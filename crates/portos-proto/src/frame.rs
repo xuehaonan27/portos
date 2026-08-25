@@ -1,8 +1,8 @@
 //! Frame codec. 4-byte little-endian length prefix, then JSON payload over a
 //! byte stream (UDS SOCK_STREAM). Max frame size guards against a misbehaving
-//! peer. fd attachments ride on a parallel SCM_RIGHTS message. A frame whose
-//! JSON carries `"fds": n` is followed by exactly one ancillary message with
-//! n descriptors.
+//! peer. Frames carry control-plane JSON only; payload bytes ride after a
+//! frame as a chunked byte stream (see [`crate::chunk`]) and never inside
+//! JSON.
 
 use std::io::{Read, Write};
 

@@ -119,6 +119,45 @@ impl CapStore {
         Ok(())
     }
 
+    /// Find a live capability granting `verb` on `resource` to `subject` and
+    /// exercise it (counting budgets decrement transactionally). This is the
+    /// authorization gate behind plugin→kernel `invoke` (ABI v2): the caller
+    /// names a verb, not a cap id — the kernel resolves which grant covers it.
+    /// Several candidate caps may exist; the first that exercises cleanly
+    /// wins, so an exhausted budget falls through to a fresh grant.
+    pub fn find_and_exercise(
+        &self,
+        subject: &str,
+        resource: &str,
+        verb: &str,
+        now: u64,
+    ) -> Result<String, KernelError> {
+        let candidates: Vec<Capability> = {
+            let db = self.db.lock().unwrap();
+            let mut stmt = db.prepare("SELECT json FROM caps WHERE revoked=0")?;
+            let rows: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<Result<_, _>>()?;
+            rows.iter()
+                .filter_map(|j| serde_json::from_str::<Capability>(j).ok())
+                .filter(|c| c.subject == subject && c.resource == resource && c.verbs.contains(verb))
+                .collect()
+        };
+        if candidates.is_empty() {
+            return Err(KernelError::Denied(format!(
+                "no capability: {subject} → {resource} verb {verb}"
+            )));
+        }
+        let mut last = KernelError::Denied("no capability".into());
+        for cap in candidates {
+            match self.exercise(&cap.cap_id, verb, now) {
+                Ok(()) => return Ok(cap.cap_id),
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
+    }
+
     /// Revoke a capability and everything attenuated from it.
     pub fn revoke(&self, cap_id: &str) -> Result<u64, KernelError> {
         let mut frontier = vec![cap_id.to_string()];

@@ -89,7 +89,7 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let id = need(args, 3, "artifact-id")?;
             let out = need(args, 4, "out-file")?;
             let k = Kernel::open(std::path::Path::new(&root))?;
-            let mut f = k.cas.open_fd(&id)?;
+            let mut f = k.cas.open_read(&id)?;
             let mut o = std::fs::File::create(&out)?;
             std::io::copy(&mut f, &mut o)?;
             println!("wrote {out}");

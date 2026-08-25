@@ -2,10 +2,15 @@
 
 pub mod artifact;
 pub mod cap;
-pub mod fdpass;
+pub mod chunk;
 pub mod frame;
 pub mod label;
 pub mod plan;
+
+/// Wire ABI version, sent in every hello. ABI v2 (decisions-v1.md D23–D25,
+/// D29): two connections per plugin (serve + client roles), plugin→kernel
+/// `invoke`, event frames, chunked artifact streaming; fd passing removed.
+pub const ABI_VERSION: &str = "0.2";
 
 pub use artifact::{ArtifactId, ArtifactMeta};
 pub use cap::{Capability, Constraints};

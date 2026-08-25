@@ -1,7 +1,7 @@
 //! Content-addressed object store.
 //! Layout: <root>/objects/<hh>/<rest-of-hash>. Ingest is tmp + rename;
-//! Reads hand out O_RDONLY fds so payloads move by descriptor, not by copy
-//! through any context.
+//! reads stream out as chunked bytes on the data plane — payloads never move
+//! through any JSON frame or model context.
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -167,10 +167,10 @@ impl Cas {
         })
     }
 
-    /// The zero-copy read path: an O_RDONLY descriptor to the object.
-    /// Callers pass this fd across UDS with SCM_RIGHTS; the payload never
-    /// transits any JSON frame or model context.
-    pub fn open_fd(&self, id: &ArtifactId) -> Result<File, KernelError> {
+    /// Kernel-internal read handle to the object. Dereference to plugins goes
+    /// out as a chunked byte stream (host `read` op, decisions-v1.md D25);
+    /// the payload never transits any JSON frame or model context.
+    pub fn open_read(&self, id: &ArtifactId) -> Result<File, KernelError> {
         let path = self.path_for(id)?;
         Ok(File::open(path)?)
     }
@@ -236,7 +236,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(m1.id, m2.id, "content addressing dedups");
-        let mut f = cas.open_fd(&m1.id).unwrap();
+        let mut f = cas.open_read(&m1.id).unwrap();
         let mut s = String::new();
         f.read_to_string(&mut s).unwrap();
         assert_eq!(s, "hello");

@@ -2,7 +2,7 @@
 //! 
 //! context bytes / data-plane bytes. Context bytes are whatever crosses into
 //! the model-facing control plane (handles, metadata, previews); data-plane
-//! bytes move by fd and never count against context.
+//! bytes move as chunked streams and never count against context.
 //! 
 //! ## Documentation
 //! ### architecture-v0.md §4.5
