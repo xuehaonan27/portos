@@ -145,7 +145,7 @@ mod tests {
                 Stmt::Let {
                     var: "xs".into(),
                     expr: Expr::Observe {
-                        verb: "echo.list".into(),
+                        verb: "echo::list".into(),
                         args: vec![],
                     },
                 },
@@ -155,7 +155,7 @@ mod tests {
                     bound: 3,
                     mode: Mode::Strict,
                     body: vec![Stmt::Effect {
-                        verb: "echo.emit".into(),
+                        verb: "echo::emit".into(),
                         args: vec![Expr::Var { name: "x".into() }],
                     }],
                 },

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/portos-cli", "crates/portos-compute", "crates/portos-echo", "crates/portos-kernel", "crates/portos-proto", "crates/portos-sdk"]
+members = ["crates/portos-broker", "crates/portos-cli", "crates/portos-compute", "crates/portos-echo", "crates/portos-kernel", "crates/portos-proto", "crates/portos-sdk"]
 
 [workspace.package]
 version = "0.1.0"
@@ -15,3 +15,5 @@ nix = { version = "0.29", features = ["socket", "uio", "fs"] }
 rand = "0.8"
 regex = "1"
 hex = "0.4"
+ureq = "2"
+url = "2"

@@ -1,12 +1,12 @@
 {
   "stmts": [
-    { "k": "effect", "verb": "echo.emit", "args": [ { "k": "const", "value": "start" } ] },
-    { "k": "let", "var": "xs", "expr": { "k": "observe", "verb": "echo.list" } },
+    { "k": "effect", "verb": "echo::emit", "args": [ { "k": "const", "value": "start" } ] },
+    { "k": "let", "var": "xs", "expr": { "k": "observe", "verb": "echo::list" } },
     { "k": "foreach", "var": "x", "list": { "k": "var", "name": "xs" }, "bound": 3, "mode": "strict",
       "body": [
         { "k": "let", "var": "u",
           "expr": { "k": "pure", "func": "upper", "args": [ { "k": "var", "name": "x" } ] } },
-        { "k": "effect", "verb": "echo.emit", "args": [ { "k": "var", "name": "u" } ] }
+        { "k": "effect", "verb": "echo::emit", "args": [ { "k": "var", "name": "u" } ] }
       ]
     }
   ]

@@ -1,0 +1,18 @@
+[package]
+name = "portos-broker"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "portos-broker"
+path = "src/main.rs"
+
+[dependencies]
+portos-sdk = { path = "../portos-sdk" }
+serde_json = { workspace = true }
+ureq = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+portos-kernel = { path = "../portos-kernel" }
+portos-proto = { path = "../portos-proto" }

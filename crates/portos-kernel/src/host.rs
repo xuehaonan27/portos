@@ -259,6 +259,24 @@ impl Host {
         dispatch_event(&self.kernel, &self.inner, topic, data)
     }
 
+    /// Persist every event on `topic` to the audit chain. This is how a
+    /// trusted plugin's self-reported log (e.g. the egress broker's
+    /// `egress::log`) becomes tamper-evident: the plugin emits, the kernel
+    /// subscribes and appends.
+    pub fn audit_topic(&self, topic: &str) {
+        let (_id, rx) = self.subscribe_local(topic);
+        let kernel = self.kernel.clone();
+        std::thread::spawn(move || {
+            for ev in rx {
+                let _ = kernel.audit.lock().unwrap().append(json!({
+                    "event": "topic.audit",
+                    "topic": ev["topic"],
+                    "data": ev["data"],
+                }));
+            }
+        });
+    }
+
     /// (context_bytes, data_bytes) moved through plugin channels so far.
     pub fn meter(&self) -> (u64, u64) {
         let m = self.inner.meter.lock().unwrap();

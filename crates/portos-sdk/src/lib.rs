@@ -101,7 +101,9 @@ fn expect_ok(resp: Value) -> Result<Value, String> {
 
 /// Connect both channels, declare `verbs`, and serve until the kernel says
 /// shutdown (or goes away). `on_call` answers kernel calls and may use the
-/// [`KernelClient`] it is handed; `on_event` receives subscribed events.
+/// [`KernelClient`] it is handed — shared as an `Arc` so a handler can move a
+/// clone into a background thread (e.g. to stream events after returning);
+/// `on_event` receives subscribed events.
 pub fn serve<F, G>(
     name: &str,
     verbs: &[&str],
@@ -109,7 +111,7 @@ pub fn serve<F, G>(
     mut on_event: G,
 ) -> std::io::Result<()>
 where
-    F: FnMut(&str, &Value, &KernelClient) -> Result<Value, String>,
+    F: FnMut(&str, &Value, &std::sync::Arc<KernelClient>) -> Result<Value, String>,
     G: FnMut(&str, &Value),
 {
     let sock = std::env::var("PORTOS_PLUGIN_SOCK")
@@ -140,9 +142,9 @@ where
             }}),
         )?;
     }
-    let client = KernelClient {
+    let client = std::sync::Arc::new(KernelClient {
         stream: Mutex::new(client_stream),
-    };
+    });
 
     loop {
         let msg = match frame::read_frame(&mut rd) {

@@ -1,10 +1,10 @@
 {
-  "plan_hash": "blake3:f7b4037d16b212cff021d441ff1e77a0c4257e79638719891e4d792d6461d35e",
+  "plan_hash": "blake3:b9017e55aabb1afeb0d4bc527b16b7ad2d394184ea7a312a71a58402302094b1",
   "budget": {
-    "echo.emit": 4
+    "echo::emit": 4
   },
-  "nonce": "6d18676f2581477c61634887",
-  "issued_at": 1787558882,
+  "nonce": "88f57f2133c14803d4e41334",
+  "issued_at": 1787681736,
   "ttl_secs": 3600,
-  "mac": "17e0d68ac366dfc11d1f7620dde8f3c5d284f94674bbf852ae7f657b119cb4c1"
+  "mac": "a2beb2809c6a24c6803828ecbefddf7df3eebe098b9ac8805e160462a14dda64"
 }

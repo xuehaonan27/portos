@@ -230,11 +230,11 @@ mod tests {
     fn toy_schemas() -> VerbSchemas {
         let mut s = VerbSchemas::default();
         s.observe
-            .insert("echo.list".into(), Label::with_integ("toy:echo"));
+            .insert("echo::list".into(), Label::with_integ("toy:echo"));
         s.observe
-            .insert("secret.read".into(), Label::with_conf("secret:demo"));
-        s.external_effects.insert("echo.emit".into(), false);
-        s.external_effects.insert("external.send".into(), true);
+            .insert("secret::read".into(), Label::with_conf("secret:demo"));
+        s.external_effects.insert("echo::emit".into(), false);
+        s.external_effects.insert("external::send".into(), true);
         s
     }
 
@@ -245,7 +245,7 @@ mod tests {
                 Stmt::Let {
                     var: "xs".into(),
                     expr: Expr::Observe {
-                        verb: "echo.list".into(),
+                        verb: "echo::list".into(),
                         args: vec![],
                     },
                 },
@@ -255,26 +255,26 @@ mod tests {
                     bound: 3,
                     mode: Mode::Strict,
                     body: vec![Stmt::Effect {
-                        verb: "echo.emit".into(),
+                        verb: "echo::emit".into(),
                         args: vec![Expr::Var { name: "x".into() }],
                     }],
                 },
             ],
         };
         let adm = admit(&plan, &toy_schemas()).unwrap();
-        assert_eq!(adm.budget.get("echo.emit"), Some(&3));
+        assert_eq!(adm.budget.get("echo::emit"), Some(&3));
         // the effect's effective label carries the list's taint (pc + arg)
         assert!(adm.effects[0].effective.integ.contains("toy:echo"));
     }
 
     #[test]
     fn pc_label_blocks_confidential_branch_to_external_sink() {
-        // if secret.read() == "A" { external.send("clean-constant") }
+        // if secret::read() == "A" { external::send("clean-constant") }
         let plan = Plan {
             stmts: vec![Stmt::If {
                 guard: Guard::Cmp {
                     lhs: Box::new(Expr::Observe {
-                        verb: "secret.read".into(),
+                        verb: "secret::read".into(),
                         args: vec![],
                     }),
                     op: portos_proto::CmpOp::Eq,
@@ -283,7 +283,7 @@ mod tests {
                     }),
                 },
                 then_: vec![Stmt::Effect {
-                    verb: "external.send".into(),
+                    verb: "external::send".into(),
                     args: vec![Expr::Const {
                         value: serde_json::json!("hi"),
                     }],
@@ -302,7 +302,7 @@ mod tests {
     fn same_effect_outside_secret_branch_is_fine() {
         let plan = Plan {
             stmts: vec![Stmt::Effect {
-                verb: "external.send".into(),
+                verb: "external::send".into(),
                 args: vec![Expr::Const {
                     value: serde_json::json!("hi"),
                 }],

@@ -24,10 +24,10 @@ use std::io::Write;
 
 fn toy_schemas() -> VerbSchemas {
     let mut s = VerbSchemas::default();
-    s.observe.insert("echo.list".into(), Label::with_integ("toy:echo"));
-    s.observe.insert("secret.read".into(), Label::with_conf("secret:demo"));
-    s.external_effects.insert("echo.emit".into(), false);
-    s.external_effects.insert("external.send".into(), true);
+    s.observe.insert("echo::list".into(), Label::with_integ("toy:echo"));
+    s.observe.insert("secret::read".into(), Label::with_conf("secret:demo"));
+    s.external_effects.insert("echo::emit".into(), false);
+    s.external_effects.insert("external::send".into(), true);
     s
 }
 
@@ -38,8 +38,8 @@ struct ToyExec {
 impl EffectExec for ToyExec {
     fn observe(&mut self, verb: &str, _args: &[Value]) -> Result<Value, String> {
         match verb {
-            "echo.list" => Ok(json!(["alpha", "beta", "gamma"])),
-            "secret.read" => Ok(json!("A")),
+            "echo::list" => Ok(json!(["alpha", "beta", "gamma"])),
+            "secret::read" => Ok(json!("A")),
             other => Err(format!("toy observe: unknown {other}")),
         }
     }

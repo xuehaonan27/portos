@@ -142,12 +142,12 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let key = ConsentKey::load_or_create(&root).unwrap();
         let mut b = Budget::new();
-        b.insert("echo.emit".into(), 3);
+        b.insert("echo::emit".into(), 3);
         let rec = ConsentRecord::sign(&key, "blake3:abc", b, 3600);
         assert!(rec.verify(&key, crate::db::now_unix()).is_ok());
 
         let mut tampered = rec.clone();
-        tampered.budget.insert("echo.emit".into(), 3000);
+        tampered.budget.insert("echo::emit".into(), 3000);
         assert!(tampered.verify(&key, crate::db::now_unix()).is_err());
         let _ = std::fs::remove_dir_all(&root);
     }

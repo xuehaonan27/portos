@@ -30,7 +30,6 @@ pub mod caps;
 pub mod cas;
 pub mod consent;
 pub mod db;
-pub mod egress;
 pub mod host;
 pub mod interp;
 pub mod metrics;
