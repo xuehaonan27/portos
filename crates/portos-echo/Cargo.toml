@@ -1,0 +1,16 @@
+[package]
+name = "portos-echo"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "portos-echo"
+path = "src/main.rs"
+
+[dependencies]
+portos-proto = { path = "../portos-proto" }
+portos-sdk = { path = "../portos-sdk" }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+portos-kernel = { path = "../portos-kernel" }

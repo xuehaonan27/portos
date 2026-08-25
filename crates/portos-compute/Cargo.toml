@@ -1,0 +1,10 @@
+[package]
+name = "portos-compute"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+portos-proto = { path = "../portos-proto" }
+serde_json = { workspace = true }
+blake3 = { workspace = true }
+hex = { workspace = true }

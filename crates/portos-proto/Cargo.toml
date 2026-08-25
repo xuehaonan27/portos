@@ -1,0 +1,12 @@
+[package]
+name = "portos-proto"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+blake3 = { workspace = true }
+nix = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }

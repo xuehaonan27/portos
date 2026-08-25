@@ -1,0 +1,14 @@
+[package]
+name = "portos-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "portos"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = { workspace = true }
+portos-kernel = { path = "../portos-kernel" }
+portos-proto = { path = "../portos-proto" }
+portos-compute = { path = "../portos-compute" }

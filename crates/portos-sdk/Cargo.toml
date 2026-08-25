@@ -1,0 +1,8 @@
+[package]
+name = "portos-sdk"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+portos-proto = { path = "../portos-proto" }
+serde_json = { workspace = true }

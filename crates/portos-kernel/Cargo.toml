@@ -1,0 +1,14 @@
+[package]
+name = "portos-kernel"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+portos-proto = { path = "../portos-proto" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+blake3 = { workspace = true }
+rusqlite = { workspace = true }
+rand = { workspace = true }
+regex = { workspace = true }
+hex = { workspace = true }

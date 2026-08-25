@@ -1,0 +1,20 @@
+{
+  "name": "workshop-browser",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Workshop M1 — a watchable, credential-safe browser limb for your AI workshop.",
+  "bin": { "workshop-browser": "src/mcp-server.js" },
+  "scripts": {
+    "demo": "node src/cli-demo.js",
+    "smoke": "node test/smoke.mjs",
+    "mcp": "node src/mcp-server.js",
+    "test": "node test/smoke.mjs && node test/mcp-smoke.mjs && node test/mcp-e2e.mjs"
+  },
+  "dependencies": {
+    "playwright": "1.56.0"
+  },
+  "optionalDependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  }
+}
