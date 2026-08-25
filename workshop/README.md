@@ -1,45 +1,27 @@
-# Workshop — browser limb (M1, Stage A)
+# PortOS browser driver (Stage A)
 
-一个**看得见、能接管、不碰你凭证**的浏览器,让你现有的 AI agent 替你在已登录的网站上做事。这是 AI workshop 的第一条肢体;终端和编辑器由你现有的 harness 提供。
+一个**看得见、能接管、不碰你凭证**的浏览器,作为 PortOS 的第一个 driver:让模型替你在已登录的网站上做事。今天它以 Playwright 为后端、以库形式存在;下一步接上 PortOS 内核的 plugin 协议(见 `.dev/plans/decisions-v1.md`)。PortOS 不做任何人的 MCP server;将来通过 mcp-host **消费** MCP 生态,方向相反。
 
-设计见 `.dev/plans/workshopm1v0.md`(demo 优先的 M1 计划);它将来长成的 substrate 见 `.dev/plans/architecture-v0.md`。
+设计上游:`.dev/plans/workshopm1v0.md`(demo 优先)+ `.dev/plans/architecture-v0.md`(substrate 北极星)+ `.dev/plans/decisions-v1.md`(独立运行时方向修订)。
 
 ## 跑起来
 
 ```sh
 npm install
-npm test        # 冒烟 + MCP 握手 + MCP 端到端多步任务,全部无头、零配置
-
-# 独立 demo:在 Mac 上默认开一个真实、可见的 Chrome 窗口;无显示器的机器上自动无头
-node src/cli-demo.js https://example.com
+npm test                              # 冒烟:navigate → 蒸馏 → type → compare-and-act click,无头零配置
+node src/cli-demo.js https://example.com   # 独立 demo;Mac 上默认开真实可见 Chrome,无显示器机器自动无头
 ```
 
-## 插进你的 agent(骑现有 harness)
+## 结构与三条缝
 
-本仓库根目录的 `.mcp.json` 已把它注册给 Claude Code:在仓库里开会话即可用 `browser_*` 工具。其他 harness(Claude Desktop 等)手动注册:
-
-```json
-{
-  "mcpServers": {
-    "workshop-browser": {
-      "command": "node",
-      "args": ["/absolute/path/to/portos/workshop/src/mcp-server.js"]
-    }
-  }
-}
-```
-
-工具:`browser_open / navigate / snapshot / click / type / wait_for / screenshot / login_passthrough / resume / close`。
-
-## 三条缝(为将来的 AgentOS 留的)
-
-- `src/driver/driver.js` — **驱动接口**。今天背后是 Playwright,将来换手写 CDP + 过滤代理,上层不动。
-- `src/policy.js` — **policy 单点**。今天近乎放行;将来 capability / effect-plan 从这里接。
-- `src/sink.js` — **result sink**。今天全文进上下文;将来大 payload 进 CAS、只回 handle+预览,只改这一个函数。它顺带计量 context/data 字节比。
+- `src/tools.js` — 工具面,**传输无关**(将来由 PortOS plugin 适配层暴露为 `browser::*` verbs)。
+- `src/driver/driver.js` — **缝①驱动接口**。今天背后是 Playwright,将来换手写 CDP + 过滤代理,上层不动。
+- `src/policy.js` — **缝②policy 单点**。今天近乎放行;将来 capability / effect-plan 从这里接。
+- `src/sink.js` — **缝③result sink**。今天全文返回;接上内核后大 payload 进 CAS、只回 handle+预览,只改这一个函数。它顺带计量 context/data 字节比。
 
 ## 唯一保留的安全性质
 
-专用 Chrome profile + 你人肉登录(passthrough)+ agent 只拿到蒸馏 DOM/截图、从不读 cookie。其余 enforcement(能力、effect-plan、IFC)全部推迟,由"你看着它做"这一 supervised autonomy 顶上。
+专用 Chrome profile + 你人肉登录(passthrough)+ 模型只拿到蒸馏 DOM/截图、从不读 cookie。其余 enforcement(能力、effect-plan、IFC)全部推迟,由"你看着它做"这一 supervised autonomy 顶上。
 
 ## 启动行为与环境变量
 

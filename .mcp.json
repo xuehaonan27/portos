@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "workshop-browser": {
-      "command": "node",
-      "args": ["workshop/src/mcp-server.js"]
-    }
-  }
-}
