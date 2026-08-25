@@ -44,11 +44,17 @@ impl KernelClient {
         Ok(ok["delivered"].as_u64().unwrap_or(0))
     }
 
-    /// Subscribe to a topic. Matching events later arrive on the serve
+    /// Subscribe to a topic. Matching events later arrive on the events
     /// channel and are handed to the plugin's event handler.
     pub fn subscribe(&self, topic: &str) -> Result<u64, String> {
         let ok = self.request(&json!({"op": "subscribe", "topic": topic}))?;
         ok["sub"].as_u64().ok_or_else(|| "no sub id".into())
+    }
+
+    /// Drop one of this plugin's subscriptions.
+    pub fn unsubscribe(&self, sub: u64) -> Result<bool, String> {
+        let ok = self.request(&json!({"op": "unsubscribe", "sub": sub}))?;
+        Ok(ok["removed"].as_bool().unwrap_or(false))
     }
 
     /// Ingest a payload into the kernel CAS, streaming (never buffered whole,
@@ -99,11 +105,13 @@ fn expect_ok(resp: Value) -> Result<Value, String> {
     Ok(resp.get("ok").cloned().unwrap_or(Value::Null))
 }
 
-/// Connect both channels, declare `verbs`, and serve until the kernel says
+/// Connect all channels, declare `verbs`, and serve until the kernel says
 /// shutdown (or goes away). `on_call` answers kernel calls and may use the
 /// [`KernelClient`] it is handed — shared as an `Arc` so a handler can move a
-/// clone into a background thread (e.g. to stream events after returning);
-/// `on_event` receives subscribed events.
+/// clone into a background thread (e.g. to stream events after returning).
+/// `on_event` receives subscribed events **on a dedicated thread** fed by the
+/// events channel, so events keep flowing while a call handler is blocked —
+/// which is what lets a handler await an event stream mid-call.
 pub fn serve<F, G>(
     name: &str,
     verbs: &[&str],
@@ -112,7 +120,7 @@ pub fn serve<F, G>(
 ) -> std::io::Result<()>
 where
     F: FnMut(&str, &Value, &std::sync::Arc<KernelClient>) -> Result<Value, String>,
-    G: FnMut(&str, &Value),
+    G: FnMut(&str, &Value) + Send + 'static,
 {
     let sock = std::env::var("PORTOS_PLUGIN_SOCK")
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "PORTOS_PLUGIN_SOCK unset"))?;
@@ -127,6 +135,7 @@ where
         &json!({"hello": {
             "name": name, "abi": ABI_VERSION, "role": "serve",
             "token": token, "verbs": verbs,
+            "channels": ["client", "events"],
         }}),
     )?;
 
@@ -146,6 +155,31 @@ where
         stream: Mutex::new(client_stream),
     });
 
+    let events_stream = UnixStream::connect(&sock)?;
+    {
+        let mut erd = events_stream.try_clone()?;
+        let mut ewr = events_stream.try_clone()?;
+        hello(
+            &mut ewr,
+            &mut erd,
+            &json!({"hello": {
+                "name": name, "abi": ABI_VERSION, "role": "events", "token": token,
+            }}),
+        )?;
+    }
+    std::thread::spawn(move || {
+        let mut erd = events_stream;
+        loop {
+            let msg = match frame::read_frame(&mut erd) {
+                Ok(m) => m,
+                Err(_) => return, // kernel went away
+            };
+            if msg["op"] == "event" {
+                on_event(msg["topic"].as_str().unwrap_or(""), &msg["data"]);
+            }
+        }
+    });
+
     loop {
         let msg = match frame::read_frame(&mut rd) {
             Ok(m) => m,
@@ -162,10 +196,7 @@ where
                 };
                 frame::write_frame(&mut wr, &resp).map_err(io_err)?;
             }
-            Some("event") => {
-                let topic = msg["topic"].as_str().unwrap_or("");
-                on_event(topic, &msg["data"]);
-            }
+            Some("event") => {} // events ride their own channel; tolerate strays
             Some(other) => {
                 frame::write_frame(&mut wr, &json!({"err": format!("unknown op {other}")}))
                     .map_err(io_err)?;

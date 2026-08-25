@@ -1,0 +1,16 @@
+[package]
+name = "portos-modeld"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "portos-modeld"
+path = "src/main.rs"
+
+[dependencies]
+portos-sdk = { path = "../../crates/portos-sdk" }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+portos-kernel = { path = "../../crates/portos-kernel" }
+portos-proto = { path = "../../crates/portos-proto" }

@@ -161,6 +161,14 @@ export class KernelClient {
     });
   }
 
+  /** Drop one of this plugin's subscriptions. */
+  unsubscribe(sub) {
+    return this._serial(async () => {
+      this.chan.writeFrame({ op: "unsubscribe", sub });
+      return unwrapOk(await this.chan.readFrame()).removed ?? false;
+    });
+  }
+
   /** Ingest a Buffer into the kernel CAS; resolves to the ArtifactMeta. */
   put(buf, type = "application/octet-stream", labels = null) {
     return this._serial(async () => {
@@ -192,8 +200,11 @@ export async function servePlugin({ name, verbs, onCall, onEvent }) {
   if (!sock) throw new Error("PORTOS_PLUGIN_SOCK unset");
   const token = process.env.PORTOS_PLUGIN_TOKEN ?? "";
 
+  // JS declares only the client channel: the async event loop interleaves
+  // event frames with in-flight calls on one connection, so the dedicated
+  // events channel (which sync-threaded plugins need) is unnecessary here.
   const serveChan = await connectChannel(sock, {
-    hello: { name, abi: ABI_VERSION, role: "serve", token, verbs },
+    hello: { name, abi: ABI_VERSION, role: "serve", token, verbs, channels: ["client"] },
   });
   const clientChan = await connectChannel(sock, {
     hello: { name, abi: ABI_VERSION, role: "client", token },

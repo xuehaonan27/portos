@@ -413,6 +413,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "portos-modeld"
+version = "0.1.0"
+dependencies = [
+ "portos-kernel",
+ "portos-proto",
+ "portos-sdk",
+ "serde_json",
+]
+
+[[package]]
 name = "portos-proto"
 version = "0.1.0"
 dependencies = [

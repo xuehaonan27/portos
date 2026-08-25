@@ -4,17 +4,25 @@
 //! to a per-spawn UDS **twice**, authenticating both connections with a
 //! spawn token from the environment:
 //!
-//!   - the **serve** channel: kernel→plugin `call` requests, one-way `event`
-//!     deliveries, and `shutdown`. The plugin declares its verb list in the
-//!     serve hello; the kernel registers those verbs in its route table.
+//!   - the **serve** channel: kernel→plugin `call` requests and `shutdown`.
+//!     The plugin declares its verb list (and which extra channels it will
+//!     open) in the serve hello; the kernel registers those verbs in its
+//!     route table.
 //!   - the **client** channel: plugin→kernel requests — `invoke` (call
 //!     another plugin's verb through the kernel: capability-checked against
-//!     the calling plugin, audited, routed), `emit`/`subscribe` (event bus),
-//!     and `put`/`read` (artifact dereference as chunked byte streams; see
-//!     `portos_proto::chunk`). fd passing is gone (D25).
+//!     the calling plugin, audited, routed), `emit`/`subscribe`/`unsubscribe`
+//!     (event bus), and `put`/`read` (artifact dereference as chunked byte
+//!     streams; see `portos_proto::chunk`). fd passing is gone (D25).
+//!   - an optional **events** channel: one-way kernel→plugin event
+//!     deliveries. A plugin that declares it can receive subscribed events
+//!     *while one of its own verbs is mid-call* — the serve channel is busy
+//!     then, and without a separate channel a plugin awaiting an event
+//!     stream inside a call handler would deadlock (the model driver's SSE
+//!     consumption is exactly that shape). Plugins that don't declare it get
+//!     events interleaved on the serve channel as before.
 //!
-//! Each channel is strict request→response in a single direction, which keeps
-//! the M0 sync-thread model trivial: no frame multiplexing anywhere.
+//! Each channel is strict in a single direction, which keeps the M0
+//! sync-thread model trivial: no frame multiplexing anywhere.
 //!
 //! Verbs are `family::verb` strings (D29). They are opaque to this module —
 //! the kernel routes text, it never interprets domain meaning (the
@@ -47,6 +55,9 @@ const SPAWN_DEADLINE_MS: u64 = 10_000;
 struct PluginHandle {
     child: Mutex<std::process::Child>,
     serve: Mutex<UnixStream>,
+    /// Dedicated event-delivery stream, when the plugin declared one.
+    /// Without it, events interleave on the serve channel.
+    events: Option<Mutex<UnixStream>>,
     events_tx: SyncSender<Value>,
     sock_path: PathBuf,
 }
@@ -123,28 +134,25 @@ impl Host {
         }
         let mut child = cmd.spawn()?;
 
-        // Two connections, either role order. Bad token or a duplicate role is
-        // fatal for the spawn.
-        let mut serve: Option<(UnixStream, String, Vec<String>)> = None;
-        let mut client: Option<UnixStream> = None;
-        for _ in 0..2 {
-            let mut stream = match accept_with_deadline(&listener, &mut child, SPAWN_DEADLINE_MS) {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = child.kill();
-                    return Err(e);
-                }
-            };
+        // The serve connection comes first and declares which extra channels
+        // follow ("client" always; "events" optionally). Bad token or an
+        // undeclared/duplicate role is fatal for the spawn.
+        let mut accept_hello = |child: &mut std::process::Child| -> Result<(UnixStream, Value), KernelError> {
+            let mut stream = accept_with_deadline(&listener, child, SPAWN_DEADLINE_MS)?;
             let hello = frame::read_frame(&mut stream)
                 .map_err(|e| KernelError::Corrupt(format!("hello: {e}")))?;
-            let h = &hello["hello"];
-            if h["token"].as_str() != Some(token.as_str()) {
+            if hello["hello"]["token"].as_str() != Some(token.as_str()) {
                 let _ = frame::write_frame(&mut stream, &json!({"err": "bad token"}));
-                let _ = child.kill();
                 return Err(KernelError::Denied("plugin hello: bad token".into()));
             }
-            match h["role"].as_str() {
-                Some("serve") if serve.is_none() => {
+            frame::write_frame(&mut stream, &json!({"ok": {}}))
+                .map_err(|e| KernelError::Corrupt(format!("hello ack: {e}")))?;
+            Ok((stream, hello["hello"].clone()))
+        };
+
+        let (serve_stream, name, verbs, mut expected) =
+            match accept_hello(&mut child) {
+                Ok((stream, h)) if h["role"] == "serve" => {
                     let name = h["name"].as_str().unwrap_or("?").to_string();
                     let verbs: Vec<String> = h["verbs"]
                         .as_array()
@@ -154,25 +162,67 @@ impl Host {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    frame::write_frame(&mut stream, &json!({"ok": {}}))
-                        .map_err(|e| KernelError::Corrupt(format!("hello ack: {e}")))?;
-                    serve = Some((stream, name, verbs));
+                    let channels: Vec<String> = h["channels"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_else(|| vec!["client".to_string()]);
+                    (stream, name, verbs, channels)
                 }
-                Some("client") if client.is_none() => {
-                    frame::write_frame(&mut stream, &json!({"ok": {}}))
-                        .map_err(|e| KernelError::Corrupt(format!("hello ack: {e}")))?;
-                    client = Some(stream);
+                Ok(_) => {
+                    let _ = child.kill();
+                    return Err(KernelError::Corrupt(
+                        "plugin hello: first connection must be role serve".into(),
+                    ));
                 }
-                other => {
+                Err(e) => {
+                    let _ = child.kill();
+                    return Err(e);
+                }
+            };
+        if !expected.iter().any(|c| c == "client") {
+            let _ = child.kill();
+            return Err(KernelError::Corrupt(
+                "plugin hello: a client channel is required".into(),
+            ));
+        }
+        let mut client: Option<UnixStream> = None;
+        let mut events: Option<UnixStream> = None;
+        while !expected.is_empty() {
+            let (stream, h) = match accept_hello(&mut child) {
+                Ok(x) => x,
+                Err(e) => {
+                    let _ = child.kill();
+                    return Err(e);
+                }
+            };
+            let role = h["role"].as_str().unwrap_or("?").to_string();
+            match expected.iter().position(|c| *c == role) {
+                Some(i) => {
+                    expected.remove(i);
+                    match role.as_str() {
+                        "client" => client = Some(stream),
+                        "events" => events = Some(stream),
+                        _ => {
+                            let _ = child.kill();
+                            return Err(KernelError::Corrupt(format!(
+                                "plugin hello: unknown channel role {role}"
+                            )));
+                        }
+                    }
+                }
+                None => {
                     let _ = child.kill();
                     return Err(KernelError::Corrupt(format!(
-                        "plugin hello: unexpected role {other:?}"
+                        "plugin hello: undeclared or duplicate role {role}"
                     )));
                 }
             }
         }
-        let (serve_stream, name, verbs) = serve.expect("serve role present");
-        let client_stream = client.expect("client role present");
+        let client_stream = client.expect("client channel present");
 
         // Register verbs; a route conflict aborts the spawn.
         {
@@ -190,6 +240,7 @@ impl Host {
             let handle = Arc::new(PluginHandle {
                 child: Mutex::new(child),
                 serve: Mutex::new(serve_stream),
+                events: events.map(Mutex::new),
                 events_tx,
                 sock_path: sock_path.clone(),
             });
@@ -337,11 +388,13 @@ fn call_on(handle: &PluginHandle, verb: &str, args: Value) -> Result<Value, Kern
     Ok(resp.get("ok").cloned().unwrap_or(Value::Null))
 }
 
-/// Per-plugin thread draining the bounded event queue onto the serve channel.
+/// Per-plugin thread draining the bounded event queue onto the plugin's
+/// events channel (or the serve channel, when it declared none).
 fn spawn_event_pump(handle: Arc<PluginHandle>, rx: Receiver<Value>) {
     std::thread::spawn(move || {
         for ev in rx {
-            let mut s = handle.serve.lock().unwrap();
+            let target = handle.events.as_ref().unwrap_or(&handle.serve);
+            let mut s = target.lock().unwrap();
             if frame::write_frame(&mut *s, &ev).is_err() {
                 return;
             }
@@ -542,6 +595,17 @@ fn handle_client_op(
                 "event": "events.subscribed", "plugin": name, "topic": topic, "sub": id,
             }));
             Ok(json!({"ok": {"sub": id}}))
+        }
+        Some("unsubscribe") => {
+            // A plugin can only drop its own subscriptions.
+            let id = req["sub"].as_u64().unwrap_or(0);
+            let mut subs = inner.subs.lock().unwrap();
+            let before = subs.len();
+            subs.retain(|s| {
+                !(s.id == id && matches!(&s.target, SubTarget::Plugin(n) if n == name))
+            });
+            let removed = before != subs.len();
+            Ok(json!({"ok": {"removed": removed}}))
         }
 
         // ---- artifact dereference: put (frame, then chunk stream) ----
