@@ -1,6 +1,6 @@
-# PortOS browser driver (Stage A)
+# PortOS browser driver
 
-一个**看得见、能接管、不碰你凭证**的浏览器,作为 PortOS 的第一个 driver:让模型替你在已登录的网站上做事。今天它以 Playwright 为后端、以库形式存在;下一步接上 PortOS 内核的 plugin 协议(见 `.dev/plans/decisions-v1.md`)。PortOS 不做任何人的 MCP server;将来通过 mcp-host **消费** MCP 生态,方向相反。
+一个**看得见、能接管、不碰你凭证**的浏览器,作为 PortOS 的第一个 driver:让模型替你在已登录的网站上做事。它已接上 PortOS 内核的 plugin 协议(`src/plugin.js`),由 `portos chat` 拉起使用。PortOS 不做任何人的 MCP server;将来通过 mcp-host **消费** MCP 生态,方向相反。
 
 设计上游:`.dev/plans/workshopm1v0.md`(demo 优先)+ `.dev/plans/architecture-v0.md`(substrate 北极星)+ `.dev/plans/decisions-v1.md`(独立运行时方向修订)。
 
@@ -12,12 +12,15 @@ npm test                              # 冒烟:navigate → 蒸馏 → type → 
 node src/cli-demo.js https://example.com   # 独立 demo;Mac 上默认开真实可见 Chrome,无显示器机器自动无头
 ```
 
+作为 PortOS driver 运行:在 `<root>/chat.json` 里登记本插件后 `portos chat <root>`(见仓库 `.dev/gen/chat-status.md` 的配置样例);端到端测试在 `crates/portos-cli/tests/chat.rs`。
+
 ## 结构与三条缝
 
-- `src/tools.js` — 工具面,**传输无关**(将来由 PortOS plugin 适配层暴露为 `browser::*` verbs)。
+- `src/plugin.js` — **PortOS 适配层**(薄;只有它知道内核协议):tools.js 暴露为 `browser::*` verbs 并自述工具元数据(description/schema,供 grants 自省);截图字节进内核 CAS 成 artifact(按页面 origin 打 `web:<origin>` taint 标签)。JS 协议客户端在共享 SDK:`sdk/js/client.js`。
+- `src/tools.js` — 工具面,**传输无关**(plugin.js 之下、driver 之上)。
 - `src/driver/driver.js` — **缝①驱动接口**。今天背后是 Playwright,将来换手写 CDP + 过滤代理,上层不动。
 - `src/policy.js` — **缝②policy 单点**。今天近乎放行;将来 capability / effect-plan 从这里接。
-- `src/sink.js` — **缝③result sink**。今天全文返回;接上内核后大 payload 进 CAS、只回 handle+预览,只改这一个函数。它顺带计量 context/data 字节比。
+- `src/sink.js` — **缝③result sink,已接数据面**:`kernel` 模式下超过 `WORKSHOP_SINK_INLINE_MAX`(默认 16KB)的 payload 进内核 CAS,模型只收 handle+元数据+预览(architecture §4.4);小 payload(蒸馏元素表这类"工作镜头")保持内联。照旧计量 context/data 字节比。
 
 ## 唯一保留的安全性质
 

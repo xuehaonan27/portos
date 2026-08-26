@@ -27,11 +27,20 @@ fn main() -> std::io::Result<()> {
         "subscribe",
         "events",
         "put_pattern",
+        "grants",
     ]
     .iter()
     .map(|v| format!("{family}::{v}"))
     .collect();
     let verb_refs: Vec<&str> = verbs.iter().map(|s| s.as_str()).collect();
+    // Advertise metadata for one verb so grants introspection has something
+    // to join against in tests.
+    let tools_meta = json!({
+        format!("{family}::emit"): {
+            "description": "Print a line to the echo driver's stdout.",
+            "schema": {"type": "object", "properties": {"text": {"type": "string"}}},
+        },
+    });
 
     let mut ephemeral: HashSet<String> = HashSet::new();
     let mut next_ref = 0u32;
@@ -39,9 +48,10 @@ fn main() -> std::io::Result<()> {
     let received_by_call = received.clone();
 
     let prefix = format!("{family}::");
-    portos_sdk::serve(
+    portos_sdk::serve_full(
         &name,
         &verb_refs,
+        tools_meta,
         move |verb, args, client| {
             let short = verb.strip_prefix(&prefix).unwrap_or(verb);
             let arg = |i: usize| args.get(i).cloned().unwrap_or(Value::Null);
@@ -90,6 +100,8 @@ fn main() -> std::io::Result<()> {
                     let evs = received_by_call.lock().unwrap();
                     Ok(json!(evs.clone()))
                 }
+                // expose grants introspection for tests
+                "grants" => Ok(json!(client.grants()?)),
                 // two-layer naming demo: refs are driver-session-local,
                 // volatile, and never enter the kernel handle table.
                 "make_ref" => {

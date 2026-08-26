@@ -82,10 +82,89 @@ fn load_tools(cfg: &Value) -> Result<Vec<ToolDef>, String> {
     Ok(out)
 }
 
+/// The built-in data-plane tool: oversized tool results arrive as
+/// `{handle, preview}`; this reads the full content back by handle. It is
+/// model-driver plumbing (provider- and driver-neutral), handled via the
+/// kernel `read` op rather than an invoke — reads are free but audited.
+const ARTIFACT_READ: &str = "artifact::read";
+
+fn artifact_read_tool() -> ToolDef {
+    ToolDef {
+        verb: ARTIFACT_READ.to_string(),
+        description: "Read (a range of) a stored artifact by id. Large tool results \
+                      arrive as {handle, preview}: pass the handle here to read the \
+                      full content as UTF-8 text. Page through big artifacts with \
+                      offset/len; the result says whether it was truncated."
+            .to_string(),
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "the artifact handle"},
+                "offset": {"type": "integer"},
+                "len": {"type": "integer"},
+            },
+            "required": ["id"],
+        }),
+    }
+}
+
+/// The per-turn tool surface: grants introspection (each granted verb joined
+/// with the metadata its driver advertised) + config-declared tools (which
+/// win per verb) + the artifact::read built-in. Families in `exclude` never
+/// surface — egress by default: it is this driver's own plumbing, not a
+/// model tool, even though the capability exists.
+fn assemble_tools(
+    client: &std::sync::Arc<portos_sdk::KernelClient>,
+    introspect: bool,
+    exclude: &[String],
+    config_tools: &[ToolDef],
+) -> Vec<ToolDef> {
+    let mut map: BTreeMap<String, ToolDef> = BTreeMap::new();
+    if introspect {
+        if let Ok(grants) = client.grants() {
+            for g in grants {
+                let Some(verb) = g["verb"].as_str() else { continue };
+                let family = verb.split("::").next().unwrap_or(verb);
+                if exclude.iter().any(|e| e == family) {
+                    continue;
+                }
+                map.insert(
+                    verb.to_string(),
+                    ToolDef {
+                        verb: verb.to_string(),
+                        description: g["description"].as_str().unwrap_or("").to_string(),
+                        schema: if g["schema"].is_object() {
+                            g["schema"].clone()
+                        } else {
+                            json!({"type": "object"})
+                        },
+                    },
+                );
+            }
+        }
+    }
+    for t in config_tools {
+        map.insert(t.verb.clone(), t.clone());
+    }
+    map.entry(ARTIFACT_READ.to_string())
+        .or_insert_with(artifact_read_tool);
+    map.into_values().collect()
+}
+
 fn main() -> std::io::Result<()> {
     let cfg = load_config();
     let backend = backend::make_backend(&cfg).map_err(std::io::Error::other)?;
-    let tools = load_tools(&cfg).map_err(std::io::Error::other)?;
+    let config_tools = load_tools(&cfg).map_err(std::io::Error::other)?;
+    let introspect = cfg["introspect_tools"].as_bool().unwrap_or(true);
+    let exclude: Vec<String> = cfg["tool_families_exclude"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_else(|| vec!["egress".to_string()]);
+    let read_max = cfg["read_max"].as_u64().unwrap_or(32 * 1024);
     let default_system = cfg["system"].as_str().unwrap_or("").to_string();
     let max_turns = cfg["max_turns"].as_u64().unwrap_or(16) as u32;
 
@@ -133,11 +212,28 @@ fn main() -> std::io::Result<()> {
                     client: client.clone(),
                     slot: slot.clone(),
                 };
+                // Fresh per send: grants can change between turns.
+                let tools = assemble_tools(client, introspect, &exclude, &config_tools);
                 let topic = format!("model::session::{sid}");
                 let emit = |v: Value| {
                     let _ = client.emit(&topic, v);
                 };
-                let invoke = |verb: &str, a: Value| client.invoke(verb, a);
+                let invoke = |verb: &str, a: Value| -> Result<Value, String> {
+                    if verb == ARTIFACT_READ {
+                        let id = a["id"].as_str().ok_or("artifact::read: missing id")?;
+                        let offset = a["offset"].as_u64().unwrap_or(0);
+                        let len = a["len"].as_u64().map(|l| l.min(read_max)).unwrap_or(read_max);
+                        let mut buf = Vec::new();
+                        let n = client.read_to(id, offset, Some(len), &mut buf)?;
+                        return Ok(json!({
+                            "text": String::from_utf8_lossy(&buf),
+                            "offset": offset,
+                            "len_read": n,
+                            "truncated": n == len,
+                        }));
+                    }
+                    client.invoke(verb, a)
+                };
                 let result = core::run_send(
                     &*backend, &gw, &mut session, &tools, text, max_turns, &emit, &invoke,
                 );

@@ -57,6 +57,15 @@ impl KernelClient {
         Ok(ok["removed"].as_bool().unwrap_or(false))
     }
 
+    /// What this plugin may invoke right now: live grants joined with the
+    /// target verbs' advertised metadata — each entry
+    /// `{verb, description, schema, counts_left?}`, ready to become a tool
+    /// definition.
+    pub fn grants(&self) -> Result<Vec<Value>, String> {
+        let ok = self.request(&json!({"op": "grants"}))?;
+        Ok(ok["grants"].as_array().cloned().unwrap_or_default())
+    }
+
     /// Ingest a payload into the kernel CAS, streaming (never buffered whole,
     /// never inside a JSON frame). Returns the ArtifactMeta as JSON.
     pub fn put<R: Read>(&self, mut r: R, r#type: &str, labels: Value) -> Result<Value, String> {
@@ -115,6 +124,24 @@ fn expect_ok(resp: Value) -> Result<Value, String> {
 pub fn serve<F, G>(
     name: &str,
     verbs: &[&str],
+    on_call: F,
+    on_event: G,
+) -> std::io::Result<()>
+where
+    F: FnMut(&str, &Value, &std::sync::Arc<KernelClient>) -> Result<Value, String>,
+    G: FnMut(&str, &Value) + Send + 'static,
+{
+    serve_full(name, verbs, Value::Null, on_call, on_event)
+}
+
+/// Like [`serve`], additionally advertising per-verb tool metadata —
+/// `{"family::verb": {"description": …, "schema": {…}}}` — which the kernel
+/// stores with the routes and joins into `grants` introspection, so callers
+/// holding a capability get ready-made tool definitions.
+pub fn serve_full<F, G>(
+    name: &str,
+    verbs: &[&str],
+    tools_meta: Value,
     mut on_call: F,
     mut on_event: G,
 ) -> std::io::Result<()>
@@ -129,15 +156,15 @@ where
     let serve_stream = UnixStream::connect(&sock)?;
     let mut rd = serve_stream.try_clone()?;
     let mut wr = serve_stream.try_clone()?;
-    hello(
-        &mut wr,
-        &mut rd,
-        &json!({"hello": {
-            "name": name, "abi": ABI_VERSION, "role": "serve",
-            "token": token, "verbs": verbs,
-            "channels": ["client", "events"],
-        }}),
-    )?;
+    let mut h = json!({"hello": {
+        "name": name, "abi": ABI_VERSION, "role": "serve",
+        "token": token, "verbs": verbs,
+        "channels": ["client", "events"],
+    }});
+    if !tools_meta.is_null() {
+        h["hello"]["tools"] = tools_meta;
+    }
+    hello(&mut wr, &mut rd, &h)?;
 
     let client_stream = UnixStream::connect(&sock)?;
     {

@@ -16,6 +16,7 @@
 //   screenshot({path?})          -> { path }        // returns a file path, NOT base64 in context
 //   passthroughBegin({url?})     -> { mode: 'user_driving', hint }
 //   passthroughEnd()             -> { mode: 'agent_driving', url, loggedInHint }
+//   currentUrl()                 -> string | null   // for origin taint labels
 //   close()                      -> {}
 //
 // ElementRef = { ref, role, name, tag, bbox:{x,y,w,h}, visible, editable }

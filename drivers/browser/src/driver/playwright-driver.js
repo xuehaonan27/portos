@@ -192,6 +192,12 @@ export class PlaywrightDriver {
     return { path: out };
   }
 
+  /** Current page URL, or null before any page exists. Used by the PortOS
+   *  adapter to taint-label artifacts by origin. */
+  currentUrl() {
+    return this.page ? this.page.url() : null;
+  }
+
   async passthroughBegin({ url } = {}) {
     await this._ensure();
     if (url) await this.page.goto(url, { waitUntil: "domcontentloaded" });

@@ -8,10 +8,13 @@
 //!   portos audit-verify <root>
 //!   portos consent <root> <plan.json> [--yes]
 //!   portos run-plan <root> <plan.json> <consent.json>
+//!   portos chat <root>
 //!
 //! `consent` renders the kernel-computed canonical budget (never model
 //! prose) and signs the quadruple on approval. `run-plan` executes under a
 //! toy executor wired to portos-compute.
+
+mod chat;
 
 use portos_kernel::consent::{render_budget, Budget, ConsentRecord};
 use portos_kernel::interp::{run_plan, EffectExec};
@@ -143,9 +146,13 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let out = run_plan(&bytes, &rec, &k.consent_key, &toy_schemas(), &mut exec, &mut audit)?;
             println!("{}", serde_json::to_string_pretty(&out)?);
         }
+        "chat" => {
+            let root = need(args, 2, "root")?;
+            chat::run(&root)?;
+        }
         _ => {
             println!("portos — AgentOS M0 CLI");
-            println!("  init | put | meta | get | audit-verify | consent | run-plan");
+            println!("  init | put | meta | get | audit-verify | consent | run-plan | chat");
         }
     }
     Ok(())

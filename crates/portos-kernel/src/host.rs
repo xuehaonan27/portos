@@ -10,9 +10,12 @@
 //!     route table.
 //!   - the **client** channel: plugin→kernel requests — `invoke` (call
 //!     another plugin's verb through the kernel: capability-checked against
-//!     the calling plugin, audited, routed), `emit`/`subscribe`/`unsubscribe`
-//!     (event bus), and `put`/`read` (artifact dereference as chunked byte
-//!     streams; see `portos_proto::chunk`). fd passing is gone (D25).
+//!     the calling plugin, audited, routed), `grants` (introspect what this
+//!     plugin may invoke, joined with the verbs' advertised metadata),
+//!     `emit`/`subscribe`/`unsubscribe` (event bus; topic patterns may end
+//!     in `*` for prefix matching), and `put`/`read` (artifact dereference
+//!     as chunked byte streams; see `portos_proto::chunk`). fd passing is
+//!     gone (D25).
 //!   - an optional **events** channel: one-way kernel→plugin event
 //!     deliveries. A plugin that declares it can receive subscribed events
 //!     *while one of its own verbs is mid-call* — the serve channel is busy
@@ -73,9 +76,18 @@ struct Sub {
     target: SubTarget,
 }
 
+/// A routed verb: which plugin serves it, plus the model-facing metadata the
+/// plugin advertised in its hello (opaque to the kernel — stored and joined,
+/// never interpreted).
+struct RouteEntry {
+    plugin: String,
+    description: String,
+    schema: Value,
+}
+
 struct HostInner {
     plugins: Mutex<BTreeMap<String, Arc<PluginHandle>>>,
-    routes: Mutex<BTreeMap<String, String>>, // verb -> plugin name
+    routes: Mutex<BTreeMap<String, RouteEntry>>, // verb -> route
     subs: Mutex<Vec<Sub>>,
     next_sub: AtomicU64,
     next_spawn: AtomicU64,
@@ -137,7 +149,7 @@ impl Host {
         // The serve connection comes first and declares which extra channels
         // follow ("client" always; "events" optionally). Bad token or an
         // undeclared/duplicate role is fatal for the spawn.
-        let mut accept_hello = |child: &mut std::process::Child| -> Result<(UnixStream, Value), KernelError> {
+        let accept_hello = |child: &mut std::process::Child| -> Result<(UnixStream, Value), KernelError> {
             let mut stream = accept_with_deadline(&listener, child, SPAWN_DEADLINE_MS)?;
             let hello = frame::read_frame(&mut stream)
                 .map_err(|e| KernelError::Corrupt(format!("hello: {e}")))?;
@@ -150,7 +162,7 @@ impl Host {
             Ok((stream, hello["hello"].clone()))
         };
 
-        let (serve_stream, name, verbs, mut expected) =
+        let (serve_stream, name, verbs, tools_meta, mut expected) =
             match accept_hello(&mut child) {
                 Ok((stream, h)) if h["role"] == "serve" => {
                     let name = h["name"].as_str().unwrap_or("?").to_string();
@@ -162,6 +174,9 @@ impl Host {
                                 .collect()
                         })
                         .unwrap_or_default();
+                    // Optional per-verb tool metadata (description + schema),
+                    // joined into `grants` introspection responses.
+                    let tools_meta = h["tools"].clone();
                     let channels: Vec<String> = h["channels"]
                         .as_array()
                         .map(|a| {
@@ -170,7 +185,7 @@ impl Host {
                                 .collect()
                         })
                         .unwrap_or_else(|| vec!["client".to_string()]);
-                    (stream, name, verbs, channels)
+                    (stream, name, verbs, tools_meta, channels)
                 }
                 Ok(_) => {
                     let _ = child.kill();
@@ -245,7 +260,19 @@ impl Host {
                 sock_path: sock_path.clone(),
             });
             for v in &verbs {
-                routes.insert(v.clone(), name.clone());
+                let meta = &tools_meta[v.as_str()];
+                routes.insert(
+                    v.clone(),
+                    RouteEntry {
+                        plugin: name.clone(),
+                        description: meta["description"].as_str().unwrap_or("").to_string(),
+                        schema: if meta["schema"].is_object() {
+                            meta["schema"].clone()
+                        } else {
+                            json!({"type": "object"})
+                        },
+                    },
+                );
             }
             plugins.insert(name.clone(), handle.clone());
             spawn_event_pump(handle.clone(), events_rx);
@@ -286,7 +313,7 @@ impl Host {
             .lock()
             .unwrap()
             .get(verb)
-            .cloned()
+            .map(|e| e.plugin.clone())
             .ok_or_else(|| KernelError::NotFound(format!("no route for verb: {verb}")))?;
         self.call(&target, verb, args)
     }
@@ -413,7 +440,7 @@ fn dispatch_event(kernel: &Arc<Kernel>, inner: &Arc<HostInner>, topic: &str, dat
     let targets: Vec<Target> = {
         let subs = inner.subs.lock().unwrap();
         subs.iter()
-            .filter(|s| s.topic == topic)
+            .filter(|s| topic_matches(&s.topic, topic))
             .map(|s| match &s.target {
                 SubTarget::Local(tx) => Target::Local(s.id, tx.clone()),
                 SubTarget::Plugin(name) => Target::Plugin(s.id, name.clone()),
@@ -486,11 +513,20 @@ fn cleanup_plugin(inner: &Arc<HostInner>, name: &str) {
         .routes
         .lock()
         .unwrap()
-        .retain(|_, target| target != name);
+        .retain(|_, entry| entry.plugin != name);
     inner.subs.lock().unwrap().retain(|s| match &s.target {
         SubTarget::Plugin(n) => n != name,
         _ => true,
     });
+}
+
+/// Topic patterns: a trailing `*` matches any topic with that prefix
+/// (`model::session::*`); otherwise exact match.
+fn topic_matches(pattern: &str, topic: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => topic.starts_with(prefix),
+        None => pattern == topic,
+    }
 }
 
 /// The client-channel loop: serve one plugin's kernel requests until EOF.
@@ -563,17 +599,69 @@ fn handle_client_op(
                 let routes = inner.routes.lock().unwrap();
                 let target = routes
                     .get(verb)
+                    .map(|e| e.plugin.clone())
                     .ok_or_else(|| KernelError::NotFound(format!("no route for verb: {verb}")))?;
                 inner
                     .plugins
                     .lock()
                     .unwrap()
-                    .get(target)
+                    .get(&target)
                     .cloned()
                     .ok_or_else(|| KernelError::NotFound(format!("plugin gone: {target}")))?
             };
             let out = call_on(&handle, verb, args)?;
             Ok(json!({"ok": out}))
+        }
+
+        // ---- grants introspection: what may *this* plugin invoke? ----
+        // Joins the caller's live capabilities with the route table's
+        // advertised verb metadata: the driver owns descriptions/schemas,
+        // the user owns grants, the caller (e.g. the model driver) gets
+        // ready-made tool definitions. The kernel joins strings; it never
+        // interprets them.
+        Some("grants") => {
+            let subject = format!("plugin:{name}");
+            let caps = kernel.caps.list_live(&subject, now)?;
+            // Pass 1: merge per verb. `counts`: None = unlimited grant seen;
+            // Some(n) = best counted balance so far.
+            let mut merged: BTreeMap<String, Option<u64>> = BTreeMap::new();
+            for cap in &caps {
+                let Some(family) = cap.resource.strip_prefix("driver:") else {
+                    continue;
+                };
+                for short in &cap.verbs {
+                    let verb = format!("{family}::{short}");
+                    let this = cap.constraints.counts.get(short).copied();
+                    merged
+                        .entry(verb)
+                        .and_modify(|acc| {
+                            *acc = match (*acc, this) {
+                                (None, _) | (_, None) => None, // unlimited wins
+                                (Some(a), Some(b)) => Some(a.max(b)),
+                            }
+                        })
+                        .or_insert(this);
+                }
+            }
+            // Pass 2: join with the route table's advertised metadata.
+            let routes = inner.routes.lock().unwrap();
+            let grants: Vec<Value> = merged
+                .into_iter()
+                .map(|(verb, counts)| {
+                    let (description, schema) = routes
+                        .get(&verb)
+                        .map(|e| (e.description.clone(), e.schema.clone()))
+                        .unwrap_or_else(|| (String::new(), json!({"type": "object"})));
+                    let mut g = json!({
+                        "verb": verb, "description": description, "schema": schema,
+                    });
+                    if let Some(n) = counts {
+                        g["counts_left"] = json!(n);
+                    }
+                    g
+                })
+                .collect();
+            Ok(json!({"ok": {"grants": grants}}))
         }
 
         // ---- event bus ----

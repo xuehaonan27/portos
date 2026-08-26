@@ -102,8 +102,10 @@ pub struct EgressStream {
 
 /// The network a backend is allowed to see: the kernel-mediated egress
 /// chokepoint, nothing else. Credentials are injected broker-side; a backend
-/// never holds a key.
+/// never holds a key. (`http` is the buffered variant for backends without
+/// streaming responses; current backends stream.)
 pub trait Gateway {
+    #[allow(dead_code)]
     fn http(&self, args: Value) -> Result<Value, String>;
     fn http_stream(&self, args: Value) -> Result<EgressStream, String>;
 }

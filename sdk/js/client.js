@@ -6,8 +6,8 @@
 // chunks (4-byte LE length + bytes, zero-length terminator) and never inside
 // JSON (decisions-v1.md D25 — this is why no native addon is needed).
 //
-// Lives with the browser driver for now; becomes a shared JS SDK when a
-// second JS driver exists (D30, two-implementations rule).
+// The shared JS SDK: extracted here (D30's own trigger) when the renderer
+// became the second JS driver alongside the browser.
 
 import net from "node:net";
 
@@ -169,6 +169,15 @@ export class KernelClient {
     });
   }
 
+  /** Live grants for this plugin, joined with the target verbs' advertised
+   *  metadata: [{verb, description, schema, counts_left?}]. */
+  grants() {
+    return this._serial(async () => {
+      this.chan.writeFrame({ op: "grants" });
+      return unwrapOk(await this.chan.readFrame()).grants ?? [];
+    });
+  }
+
   /** Ingest a Buffer into the kernel CAS; resolves to the ArtifactMeta. */
   put(buf, type = "application/octet-stream", labels = null) {
     return this._serial(async () => {
@@ -194,8 +203,12 @@ export class KernelClient {
  * Connect both channels, declare verbs, and serve until shutdown.
  * onCall(verb, args, client) → result (thrown errors become {"err"}).
  * onEvent(topic, data) receives subscribed events.
+ * tools (optional): per-verb metadata {"family::verb": {description, schema}}
+ *   advertised to the kernel and joined into grants introspection.
+ * onReady (optional): async hook run with the client once connected, before
+ *   serving — where a passive plugin (e.g. a renderer) subscribes.
  */
-export async function servePlugin({ name, verbs, onCall, onEvent }) {
+export async function servePlugin({ name, verbs, tools, onCall, onEvent, onReady }) {
   const sock = process.env.PORTOS_PLUGIN_SOCK;
   if (!sock) throw new Error("PORTOS_PLUGIN_SOCK unset");
   const token = process.env.PORTOS_PLUGIN_TOKEN ?? "";
@@ -203,13 +216,14 @@ export async function servePlugin({ name, verbs, onCall, onEvent }) {
   // JS declares only the client channel: the async event loop interleaves
   // event frames with in-flight calls on one connection, so the dedicated
   // events channel (which sync-threaded plugins need) is unnecessary here.
-  const serveChan = await connectChannel(sock, {
-    hello: { name, abi: ABI_VERSION, role: "serve", token, verbs, channels: ["client"] },
-  });
+  const serveHello = { name, abi: ABI_VERSION, role: "serve", token, verbs, channels: ["client"] };
+  if (tools) serveHello.tools = tools;
+  const serveChan = await connectChannel(sock, { hello: serveHello });
   const clientChan = await connectChannel(sock, {
     hello: { name, abi: ABI_VERSION, role: "client", token },
   });
   const client = new KernelClient(clientChan);
+  if (onReady) await onReady(client);
 
   for (;;) {
     let msg;

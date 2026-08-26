@@ -1,7 +1,7 @@
 // Test fixture: a minimal JS plugin proving the JS protocol client speaks
 // ABI v2 against the real kernel host (spawned by tests/abi_v2.rs).
 
-import { servePlugin } from "../../../../drivers/browser/src/portos/client.js";
+import { servePlugin } from "../../../../sdk/js/client.js";
 
 await servePlugin({
   name: "portos-jse",

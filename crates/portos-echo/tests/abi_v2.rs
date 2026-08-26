@@ -232,6 +232,63 @@ fn slow_local_subscriber_is_dropped_not_wedged() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[test]
+fn wildcard_topics_and_grants_introspection() {
+    let (kernel, host, root) = setup("grants");
+    let a = spawn_echo(&host, "echoa");
+    let b = spawn_echo(&host, "echob");
+
+    // Wildcard subscription: a prefix pattern sees every matching topic.
+    let (_sub, rx) = host.subscribe_local("echoa::*");
+    host.call(&a, "echoa::publish", json!(["echoa::anything", {"n": 9}]))
+        .unwrap();
+    let ev = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("wildcard subscriber receives the event");
+    assert_eq!(ev["topic"].as_str(), Some("echoa::anything"));
+
+    // Grants introspection: A's live caps joined with B's advertised verb
+    // metadata — a ready-made tool definition, no config duplication.
+    let mut counts = BTreeMap::new();
+    counts.insert("emit".to_string(), 5u64);
+    kernel
+        .caps
+        .mint(
+            "plugin:portos-echoa",
+            "driver:echob",
+            BTreeSet::from(["emit".to_string(), "digest".to_string()]),
+            Constraints {
+                expires_at: None,
+                counts,
+            },
+            None,
+        )
+        .unwrap();
+    let grants = host.call(&a, "echoa::grants", json!([])).unwrap();
+    let list = grants.as_array().unwrap();
+    let emit = list
+        .iter()
+        .find(|g| g["verb"] == "echob::emit")
+        .expect("granted verb introspected");
+    assert!(
+        emit["description"].as_str().unwrap().contains("Print a line"),
+        "driver-advertised description joined in"
+    );
+    assert!(emit["schema"]["properties"]["text"].is_object());
+    assert_eq!(emit["counts_left"].as_u64(), Some(5));
+    let digest = list
+        .iter()
+        .find(|g| g["verb"] == "echob::digest")
+        .expect("verb without advertised metadata still listed");
+    assert_eq!(digest["schema"], json!({"type": "object"}));
+    assert!(digest.get("counts_left").is_none(), "uncounted grant is unlimited");
+    assert_eq!(list.len(), 2, "only granted verbs appear");
+    drop(b);
+
+    host.shutdown_all();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Cross-language: the JS protocol client speaks the same wire. Skips when
 /// node is not installed.
 #[test]

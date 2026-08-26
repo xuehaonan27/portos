@@ -158,6 +158,24 @@ impl CapStore {
         Err(last)
     }
 
+    /// All live (unrevoked, unexpired) capabilities held by `subject` —
+    /// the raw material of grants introspection.
+    pub fn list_live(&self, subject: &str, now: u64) -> Result<Vec<Capability>, KernelError> {
+        let db = self.db.lock().unwrap();
+        let mut stmt = db.prepare("SELECT json FROM caps WHERE revoked=0")?;
+        let rows: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<_, _>>()?;
+        Ok(rows
+            .iter()
+            .filter_map(|j| serde_json::from_str::<Capability>(j).ok())
+            .filter(|c| {
+                c.subject == subject
+                    && c.constraints.expires_at.map(|e| now <= e).unwrap_or(true)
+            })
+            .collect())
+    }
+
     /// Revoke a capability and everything attenuated from it.
     pub fn revoke(&self, cap_id: &str) -> Result<u64, KernelError> {
         let mut frontier = vec![cap_id.to_string()];
