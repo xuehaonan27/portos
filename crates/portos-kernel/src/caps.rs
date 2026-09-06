@@ -1,4 +1,11 @@
 //! Capability table. Currently using SQLite to store it.
+//!
+//! Counting constraints are **pools in the holding ledger** (spec F1, roadmap
+//! H.2-1): `constraints.counts[verb]` is the declared capacity of the
+//! (cap, verb) pool, never mutated; every exercise mints one spend row through
+//! the issuer gate, and the balance is recomputed from the rows. The in-place
+//! decrement this replaced was the drill's first "already-frozen theory
+//! flowing back into existing code" item.
 
 use std::{
     collections::BTreeSet,
@@ -9,15 +16,49 @@ use portos_proto::{Capability, Constraints};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::KernelError;
+use crate::ledger::LedgerStore;
 
 pub struct CapStore {
     // Currently we use a database to store capabilities.
     db: Arc<Mutex<Connection>>,
+    ledger: Arc<LedgerStore>,
 }
 
 impl CapStore {
-    pub fn new(db: Arc<Mutex<Connection>>) -> CapStore {
-        CapStore { db }
+    pub fn new(db: Arc<Mutex<Connection>>, ledger: Arc<LedgerStore>) -> CapStore {
+        CapStore { db, ledger }
+    }
+
+    /// Declare every (cap, verb) pool's capacity in the ledger. Called on
+    /// open (the ledger reloads spend rows, the cap table owns capacities).
+    pub fn rebuild_pools(&self) -> Result<(), KernelError> {
+        let rows: Vec<String> = {
+            let db = self.db.lock().unwrap();
+            let mut stmt = db.prepare("SELECT json FROM caps")?;
+            stmt.query_map([], |r| r.get::<_, String>(0))?
+                .collect::<Result<_, _>>()?
+        };
+        for j in rows {
+            if let Ok(cap) = serde_json::from_str::<Capability>(&j) {
+                self.declare_pools(&cap);
+            }
+        }
+        Ok(())
+    }
+
+    fn declare_pools(&self, cap: &Capability) {
+        for (verb, n) in &cap.constraints.counts {
+            self.ledger.set_pool(&cap.cap_id, verb, *n);
+        }
+    }
+
+    /// Remaining balance of a counted verb: capacity minus the fold of spend
+    /// rows. `None` when the verb is uncounted (unlimited).
+    pub fn counts_left(&self, cap: &Capability, verb: &str) -> Option<u64> {
+        cap.constraints
+            .counts
+            .get(verb)
+            .map(|cap_n| cap_n.saturating_sub(self.ledger.spent(&cap.cap_id, verb)))
     }
 
     fn store(&self, cap: &Capability) -> Result<(), KernelError> {
@@ -65,6 +106,7 @@ impl CapStore {
             revoked: false,
         };
         self.store(&cap)?;
+        self.declare_pools(&cap);
         Ok(cap)
     }
 
@@ -93,11 +135,12 @@ impl CapStore {
             return Err(KernelError::Denied("attenuation must narrow".into()));
         }
         self.store(&child)?;
+        self.declare_pools(&child);
         Ok(child)
     }
 
     pub fn exercise(&self, cap_id: &str, verb: &str, now: u64) -> Result<(), KernelError> {
-        let mut cap = self.get(cap_id)?;
+        let cap = self.get(cap_id)?;
         if cap.revoked {
             return Err(KernelError::Denied("cap revoked".into()));
         }
@@ -109,18 +152,23 @@ impl CapStore {
         if !cap.verbs.contains(verb) {
             return Err(KernelError::Denied(format!("verb not granted: {verb}")));
         }
-        if let Some(n) = cap.constraints.counts.get_mut(verb) {
-            if *n == 0 {
-                return Err(KernelError::Denied(format!("budget exhausted: {verb}")));
+        if cap.constraints.counts.contains_key(verb) {
+            // F1: spending is minting one unit into the pool through the
+            // issuer gate; exhaustion is the gate refusing, not a counter
+            // hitting zero.
+            match self.ledger.spend(&cap.subject, &cap.cap_id, verb, now) {
+                Ok(_) => {}
+                Err(KernelError::Denied(_)) => {
+                    return Err(KernelError::Denied(format!("budget exhausted: {verb}")));
+                }
+                Err(e) => return Err(e),
             }
-            *n -= 1;
-            self.store(&cap)?;
         }
         Ok(())
     }
 
     /// Find a live capability granting `verb` on `resource` to `subject` and
-    /// exercise it (counting budgets decrement transactionally). This is the
+    /// exercise it (counting budgets are ledger pools). This is the
     /// authorization gate behind plugin→kernel `invoke` (ABI v2): the caller
     /// names a verb, not a cap id — the kernel resolves which grant covers it.
     /// Several candidate caps may exist; the first that exercises cleanly
@@ -217,7 +265,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let db = Arc::new(Mutex::new(crate::db::open(&root).unwrap()));
-        (CapStore::new(db), root)
+        let (ledger, _) = LedgerStore::open(db.clone()).unwrap();
+        (CapStore::new(db, Arc::new(ledger)), root)
     }
 
     fn verbs(v: &[&str]) -> BTreeSet<String> {
@@ -248,6 +297,12 @@ mod tests {
             matches!(e, Err(KernelError::Denied(_))),
             "third emit must be denied"
         );
+        // The declared capacity is untouched; the balance is a fold over
+        // spend rows (F1 consequence 1).
+        let stored = caps.get(&cap.cap_id).unwrap();
+        assert_eq!(stored.constraints.counts["emit"], 2);
+        assert_eq!(caps.counts_left(&stored, "emit"), Some(0));
+        assert_eq!(caps.counts_left(&stored, "list"), None);
         let _ = std::fs::remove_dir_all(&root);
     }
 

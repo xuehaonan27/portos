@@ -157,7 +157,14 @@ pub fn run(root: &str) -> Result<(), Box<dyn std::error::Error>> {
                     let _ = std::io::stdout().flush();
                 }
                 Some("tool_call") if render_builtin => {
-                    println!("\n[tool→] {}", d["verb"].as_str().unwrap_or("?"));
+                    // The verb character rides with the activity (F4): a
+                    // read and a budgeted effect read differently.
+                    let tag = match d["verb_kind"].as_str() {
+                        Some(k) if d["budgeted"].as_bool() == Some(true) => format!(" ({k}, budgeted)"),
+                        Some(k) => format!(" ({k})"),
+                        None => String::new(),
+                    };
+                    println!("\n[tool→] {}{tag}", d["verb"].as_str().unwrap_or("?"));
                     let _ = std::io::stdout().flush();
                 }
                 Some("tool_result") if render_builtin => {

@@ -143,7 +143,7 @@ fn browser_adapter_serves_verbs_and_data_plane() {
     assert_eq!(name, "portos-browser");
 
     let url = format!("file://{}", fixture.display());
-    let snap = host.call(&name, "browser::open", json!({"url": url})).unwrap();
+    let snap = host.call(&name, "browser::navigate", json!({"url": url})).unwrap();
     assert!(snap["title"].as_str().unwrap().contains("Workshop Fixture"));
     assert!(snap["elements"].as_array().unwrap().len() >= 3, "inline snapshot keeps the element table");
 
@@ -171,7 +171,7 @@ fn browser_adapter_serves_verbs_and_data_plane() {
         )
         .unwrap();
     let out = host
-        .call(&name, "browser::open", json!({"url": format!("{origin}/")}))
+        .call(&name, "browser::navigate", json!({"url": format!("{origin}/")}))
         .unwrap();
     let handle = out["handle"].as_str().expect("oversized snapshot becomes a handle");
     assert!(!out["preview"].as_str().unwrap().is_empty());
@@ -299,7 +299,7 @@ fn portos_chat_end_to_end() {
             "delta": {"type": "text_delta", "text": "Opening the page."}})),
         ("content_block_stop", json!({"type": "content_block_stop", "index": 0})),
         ("content_block_start", json!({"type": "content_block_start", "index": 1,
-            "content_block": {"type": "tool_use", "id": "toolu_1", "name": "browser__open",
+            "content_block": {"type": "tool_use", "id": "toolu_1", "name": "browser__navigate",
                                "input": {}}})),
         ("content_block_delta", json!({"type": "content_block_delta", "index": 1,
             "delta": {"type": "input_json_delta",
@@ -336,8 +336,8 @@ fn portos_chat_end_to_end() {
             "max_tokens": 512,
             "system": "You are the PortOS assistant.",
             "tools": [{
-                "verb": "browser::open",
-                "description": "Open a page in the watchable browser.",
+                "verb": "browser::navigate",
+                "description": "Navigate the watchable browser to a url.",
                 "schema": {"type": "object", "properties": {"url": {"type": "string"}},
                             "required": ["url"]},
             }],
@@ -352,7 +352,7 @@ fn portos_chat_end_to_end() {
                 "env": {"WORKSHOP_HEADLESS": "1",
                          "WORKSHOP_PROFILE_DIR": root.join("profile").to_str().unwrap()},
             }],
-            "grants": [{"resource": "driver:browser", "verbs": ["open"]}],
+            "grants": [{"resource": "driver:browser", "verbs": ["navigate"]}],
         }),
     );
 
@@ -380,8 +380,11 @@ fn portos_chat_end_to_end() {
     assert!(out.status.success(), "chat exited badly.\nstdout:\n{stdout}\nstderr:\n{stderr}");
 
     assert!(stdout.contains("Opening the page."), "first-turn deltas streamed:\n{stdout}");
-    assert!(stdout.contains("[tool→] browser::open"), "tool call surfaced:\n{stdout}");
-    assert!(stdout.contains("[tool✓] browser::open"), "tool result surfaced:\n{stdout}");
+    assert!(
+        stdout.contains("[tool→] browser::navigate (emitting, budgeted)"),
+        "tool call surfaced with the verb character the browser declared:\n{stdout}"
+    );
+    assert!(stdout.contains("[tool✓] browser::navigate"), "tool result surfaced:\n{stdout}");
     assert!(stdout.contains("Opened: done"), "final turn streamed:\n{stdout}");
 
     // The provider saw the injected key, the tool definition, and — in turn
@@ -389,7 +392,11 @@ fn portos_chat_end_to_end() {
     let reqs = captured.lock().unwrap();
     assert_eq!(reqs.len(), 2);
     assert!(reqs[0].contains("x-api-key: fake-test-key"));
-    assert!(reqs[0].contains("browser__open"));
+    assert!(reqs[0].contains("browser__navigate"));
+    assert!(
+        reqs[0].contains("[kind: emitting; external effect; budgeted]"),
+        "the config-declared tool still carries the kernel's verb character"
+    );
     assert!(reqs[1].contains("tool_result"));
     assert!(
         reqs[1].contains("Workshop Fixture"),

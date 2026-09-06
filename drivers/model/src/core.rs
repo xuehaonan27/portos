@@ -17,6 +17,54 @@ pub struct ToolDef {
     pub verb: String,
     pub description: String,
     pub schema: Value,
+    /// The verb's character as its driver declared it and the kernel checked
+    /// it into the truth table (F4): `repeatable` | `transforming` |
+    /// `consuming` | `emitting`. `None` when the route carries no
+    /// declaration.
+    pub kind: Option<String>,
+    /// Whether the kernel budgets the verb (F4: everything but repeatable).
+    pub budgeted: Option<bool>,
+}
+
+impl ToolDef {
+    pub fn new(verb: impl Into<String>, description: impl Into<String>, schema: Value) -> Self {
+        Self {
+            verb: verb.into(),
+            description: description.into(),
+            schema,
+            kind: None,
+            budgeted: None,
+        }
+    }
+
+    /// What the provider sees as the tool description: the driver's text plus
+    /// one line stating the verb character, so the model can tell a free,
+    /// retry-safe read from a budgeted effect before choosing. This informs
+    /// the model; it never enforces anything (the kernel gates every invoke
+    /// regardless of what the model believed).
+    pub fn provider_description(&self) -> String {
+        let Some(kind) = self.kind.as_deref() else {
+            return self.description.clone();
+        };
+        let what = match kind {
+            "repeatable" => "read-only, safe to repeat",
+            "transforming" => "changes state its driver holds",
+            "consuming" => "consumes or acquires a resource",
+            "emitting" => "external effect",
+            other => other,
+        };
+        let budget = match self.budgeted {
+            Some(true) => "; budgeted",
+            Some(false) => "; not budgeted",
+            None => "",
+        };
+        let note = format!("[kind: {kind}; {what}{budget}]");
+        if self.description.is_empty() {
+            note
+        } else {
+            format!("{}\n{note}", self.description)
+        }
+    }
 }
 
 /// `family::verb` → provider-safe tool name and back. Providers commonly
@@ -189,12 +237,27 @@ pub fn run_send(
 
         let mut results = Vec::with_capacity(calls.len());
         for call in calls {
-            emit(json!({"kind": "tool_call", "verb": call.verb, "args": call.args}));
+            // Renderers get the verb character with the activity, so a read
+            // and an effect can look different on screen (`kind` is the
+            // event type; the verb's character rides as `verb_kind`).
+            let character = tools.iter().find(|t| t.verb == call.verb);
+            let with_character = |mut ev: Value| {
+                if let Some(t) = character {
+                    if let Some(k) = &t.kind {
+                        ev["verb_kind"] = json!(k);
+                    }
+                    if let Some(b) = t.budgeted {
+                        ev["budgeted"] = json!(b);
+                    }
+                }
+                ev
+            };
+            emit(with_character(json!({"kind": "tool_call", "verb": call.verb, "args": call.args})));
             let (content, is_error) = match invoke(&call.verb, call.args.clone()) {
                 Ok(v) => (serde_json::to_string(&v).unwrap_or_default(), false),
                 Err(e) => (e, true),
             };
-            emit(json!({"kind": "tool_result", "verb": call.verb, "ok": !is_error}));
+            emit(with_character(json!({"kind": "tool_result", "verb": call.verb, "ok": !is_error})));
             results.push(ToolResultMsg {
                 call_id: call.id,
                 content,
@@ -204,4 +267,81 @@ pub fn run_send(
         session.messages.push(Msg::ToolResults(results));
     }
     Err(format!("max turns exceeded ({max_turns})"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_description_carries_the_verb_character() {
+        let mut t = ToolDef::new("browser::click", "Click the element.", json!({}));
+        assert_eq!(t.provider_description(), "Click the element.");
+        t.kind = Some("emitting".into());
+        t.budgeted = Some(true);
+        assert_eq!(
+            t.provider_description(),
+            "Click the element.\n[kind: emitting; external effect; budgeted]"
+        );
+        let mut r = ToolDef::new("browser::snapshot", "", json!({}));
+        r.kind = Some("repeatable".into());
+        r.budgeted = Some(false);
+        assert_eq!(r.provider_description(), "[kind: repeatable; read-only, safe to repeat; not budgeted]");
+    }
+
+    #[test]
+    fn tool_activity_events_carry_the_verb_character() {
+        struct Scripted;
+        impl Backend for Scripted {
+            fn name(&self) -> &'static str {
+                "scripted"
+            }
+            fn complete(
+                &self,
+                _gw: &dyn Gateway,
+                req: &TurnRequest,
+                _sink: &mut dyn TurnSink,
+            ) -> Result<TurnResult, String> {
+                // Turn 1: call the tool; turn 2: finish.
+                if req.messages.len() == 1 {
+                    Ok(TurnResult {
+                        parts: vec![Part::ToolCall(ToolCall {
+                            id: "c1".into(),
+                            verb: "browser::click".into(),
+                            args: json!({"ref": "e1"}),
+                        })],
+                        raw: Value::Null,
+                        stop: StopKind::ToolUse,
+                    })
+                } else {
+                    Ok(TurnResult { parts: vec![Part::Text("done".into())], raw: Value::Null, stop: StopKind::EndTurn })
+                }
+            }
+        }
+        struct NoNet;
+        impl Gateway for NoNet {
+            fn http(&self, _: Value) -> Result<Value, String> {
+                Err("no network".into())
+            }
+            fn http_stream(&self, _: Value) -> Result<EgressStream, String> {
+                Err("no network".into())
+            }
+        }
+        let mut click = ToolDef::new("browser::click", "Click.", json!({}));
+        click.kind = Some("emitting".into());
+        click.budgeted = Some(true);
+        let mut session = Session { system: String::new(), messages: Vec::new() };
+        let events = std::cell::RefCell::new(Vec::new());
+        let emit = |v: Value| events.borrow_mut().push(v);
+        let invoke = |_: &str, _: Value| Ok(json!({"clicked": true}));
+        let out = run_send(&Scripted, &NoNet, &mut session, &[click], "go".into(), 4, &emit, &invoke).unwrap();
+        assert_eq!(out, "done");
+        let evs = events.borrow();
+        let call = evs.iter().find(|e| e["kind"] == "tool_call").unwrap();
+        assert_eq!(call["verb_kind"], "emitting");
+        assert_eq!(call["budgeted"], true);
+        let result = evs.iter().find(|e| e["kind"] == "tool_result").unwrap();
+        assert_eq!(result["verb_kind"], "emitting");
+        assert_eq!(result["ok"], true);
+    }
 }

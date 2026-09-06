@@ -36,9 +36,44 @@
 //! B while B's serve loop is blocked invoking A) deadlocks; v0 flows
 //! (cli → model driver → {broker, browser}) are acyclic by construction, and
 //! the effect-plan world later makes call structure explicit.
+//!
+//! ## Resource-management laws wired in (spec F1–F6 via `portos-rm`)
+//!
+//!   - **Holdings (F1/F2).** A spawned plugin is an exclusive holding of class
+//!     `kernel/plugin` (generation = spawn token); each of its subscriptions
+//!     is a `kernel/subscription` holding under it. Reclamation is
+//!     crash-only: plugin death, event-queue overflow and graceful shutdown
+//!     all run the same F2 teardown of the plugin's ownership closure,
+//!     children first, through a `World` that drops subscriptions, routes and
+//!     the process. Graceful shutdown only adds a polite `shutdown` frame in
+//!     front of it.
+//!   - **Verb character (F4).** A hello's `tools[verb]` may declare `kind`
+//!     (`repeatable` | `repeatable_shared` | `transforming` | `consuming` |
+//!     `emitting`, with `world`, `compensate_with`, `amortizable`,
+//!     `idempotent`, `commutes`, `degrade`), and the hello may declare the
+//!     plugin's `holding_rho`. The kernel builds the plugin's truth table and
+//!     refuses the spawn if it is incoherent. `grants` exposes `kind` and
+//!     `budgeted` so callers (the model driver) can tell reads from effects.
+//!   - **Slot row (F5).** `spawn_in` takes a slot: its `offers` are the
+//!     position ceiling; every verb's declared `requires.caps` must fit at
+//!     spawn (`admit_mount`), and an `invoke` outside the row is refused
+//!     regardless of capabilities (actual = row ∩ grant).
+//!   - **Protocol (F6).** A hello may declare a deterministic safety
+//!     automaton over its verbs; the kernel enforces it precisely by refusing
+//!     the offending call (truncation tier), state advancing only on success.
+//!
+//! Lock order: ledger → plugins/routes/subs. Teardown holds the ledger while
+//! its `World` takes host locks; no host path takes a host lock and then the
+//! ledger.
 
+use crate::ledger::{CLASS_PLUGIN, CLASS_SUBSCRIPTION};
 use crate::{Kernel, KernelError};
 use portos_proto::{Label, chunk, frame};
+use portos_rm::coeffect::{Flat, Manifest, Mount, Requires, admit_mount};
+use portos_rm::ledger::{LiveItem, RevertGrade};
+use portos_rm::protocol::Protocol;
+use portos_rm::teardown::{RunOutcome, World};
+use portos_rm::verbs::{ConsumeGrade, EmitGrade, Kind, VerbEntry, VerbTable};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
@@ -63,6 +98,29 @@ struct PluginHandle {
     events: Option<Mutex<UnixStream>>,
     events_tx: SyncSender<Value>,
     sock_path: PathBuf,
+    /// The plugin's `kernel/plugin` holding (F1) and its generation (the
+    /// spawn token): the stable denotation of this incarnation.
+    holding: u64,
+    generation: String,
+    pid: u32,
+    /// Position ceiling (F5 effect row) when spawned into a slot: the verbs
+    /// this plugin may invoke, before any capability is consulted.
+    offers: Option<Flat>,
+    /// Declared verb-order protocol (F6) and its current state.
+    protocol: Option<Protocol>,
+    proto_state: Mutex<Option<String>>,
+    /// Set by a graceful shutdown before the polite frame, so the exit path
+    /// that races it reports the true reason.
+    shutting_down: std::sync::atomic::AtomicBool,
+}
+
+/// A slot a plugin is spawned into (F5 `Mount`): `offers` is the row — the
+/// verbs a plugin here may invoke at most; `provides` names services (verb
+/// families) the slot guarantees present besides those already routed.
+#[derive(Clone, Debug, Default)]
+pub struct Slot {
+    pub offers: Vec<String>,
+    pub provides: Vec<String>,
 }
 
 enum SubTarget {
@@ -74,15 +132,20 @@ struct Sub {
     id: u64,
     topic: String,
     target: SubTarget,
+    /// The `kernel/subscription` holding backing this subscription.
+    holding: u64,
 }
 
 /// A routed verb: which plugin serves it, plus the model-facing metadata the
 /// plugin advertised in its hello (opaque to the kernel — stored and joined,
-/// never interpreted).
+/// never interpreted), and the verb character it declared (checked by the
+/// F4 truth table at spawn).
 struct RouteEntry {
     plugin: String,
     description: String,
     schema: Value,
+    kind: Option<&'static str>,
+    budgeted: Option<bool>,
 }
 
 struct HostInner {
@@ -120,12 +183,25 @@ impl Host {
 
     /// Spawn `bin args…` with `envs` added, wait for both hellos, register
     /// the plugin's verbs, and start its service threads. Returns the plugin
-    /// name (from its hello).
+    /// name (from its hello). No slot: no position ceiling.
     pub fn spawn(
         &self,
         bin: &Path,
         args: &[&str],
         envs: &[(&str, &str)],
+    ) -> Result<String, KernelError> {
+        self.spawn_in(bin, args, envs, None)
+    }
+
+    /// [`spawn`](Self::spawn) into a slot (F5): the plugin's declared
+    /// `requires` must fit the slot's row at the door, and later invokes are
+    /// bounded by it.
+    pub fn spawn_in(
+        &self,
+        bin: &Path,
+        args: &[&str],
+        envs: &[(&str, &str)],
+        slot: Option<&Slot>,
     ) -> Result<String, KernelError> {
         let idx = self.inner.next_spawn.fetch_add(1, Ordering::SeqCst);
         let sock_path = self
@@ -162,42 +238,28 @@ impl Host {
             Ok((stream, hello["hello"].clone()))
         };
 
-        let (serve_stream, name, verbs, tools_meta, mut expected) =
-            match accept_hello(&mut child) {
-                Ok((stream, h)) if h["role"] == "serve" => {
-                    let name = h["name"].as_str().unwrap_or("?").to_string();
-                    let verbs: Vec<String> = h["verbs"]
-                        .as_array()
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    // Optional per-verb tool metadata (description + schema),
-                    // joined into `grants` introspection responses.
-                    let tools_meta = h["tools"].clone();
-                    let channels: Vec<String> = h["channels"]
-                        .as_array()
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                                .collect()
-                        })
-                        .unwrap_or_else(|| vec!["client".to_string()]);
-                    (stream, name, verbs, tools_meta, channels)
-                }
-                Ok(_) => {
-                    let _ = child.kill();
-                    return Err(KernelError::Corrupt(
-                        "plugin hello: first connection must be role serve".into(),
-                    ));
-                }
-                Err(e) => {
-                    let _ = child.kill();
-                    return Err(e);
-                }
-            };
+        let (serve_stream, hello) = match accept_hello(&mut child) {
+            Ok((stream, h)) if h["role"] == "serve" => (stream, h),
+            Ok(_) => {
+                let _ = child.kill();
+                return Err(KernelError::Corrupt(
+                    "plugin hello: first connection must be role serve".into(),
+                ));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                return Err(e);
+            }
+        };
+        let name = hello["name"].as_str().unwrap_or("?").to_string();
+        let verbs: Vec<String> = str_array(&hello["verbs"]);
+        // Optional per-verb tool metadata (description + schema + kind +
+        // requires): joined into `grants`, checked by the F4/F5 laws below.
+        let tools_meta = hello["tools"].clone();
+        let mut expected: Vec<String> = hello["channels"]
+            .as_array()
+            .map(|_| str_array(&hello["channels"]))
+            .unwrap_or_else(|| vec!["client".to_string()]);
         if !expected.iter().any(|c| c == "client") {
             let _ = child.kill();
             return Err(KernelError::Corrupt(
@@ -239,16 +301,64 @@ impl Host {
         }
         let client_stream = client.expect("client channel present");
 
-        // Register verbs; a route conflict aborts the spawn.
-        {
-            let mut plugins = self.inner.plugins.lock().unwrap();
-            let mut routes = self.inner.routes.lock().unwrap();
-            if plugins.contains_key(&name) {
+        // ---- F4: the verb character the plugin declared, checked at the door.
+        let table = match build_verb_table(&name, &verbs, &tools_meta, &hello) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = child.kill();
+                return Err(KernelError::Denied(format!(
+                    "plugin {name}: verb metadata rejected: {e}"
+                )));
+            }
+        };
+        let protocol = table.derive_handler_policy(&name).protocol;
+
+        // ---- F5: slot admission — every verb's requires must fit the row.
+        if let Some(slot) = slot {
+            let manifest = manifest_from_meta(&name, &verbs, &tools_meta);
+            let mut provides: Vec<String> = slot.provides.clone();
+            provides.extend(self.routed_families());
+            let mount = Mount {
+                name: "slot".into(),
+                offers: Flat(slot.offers.iter().cloned().collect()),
+                provides: Flat(provides.into_iter().collect()),
+            };
+            if let Err(e) = admit_mount(&manifest, &mount) {
+                let _ = child.kill();
+                return Err(KernelError::Denied(format!(
+                    "plugin {name}: slot admission failed: {e:?}"
+                )));
+            }
+        }
+        let offers: Option<Flat> = slot.map(|s| Flat(s.offers.iter().cloned().collect()));
+
+        // ---- F1: the instance is a holding. Ledger first, host locks after.
+        let now = crate::db::now_unix();
+        let subject = format!("plugin:{name}");
+        let holding = match self.kernel.ledger.hold_exclusive(
+            &subject,
+            CLASS_PLUGIN,
+            &name,
+            &token,
+            None,
+            now,
+        ) {
+            Ok(id) => id,
+            Err(_) => {
                 let _ = child.kill();
                 return Err(KernelError::Denied(format!("plugin name taken: {name}")));
             }
+        };
+        let pid = child.id();
+
+        // Register verbs; a route conflict aborts the spawn (and releases the
+        // holding again — nothing in the ledger outlives a failed spawn).
+        {
+            let mut plugins = self.inner.plugins.lock().unwrap();
+            let mut routes = self.inner.routes.lock().unwrap();
             if let Some(v) = verbs.iter().find(|v| routes.contains_key(*v)) {
                 let _ = child.kill();
+                let _ = self.kernel.ledger.release(holding, &token, now);
                 return Err(KernelError::Denied(format!("verb already routed: {v}")));
             }
             let (events_tx, events_rx) = sync_channel::<Value>(EVENT_QUEUE);
@@ -258,9 +368,17 @@ impl Host {
                 events: events.map(Mutex::new),
                 events_tx,
                 sock_path: sock_path.clone(),
+                holding,
+                generation: token.clone(),
+                pid,
+                offers,
+                protocol,
+                proto_state: Mutex::new(None),
+                shutting_down: std::sync::atomic::AtomicBool::new(false),
             });
             for v in &verbs {
                 let meta = &tools_meta[v.as_str()];
+                let entry = table.lookup(&name, v).ok();
                 routes.insert(
                     v.clone(),
                     RouteEntry {
@@ -271,6 +389,8 @@ impl Host {
                         } else {
                             json!({"type": "object"})
                         },
+                        kind: entry.map(kind_label),
+                        budgeted: entry.map(|e| e.bears_budget()),
                     },
                 );
             }
@@ -286,8 +406,32 @@ impl Host {
 
         self.audit(json!({
             "event": "plugin.spawned", "plugin": name, "verbs": verbs,
+            "holding": holding, "pid": pid,
         }));
         Ok(name)
+    }
+
+    /// Verb families currently routed (the services present for F5 `deps`).
+    fn routed_families(&self) -> Vec<String> {
+        let routes = self.inner.routes.lock().unwrap();
+        let mut fams: Vec<String> = routes
+            .keys()
+            .map(|v| v.split("::").next().unwrap_or(v).to_string())
+            .collect();
+        fams.sort();
+        fams.dedup();
+        fams
+    }
+
+    /// OS pid of a running plugin (tests kill plugins with it).
+    pub fn pid(&self, plugin: &str) -> Option<u32> {
+        self.inner.plugins.lock().unwrap().get(plugin).map(|h| h.pid)
+    }
+
+    /// Crash-only reclamation of a plugin's holdings (children first) with
+    /// the physical inverses — the one teardown path. Returns rows released.
+    pub fn reclaim(&self, plugin: &str, reason: &str) -> usize {
+        reclaim(&self.kernel, &self.inner, plugin, reason)
     }
 
     /// Kernel-initiated verb call on a named plugin (no capability check:
@@ -319,14 +463,21 @@ impl Host {
     }
 
     /// Subscribe an in-process consumer (the CLI / model-facing loop) to a
-    /// topic. Exact-match topics for now.
+    /// topic (exact or trailing-`*` prefix pattern). The subscription is a
+    /// `kernel/subscription` holding of the kernel itself.
     pub fn subscribe_local(&self, topic: &str) -> (u64, Receiver<Value>) {
         let (tx, rx) = sync_channel::<Value>(EVENT_QUEUE);
         let id = self.inner.next_sub.fetch_add(1, Ordering::SeqCst);
+        let holding = self
+            .kernel
+            .ledger
+            .hold_exclusive("kernel", CLASS_SUBSCRIPTION, &id.to_string(), "sub", None, crate::db::now_unix())
+            .unwrap_or(0);
         self.inner.subs.lock().unwrap().push(Sub {
             id,
             topic: topic.to_string(),
             target: SubTarget::Local(tx),
+            holding,
         });
         (id, rx)
     }
@@ -361,26 +512,24 @@ impl Host {
         (m.context_bytes, m.data_bytes)
     }
 
-    /// Graceful-ish shutdown: send the shutdown op, give the plugin a moment,
-    /// then make sure it is gone.
+    /// Graceful shutdown = the crash-only path triggered early (endstate
+    /// §5.3): a polite `shutdown` frame and a moment to exit, then the same
+    /// reclamation any death gets.
     pub fn shutdown(&self, plugin: &str) {
-        let handle = { self.inner.plugins.lock().unwrap().remove(plugin) };
+        let handle = { self.inner.plugins.lock().unwrap().get(plugin).cloned() };
         if let Some(h) = handle {
-            cleanup_plugin(&self.inner, plugin);
+            h.shutting_down.store(true, Ordering::SeqCst);
             if let Ok(mut s) = h.serve.lock() {
                 let _ = frame::write_frame(&mut *s, &json!({"op": "shutdown"}));
             }
-            let mut child = h.child.lock().unwrap();
             for _ in 0..20 {
-                if matches!(child.try_wait(), Ok(Some(_))) {
+                if matches!(h.child.lock().unwrap().try_wait(), Ok(Some(_))) {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = std::fs::remove_file(&h.sock_path);
         }
+        reclaim(&self.kernel, &self.inner, plugin, "shutdown");
     }
 
     pub fn shutdown_all(&self) {
@@ -402,9 +551,32 @@ impl Drop for Host {
 }
 
 /// One serve-channel request/response under the channel lock. Holding the
-/// lock across write+read is what keeps the channel unmultiplexed.
+/// lock across write+read is what keeps the channel unmultiplexed — and it
+/// is also what makes the F6 protocol check below precise: calls to one
+/// plugin are serialized, so the automaton steps in call order, advancing
+/// only when the call succeeded.
 fn call_on(handle: &PluginHandle, verb: &str, args: Value) -> Result<Value, KernelError> {
     let mut s = handle.serve.lock().unwrap();
+    let next_state = match &handle.protocol {
+        Some(p) => {
+            let cur = handle
+                .proto_state
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| p.initial.clone());
+            match p.step(&cur, verb) {
+                Ok(n) => Some(n),
+                Err(v) => {
+                    return Err(KernelError::Denied(format!(
+                        "protocol violation: {} in state {}",
+                        v.verb, v.state
+                    )));
+                }
+            }
+        }
+        None => None,
+    };
     frame::write_frame(&mut *s, &json!({"op": "call", "verb": verb, "args": args}))
         .map_err(|e| KernelError::Corrupt(format!("call write: {e}")))?;
     let resp = frame::read_frame(&mut *s)
@@ -412,7 +584,239 @@ fn call_on(handle: &PluginHandle, verb: &str, args: Value) -> Result<Value, Kern
     if let Some(err) = resp.get("err").and_then(|e| e.as_str()) {
         return Err(KernelError::Denied(format!("plugin error: {err}")));
     }
+    if let Some(n) = next_state {
+        *handle.proto_state.lock().unwrap() = Some(n);
+    }
     Ok(resp.get("ok").cloned().unwrap_or(Value::Null))
+}
+
+fn str_array(v: &Value) -> Vec<String> {
+    v.as_array()
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
+}
+
+/// The plugin's F4 truth table from its hello: class = the plugin (one
+/// handler, one table — D1), verbs keyed by their full `family::verb` name.
+/// Verbs without a declared `kind` are simply not in the table (no
+/// character known; they route as before).
+fn build_verb_table(
+    name: &str,
+    verbs: &[String],
+    tools_meta: &Value,
+    hello: &Value,
+) -> Result<VerbTable, String> {
+    let mut table = VerbTable::new();
+    if let Some(rho) = hello.get("holding_rho").and_then(|r| r.as_str()) {
+        let rho = match rho {
+            "inverse" => RevertGrade::Inverse,
+            "compensable" => RevertGrade::Compensable,
+            "external" => RevertGrade::External,
+            other => return Err(format!("unknown holding_rho {other}")),
+        };
+        table.declare_class(name, rho).map_err(|e| format!("{e:?}"))?;
+    }
+    for v in verbs {
+        let meta = &tools_meta[v.as_str()];
+        if let Some(entry) = kind_from_meta(meta)? {
+            table
+                .register(name, v, entry)
+                .map_err(|e| format!("{v}: {e:?}"))?;
+        }
+    }
+    if let Some(proto) = protocol_from_json(hello.get("protocol"))? {
+        table
+            .declare_protocol(name, proto)
+            .map_err(|e| format!("protocol: {e:?}"))?;
+    }
+    table.check_all().map_err(|e| format!("{e:?}"))?;
+    Ok(table)
+}
+
+fn kind_from_meta(meta: &Value) -> Result<Option<VerbEntry>, String> {
+    let Some(kind) = meta.get("kind").and_then(|k| k.as_str()) else {
+        return Ok(None);
+    };
+    let compensate = meta.get("compensate_with").and_then(|c| c.as_str()).map(str::to_string);
+    let mut entry = match kind {
+        "repeatable" => VerbEntry::repeatable(),
+        "repeatable_shared" => VerbEntry::repeatable_shared(),
+        "transforming" => VerbEntry::transforming(),
+        "consuming" => {
+            let world = match meta.get("world").and_then(|w| w.as_str()) {
+                None | Some("held") => ConsumeGrade::Held,
+                Some("compensable") => ConsumeGrade::Compensable {
+                    compensate_with: compensate
+                        .clone()
+                        .ok_or("consuming/compensable needs compensate_with")?,
+                },
+                Some("external") => ConsumeGrade::External,
+                Some(other) => return Err(format!("unknown consuming world {other}")),
+            };
+            VerbEntry::consuming(world)
+        }
+        "emitting" => {
+            let world = match meta.get("world").and_then(|w| w.as_str()) {
+                None | Some("external") => EmitGrade::External,
+                Some("compensable") => EmitGrade::Compensable {
+                    compensate_with: compensate
+                        .clone()
+                        .ok_or("emitting/compensable needs compensate_with")?,
+                },
+                Some(other) => return Err(format!("unknown emitting world {other}")),
+            };
+            let amortizable = meta.get("amortizable").and_then(|a| a.as_bool()).unwrap_or(true);
+            VerbEntry::emitting(world, amortizable)
+        }
+        other => return Err(format!("unknown verb kind {other}")),
+    };
+    if let Some(b) = meta.get("idempotent").and_then(|b| b.as_bool()) {
+        entry.idempotent = b;
+    }
+    if let Some(b) = meta.get("commutes").and_then(|b| b.as_bool()) {
+        entry.commutes = b;
+    }
+    if let Some(d) = meta.get("degrade").and_then(|d| d.as_str()) {
+        entry = entry.degrades_to(d);
+    }
+    Ok(Some(entry))
+}
+
+fn kind_label(e: &VerbEntry) -> &'static str {
+    match e.kind {
+        Kind::Repeatable => "repeatable",
+        Kind::Transforming => "transforming",
+        Kind::Consuming { .. } => "consuming",
+        Kind::Emitting { .. } => "emitting",
+    }
+}
+
+/// `{"initial": "s0", "transitions": [["s0", "family::verb", "s1"], …]}`.
+fn protocol_from_json(v: Option<&Value>) -> Result<Option<Protocol>, String> {
+    let Some(v) = v else { return Ok(None) };
+    if v.is_null() {
+        return Ok(None);
+    }
+    let initial = v
+        .get("initial")
+        .and_then(|i| i.as_str())
+        .ok_or("protocol needs an initial state")?;
+    let mut p = Protocol::new(initial);
+    for t in v.get("transitions").and_then(|t| t.as_array()).unwrap_or(&Vec::new()) {
+        let (Some(from), Some(verb), Some(to)) = (
+            t.get(0).and_then(|x| x.as_str()),
+            t.get(1).and_then(|x| x.as_str()),
+            t.get(2).and_then(|x| x.as_str()),
+        ) else {
+            return Err("protocol transition must be [from, verb, to]".into());
+        };
+        p = p.transition(from, verb, to);
+    }
+    Ok(Some(p))
+}
+
+/// The plugin's F5 manifest from its hello: per verb, the caps it needs to
+/// invoke and the services it depends on (`tools[verb].requires`).
+fn manifest_from_meta(name: &str, verbs: &[String], tools_meta: &Value) -> Manifest {
+    let mut m = Manifest {
+        driver: name.to_string(),
+        verbs: BTreeMap::new(),
+    };
+    for v in verbs {
+        let req = &tools_meta[v.as_str()]["requires"];
+        m.verbs.insert(
+            v.clone(),
+            Requires {
+                caps: Flat(str_array(&req["caps"]).into_iter().collect()),
+                deps: Flat(str_array(&req["deps"]).into_iter().collect()),
+                uses: Default::default(),
+            },
+        );
+    }
+    m
+}
+
+/// The host as the F2 `World`: the physical inverses of the kernel's
+/// built-in holdings. Called with the ledger lock held; takes host locks only.
+struct HostWorld {
+    inner: Arc<HostInner>,
+}
+
+impl World for HostWorld {
+    fn release(&mut self, item: &LiveItem) -> Result<(), ()> {
+        match item.class_id.as_str() {
+            CLASS_SUBSCRIPTION => {
+                let id: u64 = item.instance.parse().unwrap_or(0);
+                self.inner.subs.lock().unwrap().retain(|s| s.id != id);
+                Ok(())
+            }
+            CLASS_PLUGIN => {
+                // Only this incarnation (generation = spawn token): a row of an
+                // older incarnation must never take down a newer plugin of the
+                // same name.
+                let handle = {
+                    let mut plugins = self.inner.plugins.lock().unwrap();
+                    let same = plugins
+                        .get(&item.instance)
+                        .map(|h| h.generation == item.generation)
+                        .unwrap_or(false);
+                    if same { plugins.remove(&item.instance) } else { None }
+                };
+                if let Some(h) = handle {
+                    kill_and_reap(&h);
+                    cleanup_plugin(&self.inner, &item.instance);
+                }
+                Ok(())
+            }
+            _ => Ok(()), // nothing physical behind other rows
+        }
+    }
+    fn compensate(&mut self, _item: &LiveItem, _key: &str) -> Result<bool, ()> {
+        Ok(true) // no compensable built-in class
+    }
+}
+
+fn kill_and_reap(h: &PluginHandle) {
+    let mut child = h.child.lock().unwrap();
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&h.sock_path);
+}
+
+/// The one teardown path (crash-only): release the plugin's ownership
+/// closure children first through `HostWorld`, then audit. Idempotent — a
+/// second call for the same plugin finds nothing to release.
+fn reclaim(kernel: &Arc<Kernel>, inner: &Arc<HostInner>, name: &str, reason: &str) -> usize {
+    let subject = format!("plugin:{name}");
+    let now = crate::db::now_unix();
+    let mut world = HostWorld { inner: inner.clone() };
+    let (outcome, released) = match kernel.ledger.teardown(&subject, &mut world, now) {
+        Ok(x) => x,
+        Err(e) => {
+            let _ = kernel.audit.lock().unwrap().append(json!({
+                "event": "plugin.reclaim_error", "plugin": name, "reason": reason,
+                "error": e.to_string(),
+            }));
+            (RunOutcome::Completed { failed: Vec::new() }, 0)
+        }
+    };
+    // Defensive: a handle the ledger did not know about still gets cleaned.
+    let stray = inner.plugins.lock().unwrap().remove(name);
+    if let Some(h) = stray {
+        kill_and_reap(&h);
+        cleanup_plugin(inner, name);
+    }
+    let failed = match &outcome {
+        RunOutcome::Completed { failed } => failed.clone(),
+        RunOutcome::Crashed => Vec::new(),
+    };
+    if released > 0 || !failed.is_empty() {
+        let _ = kernel.audit.lock().unwrap().append(json!({
+            "event": "plugin.reclaimed", "plugin": name, "reason": reason,
+            "released": released, "failed": failed,
+        }));
+    }
+    released
 }
 
 /// Per-plugin thread draining the bounded event queue onto the plugin's
@@ -434,38 +838,38 @@ fn spawn_event_pump(handle: Arc<PluginHandle>, rx: Receiver<Value>) {
 /// (m0 §3 — never let a slow consumer wedge the kernel).
 fn dispatch_event(kernel: &Arc<Kernel>, inner: &Arc<HostInner>, topic: &str, data: Value) -> usize {
     enum Target {
-        Local(u64, SyncSender<Value>),
-        Plugin(u64, String),
+        Local(u64, u64, SyncSender<Value>),
+        Plugin(u64, u64, String),
     }
     let targets: Vec<Target> = {
         let subs = inner.subs.lock().unwrap();
         subs.iter()
             .filter(|s| topic_matches(&s.topic, topic))
             .map(|s| match &s.target {
-                SubTarget::Local(tx) => Target::Local(s.id, tx.clone()),
-                SubTarget::Plugin(name) => Target::Plugin(s.id, name.clone()),
+                SubTarget::Local(tx) => Target::Local(s.id, s.holding, tx.clone()),
+                SubTarget::Plugin(name) => Target::Plugin(s.id, s.holding, name.clone()),
             })
             .collect()
     };
     let mut delivered = 0usize;
-    let mut drop_subs: Vec<u64> = Vec::new();
+    let mut drop_subs: Vec<(u64, u64)> = Vec::new();
     let mut kill_plugins: Vec<String> = Vec::new();
     for t in targets {
         match t {
-            Target::Local(id, tx) => {
+            Target::Local(id, holding, tx) => {
                 let ev = json!({"topic": topic, "data": data, "sub": id});
                 match tx.try_send(ev) {
                     Ok(()) => delivered += 1,
                     Err(TrySendError::Full(_)) => {
-                        drop_subs.push(id);
+                        drop_subs.push((id, holding));
                         let _ = kernel.audit.lock().unwrap().append(json!({
                             "event": "events.overflow", "sub": id, "topic": topic,
                         }));
                     }
-                    Err(TrySendError::Disconnected(_)) => drop_subs.push(id),
+                    Err(TrySendError::Disconnected(_)) => drop_subs.push((id, holding)),
                 }
             }
-            Target::Plugin(id, name) => {
+            Target::Plugin(id, holding, name) => {
                 let tx = inner
                     .plugins
                     .lock()
@@ -473,37 +877,36 @@ fn dispatch_event(kernel: &Arc<Kernel>, inner: &Arc<HostInner>, topic: &str, dat
                     .get(&name)
                     .map(|h| h.events_tx.clone());
                 let Some(tx) = tx else {
-                    drop_subs.push(id);
+                    drop_subs.push((id, holding));
                     continue;
                 };
                 let ev = json!({"op": "event", "sub": id, "topic": topic, "data": data});
                 match tx.try_send(ev) {
                     Ok(()) => delivered += 1,
                     Err(TrySendError::Full(_)) => {
-                        drop_subs.push(id);
+                        // A plugin that cannot keep up is reclaimed on the
+                        // one teardown path (its subscriptions go with it).
                         kill_plugins.push(name.clone());
                         let _ = kernel.audit.lock().unwrap().append(json!({
                             "event": "events.overflow", "sub": id, "topic": topic,
                             "plugin": name,
                         }));
                     }
-                    Err(TrySendError::Disconnected(_)) => drop_subs.push(id),
+                    Err(TrySendError::Disconnected(_)) => drop_subs.push((id, holding)),
                 }
             }
         }
     }
     if !drop_subs.is_empty() {
-        inner
-            .subs
-            .lock()
-            .unwrap()
-            .retain(|s| !drop_subs.contains(&s.id));
+        let ids: Vec<u64> = drop_subs.iter().map(|(id, _)| *id).collect();
+        inner.subs.lock().unwrap().retain(|s| !ids.contains(&s.id));
+        let now = crate::db::now_unix();
+        for (_, holding) in drop_subs {
+            let _ = kernel.ledger.release(holding, "sub", now);
+        }
     }
     for name in kill_plugins {
-        if let Some(h) = inner.plugins.lock().unwrap().remove(&name) {
-            cleanup_plugin(inner, &name);
-            let _ = h.child.lock().unwrap().kill();
-        }
+        reclaim(kernel, inner, &name, "events.overflow");
     }
     delivered
 }
@@ -540,7 +943,26 @@ fn spawn_client_loop(
         loop {
             let req = match frame::read_frame(&mut stream) {
                 Ok(r) => r,
-                Err(_) => return, // plugin went away; spawn/shutdown owns cleanup
+                Err(_) => {
+                    // The plugin went away (exit or crash): crash-only
+                    // reclamation of everything it held. A graceful
+                    // shutdown that raced us keeps its reason.
+                    let reason = inner
+                        .plugins
+                        .lock()
+                        .unwrap()
+                        .get(&name)
+                        .map(|h| {
+                            if h.shutting_down.load(Ordering::SeqCst) {
+                                "shutdown"
+                            } else {
+                                "exited"
+                            }
+                        })
+                        .unwrap_or("exited");
+                    reclaim(&kernel, &inner, &name, reason);
+                    return;
+                }
             };
             count_context(&inner, &req);
             let resp = handle_client_op(&kernel, &inner, &name, &req, &mut stream);
@@ -582,6 +1004,25 @@ fn handle_client_op(
             let short = verb.rsplit("::").next().unwrap_or(verb);
             let subject = format!("plugin:{name}");
             let resource = format!("driver:{family}");
+            // F5 effect row: the slot's position ceiling comes before the
+            // subject's grants (actual = row ∩ grant) — and before any
+            // budget is spent.
+            let in_row = inner
+                .plugins
+                .lock()
+                .unwrap()
+                .get(name)
+                .map(|h| h.offers.as_ref().map(|o| o.0.contains(verb)).unwrap_or(true))
+                .unwrap_or(true);
+            if !in_row {
+                let _ = kernel.audit.lock().unwrap().append(json!({
+                    "event": "invoke.denied", "from": name, "verb": verb,
+                    "reason": "verb outside the slot row",
+                }));
+                return Err(KernelError::Denied(format!(
+                    "verb outside the slot row: {verb}"
+                )));
+            }
             let cap = match kernel.caps.find_and_exercise(&subject, &resource, short, now) {
                 Ok(id) => id,
                 Err(e) => {
@@ -631,7 +1072,8 @@ fn handle_client_op(
                 };
                 for short in &cap.verbs {
                     let verb = format!("{family}::{short}");
-                    let this = cap.constraints.counts.get(short).copied();
+                    // Balance = capacity − fold of spend rows (F1), a snapshot.
+                    let this = kernel.caps.counts_left(cap, short);
                     merged
                         .entry(verb)
                         .and_modify(|acc| {
@@ -648,15 +1090,22 @@ fn handle_client_op(
             let grants: Vec<Value> = merged
                 .into_iter()
                 .map(|(verb, counts)| {
-                    let (description, schema) = routes
+                    let (description, schema, kind, budgeted) = routes
                         .get(&verb)
-                        .map(|e| (e.description.clone(), e.schema.clone()))
-                        .unwrap_or_else(|| (String::new(), json!({"type": "object"})));
+                        .map(|e| (e.description.clone(), e.schema.clone(), e.kind, e.budgeted))
+                        .unwrap_or_else(|| (String::new(), json!({"type": "object"}), None, None));
                     let mut g = json!({
                         "verb": verb, "description": description, "schema": schema,
                     });
                     if let Some(n) = counts {
                         g["counts_left"] = json!(n);
+                    }
+                    // F4: the verb character the serving plugin declared.
+                    if let Some(k) = kind {
+                        g["kind"] = json!(k);
+                    }
+                    if let Some(b) = budgeted {
+                        g["budgeted"] = json!(b);
                     }
                     g
                 })
@@ -674,25 +1123,49 @@ fn handle_client_op(
         Some("subscribe") => {
             let topic = req["topic"].as_str().unwrap_or("").to_string();
             let id = inner.next_sub.fetch_add(1, Ordering::SeqCst);
+            // A standing inbound channel is a holding, child of the plugin's
+            // own holding: teardown unsubscribes before it kills.
+            let parent = inner.plugins.lock().unwrap().get(name).map(|h| h.holding);
+            let subject = format!("plugin:{name}");
+            let holding = kernel.ledger.hold_exclusive(
+                &subject,
+                CLASS_SUBSCRIPTION,
+                &id.to_string(),
+                "sub",
+                parent,
+                now,
+            )?;
             inner.subs.lock().unwrap().push(Sub {
                 id,
                 topic: topic.clone(),
                 target: SubTarget::Plugin(name.to_string()),
+                holding,
             });
             let _ = kernel.audit.lock().unwrap().append(json!({
                 "event": "events.subscribed", "plugin": name, "topic": topic, "sub": id,
+                "holding": holding,
             }));
             Ok(json!({"ok": {"sub": id}}))
         }
         Some("unsubscribe") => {
-            // A plugin can only drop its own subscriptions.
+            // A plugin can only drop its own subscriptions. Find under the
+            // subs lock, release in the ledger without it (lock order), then
+            // remove.
             let id = req["sub"].as_u64().unwrap_or(0);
-            let mut subs = inner.subs.lock().unwrap();
-            let before = subs.len();
-            subs.retain(|s| {
-                !(s.id == id && matches!(&s.target, SubTarget::Plugin(n) if n == name))
-            });
-            let removed = before != subs.len();
+            let holding = {
+                let subs = inner.subs.lock().unwrap();
+                subs.iter()
+                    .find(|s| s.id == id && matches!(&s.target, SubTarget::Plugin(n) if n == name))
+                    .map(|s| s.holding)
+            };
+            let removed = match holding {
+                Some(h) => {
+                    let _ = kernel.ledger.release(h, "sub", now);
+                    inner.subs.lock().unwrap().retain(|s| s.id != id);
+                    true
+                }
+                None => false,
+            };
             Ok(json!({"ok": {"removed": removed}}))
         }
 

@@ -9,6 +9,13 @@
 // model receives handle + preview instead of the full text. Screenshots stop
 // being loose files: the bytes are ingested as an image artifact and the
 // verb returns its handle (the temp path rides along for a headful human).
+//
+// The hello carries the driver's declaration bundle (spec §6.4–§6.6): each
+// verb's character from tools.js (checked into the kernel's truth table at
+// spawn — an incoherent table refuses the spawn), the class's holding grade
+// (`holding_rho`: the browser slot is given back exactly by `close`, so
+// `inverse`), and the passthrough automaton below (enforced by the kernel on
+// every call).
 
 import { readFile } from "node:fs/promises";
 import { createWorkshop } from "./tools.js";
@@ -39,18 +46,43 @@ const { tools, driver } = createWorkshop({
 const byVerb = new Map(tools.map((t) => [`browser::${t.name.replace(/^browser_/, "")}`, t]));
 
 // The driver owns its tool metadata: advertised to the kernel, joined into
-// grants introspection, so a granted model driver needs no tool config.
+// grants introspection (description, schema, and the verb character), so a
+// granted model driver needs no tool config and can tell reads from effects.
 const toolsMeta = Object.fromEntries(
   [...byVerb.entries()].map(([verb, t]) => [
     verb,
-    { description: t.description, schema: t.inputSchema },
+    { description: t.description, schema: t.inputSchema, ...t.character },
   ]),
 );
+
+// The passthrough automaton (F6): once the window is handed to the human,
+// the agent must not drive until `resume` — in the `user` state the kernel
+// refuses navigate / click / type / submit before the call reaches us.
+// Observations (snapshot, wait_for, screenshot) and `open` stay outside the
+// automaton's scope; `close` always returns to `agent`.
+const V = (s) => `browser::${s}`;
+const protocol = {
+  initial: "agent",
+  transitions: [
+    ["agent", V("navigate"), "agent"],
+    ["agent", V("click"), "agent"],
+    ["agent", V("type"), "agent"],
+    ["agent", V("submit"), "agent"],
+    ["agent", V("login_passthrough"), "user"],
+    ["user", V("login_passthrough"), "user"],
+    ["user", V("resume"), "agent"],
+    ["agent", V("resume"), "agent"],
+    ["agent", V("close"), "agent"],
+    ["user", V("close"), "agent"],
+  ],
+};
 
 await servePlugin({
   name: "portos-browser",
   verbs: [...byVerb.keys()],
   tools: toolsMeta,
+  holdingRho: "inverse",
+  protocol,
   onCall: async (verb, args, client) => {
     clientRef.current = client;
     const tool = byVerb.get(verb);

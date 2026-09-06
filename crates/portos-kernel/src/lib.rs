@@ -5,7 +5,8 @@
 //! ### docs/architecture-v0.md §3.2
 //! Four responsibilities and nothing else.
 //!   1. capabilities and policy: [`caps`], [`plancheck`]
-//!   2. objects and handles: [`cas`]
+//!   2. objects and handles: [`cas`], and holdings: [`ledger`] (the F1/F2
+//!      resource ledger from `portos-rm`, persisted here)
 //!   3. plugin lifecycle and IPC: [`host`]
 //!   4. audit: [`audit`]
 //!
@@ -32,6 +33,7 @@ pub mod consent;
 pub mod db;
 pub mod host;
 pub mod interp;
+pub mod ledger;
 pub mod metrics;
 pub mod plancheck;
 
@@ -45,6 +47,8 @@ pub struct Kernel {
     pub cas: cas::Cas,
     /// Capability table
     pub caps: caps::CapStore,
+    /// Holding ledger (counting-budget pools, plugin and subscription holdings).
+    pub ledger: Arc<ledger::LedgerStore>,
     pub audit: Arc<Mutex<audit::AuditLog>>,
     pub consent_key: consent::ConsentKey,
 }
@@ -55,13 +59,23 @@ impl Kernel {
         let conn = db::open(root)?;
         let db = Arc::new(Mutex::new(conn));
         let cas = cas::Cas::new(root, db.clone())?;
-        let caps = caps::CapStore::new(db.clone());
+        let (ledger, stale) = ledger::LedgerStore::open(db.clone())?;
+        let ledger = Arc::new(ledger);
+        let caps = caps::CapStore::new(db.clone(), ledger.clone());
+        caps.rebuild_pools()?;
         let audit = Arc::new(Mutex::new(audit::AuditLog::open(root)?));
+        if stale > 0 {
+            let _ = audit.lock().unwrap().append(serde_json::json!({
+                "event": "ledger.reconciled", "stale_rows": stale,
+                "note": "plugin/subscription holdings of a previous kernel process tombstoned",
+            }));
+        }
         let consent_key = consent::ConsentKey::load_or_create(root)?;
         Ok(Kernel {
             root: root.to_path_buf(),
             cas,
             caps,
+            ledger,
             audit,
             consent_key,
         })

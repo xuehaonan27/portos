@@ -7,17 +7,24 @@
 // swap the implementation here and nothing above changes.
 //
 // A BrowserDriver implementation must provide:
-//   open({url})                  -> { snapshotId, url, title }
-//   navigate({url})              -> { snapshotId, url, title }
+//   open()                       -> { snapshotId, url, title, elements }  // launch (idempotent); never navigates
+//   navigate({url})              -> { snapshotId, url, title, elements }
 //   snapshot()                   -> { snapshotId, url, title, elements: [ElementRef] }
 //   click({ref, expectName?})    -> { snapshotId, ... , staleWarning? }
-//   type({ref, text, expectName?, submit?}) -> { snapshotId, ... }
+//   type({ref, text, expectName?}) -> { snapshotId, ... }               // fills only; never submits
+//   submit({ref, expectName?})   -> { snapshotId, ... }                  // presses Enter on the element
 //   waitFor({selector?, ms?, networkIdle?}) -> { ok, waited }
-//   screenshot({path?})          -> { path }        // returns a file path, NOT base64 in context
-//   passthroughBegin({url?})     -> { mode: 'user_driving', hint }
+//   screenshot({path?})          -> { path }        // a file path, NOT base64 in context; path is a
+//                                                   // driver-internal convenience (scratch file by default)
+//   passthroughBegin()           -> { mode: 'user_driving', hint }        // never navigates
 //   passthroughEnd()             -> { mode: 'agent_driving', url, loggedInHint }
 //   currentUrl()                 -> string | null   // for origin taint labels
 //   close()                      -> {}
+//
+// The split between what fills and what submits, and between launching and
+// navigating, is deliberate: each method has exactly one verb character in
+// the PortOS truth table (see tools.js), so a verb never changes character
+// with its arguments.
 //
 // ElementRef = { ref, role, name, tag, bbox:{x,y,w,h}, visible, editable }
 //   `ref` is a driver-session-local, volatile id (the two-layer-naming rule,

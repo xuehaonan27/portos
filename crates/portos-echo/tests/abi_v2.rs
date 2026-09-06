@@ -2,7 +2,8 @@
 //! chunked artifact streaming (D25), capability-gated invoke (D23/D26),
 //! the event bus, ephemeral refs, and the JS protocol client.
 
-use portos_kernel::host::Host;
+use portos_kernel::host::{Host, Slot};
+use portos_kernel::ledger::{CLASS_PLUGIN, CLASS_SUBSCRIPTION};
 use portos_kernel::Kernel;
 use portos_proto::cap::Constraints;
 use serde_json::{Value, json};
@@ -285,6 +286,248 @@ fn wildcard_topics_and_grants_introspection() {
     assert_eq!(list.len(), 2, "only granted verbs appear");
     drop(b);
 
+    host.shutdown_all();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+fn audit_events(root: &Path) -> Vec<Value> {
+    portos_kernel::audit::AuditLog::verify(&root.join("audit.log"))
+        .unwrap()
+        .into_iter()
+        .map(|e| e["body"].clone())
+        .collect()
+}
+
+/// F1 wired: a counting budget is a pool of rows. The declared capacity is
+/// never mutated, each exercise is a spend row through the issuer gate, the
+/// balance is a fold — and the rows are durable: reopening the kernel picks
+/// the budget up where it was.
+#[test]
+fn counting_budget_is_ledger_rows_and_survives_kernel_reopen() {
+    let (kernel, host, root) = setup("rows");
+    let a = spawn_echo(&host, "echoa");
+    let _b = spawn_echo(&host, "echob");
+    let mut counts = BTreeMap::new();
+    counts.insert("emit".to_string(), 2u64);
+    let cap = kernel
+        .caps
+        .mint(
+            "plugin:portos-echoa",
+            "driver:echob",
+            BTreeSet::from(["emit".to_string()]),
+            Constraints { expires_at: None, counts },
+            None,
+        )
+        .unwrap();
+    host.call(&a, "echoa::relay", json!(["echob::emit", ["one"]])).unwrap();
+    let stored = kernel.caps.get(&cap.cap_id).unwrap();
+    assert_eq!(stored.constraints.counts["emit"], 2, "capacity is immutable");
+    assert_eq!(kernel.caps.counts_left(&stored, "emit"), Some(1), "balance = capacity − spend rows");
+    kernel.ledger.invariant().unwrap();
+    host.shutdown_all();
+    drop(host);
+    drop(kernel);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    // Reopen the same root: spend rows reload, plugin rows of the previous
+    // process are tombstoned, and the same plugin names spawn again.
+    let kernel = Arc::new(Kernel::open(&root).unwrap());
+    let host = Host::new(kernel.clone(), &root.join("sock")).unwrap();
+    let a = spawn_echo(&host, "echoa");
+    let _b = spawn_echo(&host, "echob");
+    let stored = kernel.caps.get(&cap.cap_id).unwrap();
+    assert_eq!(kernel.caps.counts_left(&stored, "emit"), Some(1), "budget continues across restart");
+    assert!(host.call(&a, "echoa::relay", json!(["echob::emit", ["two"]])).is_ok());
+    assert!(host.call(&a, "echoa::relay", json!(["echob::emit", ["three"]])).is_err(), "gate refuses at capacity");
+    assert_eq!(kernel.caps.counts_left(&stored, "emit"), Some(0));
+    kernel.ledger.invariant().unwrap();
+    host.shutdown_all();
+    drop(host);
+    let events = audit_events(&root);
+    assert!(
+        !events.iter().any(|e| e["event"] == "ledger.reconciled"),
+        "a graceful shutdown leaves no stale rows for the reopen to reconcile"
+    );
+    assert_eq!(kernel.ledger.counts(CLASS_PLUGIN), (0, 4), "two incarnations of each plugin, all tombstoned");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// F2 wired: a plugin and its subscriptions are holdings; when the process
+/// dies, the one crash-only teardown path releases them children first,
+/// drops its routes and subscriptions, and audits. Graceful shutdown ends in
+/// the same ledger shape.
+#[test]
+fn plugin_death_is_reclaimed_crash_only_children_first() {
+    let (kernel, host, root) = setup("death");
+    let a = spawn_echo(&host, "echoa");
+    let b = spawn_echo(&host, "echob");
+    host.call(&a, "echoa::subscribe", json!(["echob::ping"])).unwrap();
+    let subject = "plugin:portos-echoa";
+    assert_eq!(kernel.ledger.live_closure(subject).len(), 2, "plugin holding + subscription holding");
+    assert_eq!(host.call(&b, "echob::publish", json!(["echob::ping", {"n": 1}])).unwrap()["delivered"], 1);
+
+    // The plugin dies without notice.
+    let pid = host.pid(&a).expect("pid");
+    std::process::Command::new("kill").args(["-9", &pid.to_string()]).status().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !kernel.ledger.live_snapshot(subject).is_empty() {
+        assert!(std::time::Instant::now() < deadline, "death never reclaimed");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(host.call(&a, "echoa::events", json!([])).is_err(), "handle gone");
+    assert!(host.call_verb("echoa::emit", json!(["x"])).is_err(), "route gone");
+    assert_eq!(
+        host.call(&b, "echob::publish", json!(["echob::ping", {"n": 2}])).unwrap()["delivered"],
+        0,
+        "subscription gone with its holder"
+    );
+    assert_eq!(kernel.ledger.counts(CLASS_PLUGIN), (1, 1), "echob live, echoa tombstoned");
+    assert_eq!(kernel.ledger.counts(CLASS_SUBSCRIPTION), (0, 1));
+    kernel.ledger.invariant().unwrap();
+
+    // Graceful shutdown is the same path, triggered early.
+    host.shutdown(&b);
+    assert_eq!(kernel.ledger.counts(CLASS_PLUGIN), (0, 2));
+    drop(host);
+    let events = audit_events(&root);
+    let reclaimed: Vec<&Value> = events.iter().filter(|e| e["event"] == "plugin.reclaimed").collect();
+    assert!(
+        reclaimed.iter().any(|e| e["plugin"] == "portos-echoa" && e["reason"] == "exited" && e["released"] == 2),
+        "death reclaimed both rows on the exited path: {reclaimed:?}"
+    );
+    assert!(reclaimed.iter().any(|e| e["plugin"] == "portos-echob" && e["reason"] == "shutdown"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// F4 wired: the verb character a plugin declares in its hello is checked by
+/// the truth table at the door (an incoherent declaration refuses the spawn
+/// and leaves nothing behind) and surfaces in grants introspection.
+#[test]
+fn verb_kind_metadata_is_checked_at_spawn_and_exposed_in_grants() {
+    let (kernel, host, root) = setup("kinds");
+    let bad = host.spawn(
+        Path::new(ECHO_BIN),
+        &[],
+        &[("PORTOS_ECHO_FAMILY", "echobad"), ("PORTOS_ECHO_BAD_KIND", "1")],
+    );
+    let err = bad.err().expect("incoherent verb metadata must refuse the spawn").to_string();
+    assert!(err.contains("verb metadata rejected"), "{err}");
+    assert!(kernel.ledger.live_snapshot("plugin:portos-echobad").is_empty(), "nothing held");
+    assert!(host.call_verb("echobad::emit", json!(["x"])).is_err(), "nothing routed");
+
+    let a = spawn_echo(&host, "echoa");
+    let _b = spawn_echo(&host, "echob");
+    let mut counts = BTreeMap::new();
+    counts.insert("emit".to_string(), 3u64);
+    kernel
+        .caps
+        .mint(
+            "plugin:portos-echoa",
+            "driver:echob",
+            BTreeSet::from(["emit".to_string(), "digest".to_string(), "relay".to_string()]),
+            Constraints { expires_at: None, counts },
+            None,
+        )
+        .unwrap();
+    let grants = host.call(&a, "echoa::grants", json!([])).unwrap();
+    let list = grants.as_array().unwrap();
+    let find = |v: &str| list.iter().find(|g| g["verb"] == v).cloned().unwrap();
+    assert_eq!(find("echob::emit")["kind"], "emitting");
+    assert_eq!(find("echob::emit")["budgeted"], true);
+    assert_eq!(find("echob::digest")["kind"], "repeatable");
+    assert_eq!(find("echob::digest")["budgeted"], false);
+    assert!(find("echob::relay").get("kind").is_none(), "verb without a declared kind carries none");
+
+    host.shutdown_all();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// F5 wired: a slot's row is the position ceiling. A plugin whose declared
+/// requires do not fit the row is refused at the door; a plugin inside a
+/// row cannot invoke outside it even when it holds the capability.
+#[test]
+fn slot_row_bounds_invoke_and_admits_requires() {
+    let (kernel, host, root) = setup("slot");
+    let _b = spawn_echo(&host, "echob");
+
+    let narrow = Slot { offers: vec!["echob::digest".into()], provides: vec![] };
+    let refused = host.spawn_in(
+        Path::new(ECHO_BIN),
+        &[],
+        &[("PORTOS_ECHO_FAMILY", "echoa"), ("PORTOS_ECHO_RELAY_REQUIRES", "echob::emit")],
+        Some(&narrow),
+    );
+    let err = refused.err().expect("requires outside the row must refuse the spawn").to_string();
+    assert!(err.contains("slot admission failed") && err.contains("VerbExceedsRow"), "{err}");
+
+    let unmet = host.spawn_in(
+        Path::new(ECHO_BIN),
+        &[],
+        &[("PORTOS_ECHO_FAMILY", "echoa"), ("PORTOS_ECHO_RELAY_DEPS", "nosuch")],
+        Some(&Slot { offers: vec![], provides: vec![] }),
+    );
+    let err = unmet.err().expect("unmet dependency must refuse the spawn").to_string();
+    assert!(err.contains("MissingDependency"), "{err}");
+
+    // Fits: relay requires echob::emit and depends on the echob family
+    // (already routed). Then the row bounds invoke regardless of grants.
+    let slot = Slot { offers: vec!["echob::emit".into()], provides: vec![] };
+    let a = host
+        .spawn_in(
+            Path::new(ECHO_BIN),
+            &[],
+            &[
+                ("PORTOS_ECHO_FAMILY", "echoa"),
+                ("PORTOS_ECHO_RELAY_REQUIRES", "echob::emit"),
+                ("PORTOS_ECHO_RELAY_DEPS", "echob"),
+            ],
+            Some(&slot),
+        )
+        .unwrap();
+    kernel
+        .caps
+        .mint(
+            "plugin:portos-echoa",
+            "driver:echob",
+            BTreeSet::from(["emit".to_string(), "make_ref".to_string()]),
+            Constraints::default(),
+            None,
+        )
+        .unwrap();
+    assert!(host.call(&a, "echoa::relay", json!(["echob::emit", ["in row"]])).is_ok());
+    let out = host.call(&a, "echoa::relay", json!(["echob::make_ref", []]));
+    assert!(out.is_err(), "granted but outside the row: refused");
+    host.shutdown_all();
+    drop(host);
+    let events = audit_events(&root);
+    assert!(events.iter().any(|e| e["event"] == "invoke.denied" && e["reason"] == "verb outside the slot row"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// F6 wired: a declared verb-order protocol is a safety property the kernel
+/// enforces precisely — the offending call is refused, state advances only
+/// on success.
+#[test]
+fn protocol_order_is_enforced_at_call() {
+    let (_kernel, host, root) = setup("proto");
+    let name = host
+        .spawn(
+            Path::new(ECHO_BIN),
+            &[],
+            &[("PORTOS_ECHO_FAMILY", "echo"), ("PORTOS_ECHO_PROTOCOL", "1")],
+        )
+        .unwrap();
+    let early = host.call(&name, "echo::use_ref", json!(["e1"]));
+    let err = early.err().expect("use_ref before make_ref violates the protocol").to_string();
+    assert!(err.contains("protocol violation"), "{err}");
+    let r = host.call(&name, "echo::make_ref", json!([])).unwrap();
+    let rid = r["ref"].as_str().unwrap().to_string();
+    assert!(host.call(&name, "echo::use_ref", json!([rid])).is_ok());
+    // A plugin-side error does not move the automaton: still open afterwards.
+    assert!(host.call(&name, "echo::use_ref", json!(["e999"])).is_err());
+    assert!(host.call(&name, "echo::make_ref", json!([])).is_ok());
+    // Verbs outside the protocol's scope are unaffected.
+    assert!(host.call(&name, "echo::events", json!([])).is_ok());
     host.shutdown_all();
     let _ = std::fs::remove_dir_all(&root);
 }

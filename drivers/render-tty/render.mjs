@@ -10,7 +10,11 @@
 // architecture-v0.md §10 is, in these terms, just a bigger renderer.
 //
 // Serves no verbs; holds no capabilities; consumes `model::session::*` via a
-// wildcard subscription.
+// wildcard subscription. Hence nothing to declare in the verb truth table
+// (F4 rows are per verb) — its one holding, the subscription, is booked by
+// the kernel itself. It does *read* the table's output: tool events carry
+// the verb's character (`verb_kind`, `budgeted`), so a free read and a
+// budgeted effect look different on screen.
 
 import { servePlugin } from "../../sdk/js/client.js";
 
@@ -32,12 +36,20 @@ await servePlugin({
       case "delta":
         process.stdout.write(data.text ?? "");
         break;
-      case "tool_call":
-        process.stdout.write(`\n${CYAN}⏺ ${data.verb}${RESET}\n`);
+      case "tool_call": {
+        // ◌ a read (repeatable); ⏺ an effect (anything budgeted).
+        const mark = data.verb_kind === "repeatable" ? "◌" : "⏺";
+        const tag = data.verb_kind
+          ? ` ${DIM}(${data.verb_kind}${data.budgeted ? ", budgeted" : ""})${RESET}`
+          : "";
+        process.stdout.write(`\n${CYAN}${mark} ${data.verb}${RESET}${tag}\n`);
         break;
-      case "tool_result":
-        process.stdout.write(`${DIM}⏺ ${data.verb} ${data.ok ? "done" : "failed"}${RESET}\n`);
+      }
+      case "tool_result": {
+        const mark = data.verb_kind === "repeatable" ? "◌" : "⏺";
+        process.stdout.write(`${DIM}${mark} ${data.verb} ${data.ok ? "done" : "failed"}${RESET}\n`);
         break;
+      }
       case "done":
         process.stdout.write(`\n${DIM}── turn done ──${RESET}\n`);
         break;

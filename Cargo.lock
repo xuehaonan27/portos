@@ -405,6 +405,7 @@ dependencies = [
  "blake3",
  "hex",
  "portos-proto",
+ "portos-rm",
  "rand",
  "regex",
  "rusqlite",
@@ -432,6 +433,10 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "portos-rm"
+version = "0.1.0"
 
 [[package]]
 name = "portos-sdk"

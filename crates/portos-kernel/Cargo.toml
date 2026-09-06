@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 portos-proto = { path = "../portos-proto" }
+portos-rm = { path = "../portos-rm", default-features = false }
 serde = { workspace = true }
 serde_json = { workspace = true }
 blake3 = { workspace = true }

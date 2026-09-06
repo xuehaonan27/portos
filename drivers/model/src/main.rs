@@ -11,10 +11,21 @@
 //!
 //! Config: `$PORTOS_MODELD_DIR/config.json` —
 //! `{backend, model, max_tokens, system, max_turns,
-//!   tools: [{verb, description, schema}]}`.
-//! The tool surface is config-declared for now (the kernel still enforces
-//! capabilities on every invoke; a grants-introspection op can replace the
-//! config list later). Nothing here touches the plan language (D31).
+//!   tools: [{verb, description, schema, kind?}]}`.
+//! The tool surface comes from `grants` introspection (D33) with the config
+//! list overriding per verb; the kernel still enforces capabilities on every
+//! invoke. Each granted verb arrives with the character its driver declared
+//! and the kernel checked (F4 `kind`/`budgeted`): it is shown to the model in
+//! the tool description and rides on the session's tool events as
+//! `verb_kind`, so reads and effects can be told apart end to end.
+//!
+//! This driver's own hello declares its verbs' characters too: `start`
+//! materializes a session (consuming/held; the class gives sessions back
+//! exactly, `holding_rho: inverse`), `send` is an external emission (the
+//! provider observes the transcript and bills it; one consent covers a
+//! conversation) that requires the egress stream verb, and `end` changes
+//! held state only (transforming, idempotent). Nothing here touches the plan
+//! language (D31).
 
 mod backend;
 mod backends;
@@ -68,15 +79,18 @@ fn load_tools(cfg: &Value) -> Result<Vec<ToolDef>, String> {
             if verb.contains("__") {
                 return Err(format!("tool verb may not contain '__': {verb}"));
             }
-            out.push(ToolDef {
+            let mut def = ToolDef::new(
                 verb,
-                description: t["description"].as_str().unwrap_or("").to_string(),
-                schema: if t["schema"].is_object() {
+                t["description"].as_str().unwrap_or(""),
+                if t["schema"].is_object() {
                     t["schema"].clone()
                 } else {
                     json!({"type": "object", "properties": {}})
                 },
-            });
+            );
+            def.kind = t["kind"].as_str().map(String::from);
+            def.budgeted = def.kind.as_deref().map(|k| k != "repeatable");
+            out.push(def);
         }
     }
     Ok(out)
@@ -105,6 +119,9 @@ fn artifact_read_tool() -> ToolDef {
             },
             "required": ["id"],
         }),
+        // A CAS read: immutable source, free, blind-replay safe.
+        kind: Some("repeatable".to_string()),
+        budgeted: Some(false),
     }
 }
 
@@ -128,23 +145,29 @@ fn assemble_tools(
                 if exclude.iter().any(|e| e == family) {
                     continue;
                 }
-                map.insert(
-                    verb.to_string(),
-                    ToolDef {
-                        verb: verb.to_string(),
-                        description: g["description"].as_str().unwrap_or("").to_string(),
-                        schema: if g["schema"].is_object() {
-                            g["schema"].clone()
-                        } else {
-                            json!({"type": "object"})
-                        },
-                    },
+                let mut def = ToolDef::new(
+                    verb,
+                    g["description"].as_str().unwrap_or(""),
+                    if g["schema"].is_object() { g["schema"].clone() } else { json!({"type": "object"}) },
                 );
+                def.kind = g["kind"].as_str().map(String::from);
+                def.budgeted = g["budgeted"].as_bool();
+                map.insert(verb.to_string(), def);
             }
         }
     }
     for t in config_tools {
-        map.insert(t.verb.clone(), t.clone());
+        // Config wins on description and schema; the verb character stays
+        // the kernel's (declared by the driver, checked at its spawn) unless
+        // the config states one itself.
+        let mut t = t.clone();
+        if t.kind.is_none() {
+            if let Some(seen) = map.get(&t.verb) {
+                t.kind = seen.kind.clone();
+                t.budgeted = seen.budgeted;
+            }
+        }
+        map.insert(t.verb.clone(), t);
     }
     map.entry(ARTIFACT_READ.to_string())
         .or_insert_with(artifact_read_tool);
@@ -175,9 +198,38 @@ fn main() -> std::io::Result<()> {
     let mut next_session = 0u64;
     let mut subscribed = false;
 
-    portos_sdk::serve(
+    // The declaration bundle: description/schema for grants introspection
+    // and each verb's character for the kernel's truth table (F4), plus what
+    // `send` needs from its slot row (F5): the egress stream verb.
+    let hello_extra = json!({
+        "tools": {
+            "model::start": {
+                "description": "Start a model session (optional system prompt); returns {session}.",
+                "schema": {"type": "object", "properties": {"system": {"type": "string"}}},
+                "kind": "consuming", "world": "held",
+            },
+            "model::send": {
+                "description": "Send one user message to a session and run the agentic loop \
+                                (provider turns, tool calls) to its final text.",
+                "schema": {"type": "object", "required": ["session", "text"],
+                           "properties": {"session": {"type": "string"}, "text": {"type": "string"}}},
+                "kind": "emitting", "world": "external", "amortizable": true,
+                "requires": {"caps": ["egress::http_stream"], "deps": ["egress"]},
+            },
+            "model::end": {
+                "description": "End a session; idempotent.",
+                "schema": {"type": "object", "required": ["session"],
+                           "properties": {"session": {"type": "string"}}},
+                "kind": "transforming", "idempotent": true,
+            },
+        },
+        "holding_rho": "inverse",
+    });
+
+    portos_sdk::serve_hello(
         "portos-modeld",
         &["model::start", "model::send", "model::end"],
+        hello_extra,
         move |verb, args, client| match verb {
             "model::start" => {
                 next_session += 1;

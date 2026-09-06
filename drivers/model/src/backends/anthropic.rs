@@ -111,7 +111,7 @@ impl Backend for Anthropic {
                     .map(|t| {
                         json!({
                             "name": mangle(&t.verb),
-                            "description": t.description,
+                            "description": t.provider_description(),
                             "input_schema": t.schema,
                         })
                     })

@@ -1,8 +1,11 @@
 //! Capabilities with counting constraints.
 //!
 //! A budget minted by user consent IS a counting capability. `counts` maps
-//! verb-class to remaining balance; excercise decrementstransactionally
-//! and never overdraws.
+//! verb-class to the **declared capacity** of that (cap, verb) pool. The
+//! kernel never mutates it: each exercise mints one spend row in the holding
+//! ledger through the issuer gate, and the remaining balance is recomputed
+//! from the rows (spec F1: no subtraction; rows are the truth). It never
+//! overdraws because the gate refuses at capacity.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -13,7 +16,7 @@ pub struct Constraints {
     /// Unix seconds; None = no expiry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
-    /// `counts` maps verb-class to remaining count.
+    /// `counts` maps verb-class to the pool capacity (immutable once minted).
     /// Absent verb class has unlimited budget, but currently only for
     /// observation verbs. Effect verbs should always be counted.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

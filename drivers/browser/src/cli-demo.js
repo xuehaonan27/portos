@@ -26,13 +26,14 @@ const T = Object.fromEntries(tools.map((t) => [t.name, t.handler]));
 
 try {
   console.log(`opening ${url} (${headless ? "headless" : "headful — watch the window"})`);
-  const snap = await T.browser_open({ url });
+  await T.browser_open(); // launch only; navigation is its own verb
+  const snap = await T.browser_navigate({ url });
   console.log(`\n${snap.title}  —  ${snap.elementCount} interactive elements:`);
   for (const e of snap.elements.slice(0, 20)) {
     console.log(`  ${e.ref.padEnd(4)} ${e.role.padEnd(10)} ${JSON.stringify(e.name).slice(0, 60)}`);
   }
 
-  const shot = await T.browser_screenshot({});
+  const shot = await T.browser_screenshot();
   console.log(`\nscreenshot → ${shot.path}`);
 
   // Show the seam's value: re-deliver the same snapshot through a handle-mode

@@ -137,9 +137,8 @@ export class PlaywrightDriver {
     return null;
   }
 
-  async open({ url } = {}) {
+  async open() {
     await this._ensure();
-    if (url) await this.page.goto(url, { waitUntil: "domcontentloaded" });
     return this._snap();
   }
 
@@ -165,13 +164,25 @@ export class PlaywrightDriver {
     return { ...snap, staleWarning };
   }
 
-  async type({ ref, text, expectName, submit } = {}) {
+  async type({ ref, text, expectName } = {}) {
     await this._ensure();
     const staleWarning = this._staleCheck(ref, expectName);
     const el = await this.page.$(`[data-wref="${ref}"]`);
     if (!el) throw new Error(`no element for ref ${ref} (snapshot may be stale)`);
     await el.fill(text, { timeout: 5000 });
-    if (submit) await el.press("Enter");
+    await this.page.waitForLoadState("domcontentloaded").catch(() => {});
+    const snap = await this._snap();
+    return { ...snap, staleWarning };
+  }
+
+  // Enter on the element: the form's own submission path. Kept apart from
+  // type() so submitting is always its own, separately consented verb.
+  async submit({ ref, expectName } = {}) {
+    await this._ensure();
+    const staleWarning = this._staleCheck(ref, expectName);
+    const el = await this.page.$(`[data-wref="${ref}"]`);
+    if (!el) throw new Error(`no element for ref ${ref} (snapshot may be stale)`);
+    await el.press("Enter", { timeout: 5000 });
     await this.page.waitForLoadState("domcontentloaded").catch(() => {});
     const snap = await this._snap();
     return { ...snap, staleWarning };
@@ -198,11 +209,12 @@ export class PlaywrightDriver {
     return this.page ? this.page.url() : null;
   }
 
-  async passthroughBegin({ url } = {}) {
+  async passthroughBegin() {
     await this._ensure();
-    if (url) await this.page.goto(url, { waitUntil: "domcontentloaded" });
     // In a headful window the human now types directly. Agent input is not
-    // sent during this phase (the caller is expected to stop driving).
+    // sent during this phase; over PortOS the kernel enforces that (the
+    // passthrough automaton declared in plugin.js refuses driving verbs
+    // until passthroughEnd).
     return {
       mode: "user_driving",
       hint: "在浏览器窗口里人肉完成登录/验证,然后调用 passthroughEnd。密码/passkey 不经过 agent。",

@@ -203,12 +203,20 @@ export class KernelClient {
  * Connect both channels, declare verbs, and serve until shutdown.
  * onCall(verb, args, client) → result (thrown errors become {"err"}).
  * onEvent(topic, data) receives subscribed events.
- * tools (optional): per-verb metadata {"family::verb": {description, schema}}
- *   advertised to the kernel and joined into grants introspection.
+ * tools (optional): per-verb metadata {"family::verb": {description, schema,
+ *   kind, world, compensate_with, amortizable, idempotent, commutes, degrade,
+ *   requires: {caps, deps}}} advertised to the kernel: description/schema are
+ *   joined into grants introspection; kind is checked by the kernel's verb
+ *   truth table at spawn (an incoherent declaration refuses the spawn);
+ *   requires is checked against the slot row when spawned into a slot.
+ * holdingRho (optional): "inverse" | "compensable" | "external" — how this
+ *   plugin's holdings are given back (needed for held/transforming verbs).
+ * protocol (optional): {initial, transitions: [[from, "family::verb", to], …]}
+ *   — a verb-order safety automaton the kernel enforces on calls.
  * onReady (optional): async hook run with the client once connected, before
  *   serving — where a passive plugin (e.g. a renderer) subscribes.
  */
-export async function servePlugin({ name, verbs, tools, onCall, onEvent, onReady }) {
+export async function servePlugin({ name, verbs, tools, holdingRho, protocol, onCall, onEvent, onReady }) {
   const sock = process.env.PORTOS_PLUGIN_SOCK;
   if (!sock) throw new Error("PORTOS_PLUGIN_SOCK unset");
   const token = process.env.PORTOS_PLUGIN_TOKEN ?? "";
@@ -218,6 +226,8 @@ export async function servePlugin({ name, verbs, tools, onCall, onEvent, onReady
   // events channel (which sync-threaded plugins need) is unnecessary here.
   const serveHello = { name, abi: ABI_VERSION, role: "serve", token, verbs, channels: ["client"] };
   if (tools) serveHello.tools = tools;
+  if (holdingRho) serveHello.holding_rho = holdingRho;
+  if (protocol) serveHello.protocol = protocol;
   const serveChan = await connectChannel(sock, { hello: serveHello });
   const clientChan = await connectChannel(sock, {
     hello: { name, abi: ABI_VERSION, role: "client", token },

@@ -34,6 +34,25 @@ pub fn open(root: &Path) -> Result<Connection, rusqlite::Error> {
             json       TEXT NOT NULL,
             created_at INTEGER NOT NULL
         );
+        -- Holding ledger (spec F1): one row per fragment, release = tombstone,
+        -- the composed value is only ever recomputed. Mirrors
+        -- crates/portos-rm/schema.sql `holding`; write-through from ledger.rs.
+        CREATE TABLE IF NOT EXISTS holdings (
+            id               INTEGER PRIMARY KEY,
+            subject          TEXT NOT NULL,
+            class_id         TEXT NOT NULL,
+            instance         TEXT NOT NULL,
+            frag             TEXT NOT NULL,      -- JSON fragment (ledger.rs::frag_to_json)
+            generation       TEXT NOT NULL,
+            parent           INTEGER REFERENCES holdings(id),
+            lease_expires_at INTEGER,
+            acquired_at      INTEGER NOT NULL,
+            released_at      INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS holdings_live
+            ON holdings(class_id, instance) WHERE released_at IS NULL;
+        CREATE INDEX IF NOT EXISTS holdings_subject
+            ON holdings(subject) WHERE released_at IS NULL;
         "#,
     )?;
     Ok(conn)

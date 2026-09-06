@@ -219,6 +219,7 @@ fn agentic_loop_end_to_end_with_tool_call() {
     // result, and the final text.
     let mut deltas = String::new();
     let mut kinds = Vec::new();
+    let mut call_character = None;
     loop {
         let ev = rx
             .recv_timeout(std::time::Duration::from_secs(5))
@@ -227,6 +228,9 @@ fn agentic_loop_end_to_end_with_tool_call() {
         let kind = d["kind"].as_str().unwrap_or("?").to_string();
         if kind == "delta" {
             deltas.push_str(d["text"].as_str().unwrap_or(""));
+        }
+        if kind == "tool_call" {
+            call_character = Some((d["verb_kind"].clone(), d["budgeted"].clone()));
         }
         kinds.push(kind.clone());
         if kind == "done" {
@@ -237,6 +241,14 @@ fn agentic_loop_end_to_end_with_tool_call() {
     assert_eq!(deltas, "Let me make a ref.Ref created.");
     assert!(kinds.contains(&"tool_call".to_string()));
     assert!(kinds.contains(&"tool_result".to_string()));
+    // The config declared the tool without a character; the grant carries
+    // the one echo declared (make_ref is transforming), and it rides on the
+    // activity event for renderers.
+    assert_eq!(
+        call_character,
+        Some((json!("transforming"), json!(true))),
+        "tool_call event carries the kernel-checked verb character"
+    );
 
     // What the provider actually received: the injected key (proof modeld
     // ran with zero credentials), the mangled tool name, the system prompt —
@@ -361,7 +373,15 @@ fn introspected_tools_and_artifact_read() {
     // plus the built-in reader — and egress stays plumbing, never a tool.
     assert!(reqs[0].contains("echoa__emit"), "introspected tool present");
     assert!(reqs[0].contains("Print a line"), "driver-advertised description flowed through");
+    assert!(
+        reqs[0].contains("[kind: emitting; external effect; budgeted]"),
+        "the model is told echo's emit is a budgeted external effect"
+    );
     assert!(reqs[0].contains("artifact__read"), "built-in reader present");
+    assert!(
+        reqs[0].contains("[kind: repeatable; read-only, safe to repeat; not budgeted]"),
+        "the model is told the artifact reader is a free read"
+    );
     assert!(!reqs[0].contains("egress__"), "egress must not surface as a model tool");
     // The artifact's full content reached the provider via artifact::read.
     assert!(reqs[1].contains("tool_result"));

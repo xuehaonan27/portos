@@ -33,14 +33,54 @@ fn main() -> std::io::Result<()> {
     .map(|v| format!("{family}::{v}"))
     .collect();
     let verb_refs: Vec<&str> = verbs.iter().map(|s| s.as_str()).collect();
-    // Advertise metadata for one verb so grants introspection has something
-    // to join against in tests.
-    let tools_meta = json!({
-        format!("{family}::emit"): {
+    // The declaration bundle: description/schema for grants introspection,
+    // and each verb's character for the kernel's F4 truth table. Env toggles
+    // let the tests exercise the doors:
+    //   PORTOS_ECHO_BAD_KIND=1        declare emit repeatable-but-not-idempotent (incoherent)
+    //   PORTOS_ECHO_RELAY_REQUIRES=a,b  relay requires these caps (F5 slot admission)
+    //   PORTOS_ECHO_RELAY_DEPS=x,y      relay depends on these families
+    //   PORTOS_ECHO_PROTOCOL=1        declare make_ref-before-use_ref as a protocol (F6)
+    let v = |s: &str| format!("{family}::{s}");
+    let list = |env: &str| -> Vec<String> {
+        std::env::var(env)
+            .ok()
+            .map(|s| s.split(',').filter(|x| !x.is_empty()).map(str::to_string).collect())
+            .unwrap_or_default()
+    };
+    let emit_kind = if std::env::var("PORTOS_ECHO_BAD_KIND").is_ok() {
+        json!({"kind": "repeatable", "idempotent": false})
+    } else {
+        json!({"kind": "emitting", "world": "external", "amortizable": true})
+    };
+    let mut tools_meta = json!({
+        v("emit"): {
             "description": "Print a line to the echo driver's stdout.",
             "schema": {"type": "object", "properties": {"text": {"type": "string"}}},
         },
+        v("digest"): {"kind": "repeatable"},
+        v("events"): {"kind": "repeatable"},
+        v("grants"): {"kind": "repeatable"},
+        v("use_ref"): {"kind": "repeatable"},
+        v("publish"): {"kind": "emitting", "world": "external", "amortizable": true},
+        v("make_ref"): {"kind": "transforming"},
+        v("put_pattern"): {"kind": "transforming"},
+        v("subscribe"): {"kind": "consuming", "world": "held"},
+        v("relay"): {"requires": {"caps": list("PORTOS_ECHO_RELAY_REQUIRES"), "deps": list("PORTOS_ECHO_RELAY_DEPS")}},
     });
+    for (k, val) in emit_kind.as_object().unwrap() {
+        tools_meta[v("emit")][k] = val.clone();
+    }
+    let mut hello_extra = json!({"tools": tools_meta, "holding_rho": "inverse"});
+    if std::env::var("PORTOS_ECHO_PROTOCOL").is_ok() {
+        hello_extra["protocol"] = json!({
+            "initial": "idle",
+            "transitions": [
+                ["idle", v("make_ref"), "open"],
+                ["open", v("make_ref"), "open"],
+                ["open", v("use_ref"), "open"],
+            ],
+        });
+    }
 
     let mut ephemeral: HashSet<String> = HashSet::new();
     let mut next_ref = 0u32;
@@ -48,10 +88,10 @@ fn main() -> std::io::Result<()> {
     let received_by_call = received.clone();
 
     let prefix = format!("{family}::");
-    portos_sdk::serve_full(
+    portos_sdk::serve_hello(
         &name,
         &verb_refs,
-        tools_meta,
+        hello_extra,
         move |verb, args, client| {
             let short = verb.strip_prefix(&prefix).unwrap_or(verb);
             let arg = |i: usize| args.get(i).cloned().unwrap_or(Value::Null);

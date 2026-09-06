@@ -142,6 +142,33 @@ pub fn serve_full<F, G>(
     name: &str,
     verbs: &[&str],
     tools_meta: Value,
+    on_call: F,
+    on_event: G,
+) -> std::io::Result<()>
+where
+    F: FnMut(&str, &Value, &std::sync::Arc<KernelClient>) -> Result<Value, String>,
+    G: FnMut(&str, &Value) + Send + 'static,
+{
+    let extra = if tools_meta.is_null() { Value::Null } else { json!({"tools": tools_meta}) };
+    serve_hello(name, verbs, extra, on_call, on_event)
+}
+
+/// Like [`serve_full`], with the whole declaration bundle: every key of
+/// `hello_extra` is merged into the serve hello. Known keys:
+///   - `tools`: per-verb `{description, schema, kind, world, compensate_with,
+///     amortizable, idempotent, commutes, degrade, requires: {caps, deps}}` —
+///     the verb character is checked by the kernel's F4 truth table at spawn,
+///     `requires` by the F5 slot row;
+///   - `holding_rho`: `inverse` | `compensable` | `external` — how this
+///     plugin's holdings are given back (needed for held/transforming verbs);
+///   - `protocol`: `{initial, transitions: [[from, "family::verb", to], …]}` —
+///     a verb-order safety automaton the kernel enforces on calls (F6).
+/// The wire identity keys (name, abi, role, token, verbs, channels) cannot be
+/// overridden.
+pub fn serve_hello<F, G>(
+    name: &str,
+    verbs: &[&str],
+    hello_extra: Value,
     mut on_call: F,
     mut on_event: G,
 ) -> std::io::Result<()>
@@ -161,8 +188,13 @@ where
         "token": token, "verbs": verbs,
         "channels": ["client", "events"],
     }});
-    if !tools_meta.is_null() {
-        h["hello"]["tools"] = tools_meta;
+    if let Some(extra) = hello_extra.as_object() {
+        const RESERVED: [&str; 6] = ["name", "abi", "role", "token", "verbs", "channels"];
+        for (k, v) in extra {
+            if !RESERVED.contains(&k.as_str()) {
+                h["hello"][k] = v.clone();
+            }
+        }
     }
     hello(&mut wr, &mut rd, &h)?;
 
