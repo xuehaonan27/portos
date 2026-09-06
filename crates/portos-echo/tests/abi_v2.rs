@@ -591,3 +591,99 @@ fn js_plugin_speaks_abi_v2() {
     host.shutdown_all();
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// WP-04: a plugin spawns a child only when it holds the `kernel:spawn`
+/// capability; the child's `kernel/plugin` holding is parented under the
+/// caller's holding (decision 2: instantiation edge, declared by the kernel
+/// at spawn), and the parent's death reclaims the whole closure — the child
+/// dies with it, children first.
+#[test]
+fn spawn_child_is_capability_gated_and_parent_death_reclaims_children_first() {
+    let (kernel, host, root) = setup("child");
+    let parent = spawn_echo(&host, "echop");
+
+    // No capability: the kernel refuses and audits the denial.
+    let denied = host.call(&parent, "echop::spawn_child", json!(["echoc"]));
+    assert!(denied.is_err(), "spawn_child without kernel:spawn must be refused");
+    assert!(
+        kernel.ledger.live_snapshot("plugin:portos-echoc").is_empty(),
+        "nothing spawned"
+    );
+
+    // With the capability the child spawns, parented under the caller.
+    kernel
+        .caps
+        .mint(
+            "plugin:portos-echop",
+            "kernel:spawn",
+            BTreeSet::from(["spawn_child".to_string()]),
+            Constraints::default(),
+            None,
+        )
+        .unwrap();
+    let out = host.call(&parent, "echop::spawn_child", json!(["echoc"])).unwrap();
+    assert_eq!(out["name"].as_str(), Some("portos-echoc"));
+    let p_row = kernel
+        .ledger
+        .live_snapshot("plugin:portos-echop")
+        .pop()
+        .expect("parent row");
+    let c_row = kernel
+        .ledger
+        .live_snapshot("plugin:portos-echoc")
+        .pop()
+        .expect("child row");
+    assert_eq!(c_row.parent, Some(p_row.id), "child holding parented under the parent's");
+    assert_eq!(
+        kernel.ledger.live_closure("plugin:portos-echop").len(),
+        2,
+        "the parent's ownership closure is parent + child"
+    );
+    assert_eq!(
+        host.call("portos-echoc", "echoc::events", json!([])).unwrap(),
+        json!([]),
+        "the child answers calls"
+    );
+
+    // The parent dies without notice: the one teardown path takes the whole
+    // closure, children first — the child process is reaped with it.
+    let cpid = host.pid("portos-echoc").expect("child pid");
+    let ppid = host.pid(&parent).expect("parent pid");
+    std::process::Command::new("kill").args(["-9", &ppid.to_string()]).status().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while kernel.ledger.counts(CLASS_PLUGIN).0 > 0 {
+        assert!(std::time::Instant::now() < deadline, "parent death never reclaimed the child");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let alive = |pid: u32| {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    assert!(!alive(cpid), "child process reaped with its parent");
+    assert_eq!(kernel.ledger.counts(CLASS_PLUGIN), (0, 2), "both tombstoned");
+    kernel.ledger.invariant().unwrap();
+
+    host.shutdown_all();
+    drop(host);
+    let events = audit_events(&root);
+    assert!(
+        events.iter().any(|e| e["event"] == "spawn_child.denied" && e["from"] == "portos-echop"),
+        "the denial is audited"
+    );
+    assert!(
+        events.iter().any(|e| e["event"] == "plugin.spawned"
+            && e["plugin"] == "portos-echoc"
+            && e["parent"] == "portos-echop"),
+        "the spawn names its parent"
+    );
+    assert!(
+        events.iter().any(|e| e["event"] == "plugin.reclaimed"
+            && e["plugin"] == "portos-echop"
+            && e["released"] == 2),
+        "one teardown released parent and child together"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

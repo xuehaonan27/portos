@@ -28,6 +28,7 @@ fn main() -> std::io::Result<()> {
         "events",
         "put_pattern",
         "grants",
+        "spawn_child",
     ]
     .iter()
     .map(|v| format!("{family}::{v}"))
@@ -65,6 +66,7 @@ fn main() -> std::io::Result<()> {
         v("make_ref"): {"kind": "transforming"},
         v("put_pattern"): {"kind": "transforming"},
         v("subscribe"): {"kind": "consuming", "world": "held"},
+        v("spawn_child"): {"kind": "transforming"},
         v("relay"): {"requires": {"caps": list("PORTOS_ECHO_RELAY_REQUIRES"), "deps": list("PORTOS_ECHO_RELAY_DEPS")}},
     });
     for (k, val) in emit_kind.as_object().unwrap() {
@@ -142,6 +144,18 @@ fn main() -> std::io::Result<()> {
                 }
                 // expose grants introspection for tests
                 "grants" => Ok(json!(client.grants()?)),
+                // parent/child instantiation (WP-04): spawn a copy of this
+                // binary as a child plugin. The kernel gates the op on the
+                // caller's `kernel:spawn` capability; the child's holding is
+                // parented under this plugin's own (F2 closure).
+                "spawn_child" => {
+                    let family = arg(0).as_str().unwrap_or("echoc").to_string();
+                    let bin = std::env::current_exe().map_err(|e| e.to_string())?;
+                    let bin = bin.to_str().ok_or_else(|| "exe path not utf-8".to_string())?;
+                    client
+                        .spawn_child(bin, &[], &[("PORTOS_ECHO_FAMILY", family.as_str())])
+                        .map(|name| json!({"name": name}))
+                }
                 // two-layer naming demo: refs are driver-session-local,
                 // volatile, and never enter the kernel handle table.
                 "make_ref" => {

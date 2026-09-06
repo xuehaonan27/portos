@@ -199,16 +199,32 @@ impl LedgerStore {
                         .map(|h| (h.id, h.generation.clone())),
                 );
             }
+            // Children before parents: a parent row refuses release while its
+            // child row is still live (TeardownOrder), and with parent/child
+            // plugins both are in this list — so iterate to a fixpoint.
             let mut n = 0;
-            for (id, generation) in &stale {
-                if l.release(*id, generation, now).is_ok() {
-                    n += 1;
-                    if let Some(h) = l.holding(*id) {
-                        persist_on(conn, h)?;
-                        // The row is the truth: tombstoned means its cleanup
-                        // is done, whatever an earlier teardown journaled.
-                        resolve_journal(conn, *id, now)?;
+            while !stale.is_empty() {
+                let mut progressed = false;
+                let mut i = 0;
+                while i < stale.len() {
+                    let (id, generation) = stale[i].clone();
+                    if l.release(id, &generation, now).is_ok() {
+                        n += 1;
+                        if let Some(h) = l.holding(id) {
+                            persist_on(conn, h)?;
+                            // The row is the truth: tombstoned means its
+                            // cleanup is done, whatever an earlier teardown
+                            // journaled.
+                            resolve_journal(conn, id, now)?;
+                        }
+                        stale.remove(i);
+                        progressed = true;
+                    } else {
+                        i += 1;
                     }
+                }
+                if !progressed {
+                    break;
                 }
             }
             Ok(n)
@@ -313,6 +329,37 @@ impl LedgerStore {
             }
             let id = l
                 .grant(subject, class, instance, Frag::Ex(Ex::Token), generation, parent, now)
+                .map_err(map_err)?;
+            if let Some(h) = l.holding(id) {
+                persist_on(conn, h)?;
+            }
+            Ok(id)
+        })
+    }
+
+    /// Take an exclusive holding for a child spawned by another plugin:
+    /// declare the instantiation edge and grant under the parent's holding in
+    /// one transaction, so a refused grant leaves no stale declaration behind
+    /// (decision 2: a cross-subject parent edge exists only along the
+    /// instantiation relation).
+    #[allow(clippy::too_many_arguments)]
+    pub fn hold_exclusive_child(
+        &self,
+        subject: &str,
+        class: &str,
+        instance: &str,
+        generation: &str,
+        parent_subject: &str,
+        parent: u64,
+        now: u64,
+    ) -> Result<u64, KernelError> {
+        self.transaction(|l, conn| {
+            l.declare_instantiation(subject, parent_subject);
+            if l.capacity(class, instance).is_none() {
+                l.set_capacity(class, instance, Frag::Ex(Ex::Token));
+            }
+            let id = l
+                .grant(subject, class, instance, Frag::Ex(Ex::Token), generation, Some(parent), now)
                 .map_err(map_err)?;
             if let Some(h) = l.holding(id) {
                 persist_on(conn, h)?;
@@ -756,10 +803,17 @@ mod tests {
             let p = l.hold_exclusive("plugin:x", CLASS_PLUGIN, "x", "tok1", None, 1).unwrap();
             l.hold_exclusive("plugin:x", CLASS_SUBSCRIPTION, "7", "sub", Some(p), 1).unwrap();
             assert!(l.hold_exclusive("plugin:x", CLASS_PLUGIN, "x", "tok2", None, 1).is_err(), "name taken while live");
+            // A child plugin of x (parent/child instantiation, WP-04): the
+            // parent row's release is blocked while the child lives, so
+            // reconcile must reach a children-first fixpoint.
+            let c = l
+                .hold_exclusive_child("plugin:y", CLASS_PLUGIN, "y", "tokc", "plugin:x", p, 1)
+                .unwrap();
+            assert_eq!(l.holding(c).unwrap().parent, Some(p));
         }
         let (l, report) = LedgerStore::open(db.clone()).unwrap();
-        assert_eq!(report.stale_rows, 2);
-        assert_eq!(l.counts(CLASS_PLUGIN), (0, 1));
+        assert_eq!(report.stale_rows, 3);
+        assert_eq!(l.counts(CLASS_PLUGIN), (0, 2));
         assert_eq!(l.counts(CLASS_SUBSCRIPTION), (0, 1));
         l.hold_exclusive("plugin:x", CLASS_PLUGIN, "x", "tok2", None, 2).unwrap();
         l.invariant().unwrap();

@@ -13,11 +13,15 @@
 //!   chat.json                                  (optional: extra plugins + grants)
 //!
 //! chat.json shape:
-//!   { "plugins": [ {"bin": "node", "args": ["…/plugin.js"], "env": {"K": "V"}} ],
+//!   { "plugins": [ {"bin": "node", "args": ["…/plugin.js"], "env": {"K": "V"},
+//!                    "slot"?: {"offers": ["family::verb", …], "provides": ["family", …]}} ],
 //!     "grants":  [ {"subject"?: "plugin:portos-modeld",
 //!                   "resource": "driver:browser", "verbs": ["open", …]} ],
 //!     "render":  "builtin" | "none" }
 //! Relative paths in `args` resolve against `<root>` when they exist there.
+//! A plugin entry's `slot` is its F5 position ceiling: spawn is refused when
+//! the plugin's declared `requires` exceed it, and later invokes are bounded
+//! by it (actual = row ∩ grant).
 //!
 //! Rendering (decisions-v1.md D32): a renderer is an ordinary plugin
 //! subscribed to the event plane (`model::session::*`); list one under
@@ -110,7 +114,12 @@ pub fn run(root: &str) -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap_or_default();
                 let env_refs: Vec<(&str, &str)> =
                     envs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-                let name = host.spawn(Path::new(bin), &arg_refs, &env_refs)?;
+                // F5: an entry may declare the slot it spawns into.
+                let slot = p.get("slot").map(|s| portos_kernel::host::Slot {
+                    offers: str_list(&s["offers"]),
+                    provides: str_list(&s["provides"]),
+                });
+                let name = host.spawn_in(Path::new(bin), &arg_refs, &env_refs, slot.as_ref())?;
                 println!("[chat] plugin: {name}");
             }
         }
@@ -250,6 +259,12 @@ fn resolve_arg(root: &Path, arg: &str) -> String {
     } else {
         arg.to_string()
     }
+}
+
+fn str_list(v: &Value) -> Vec<String> {
+    v.as_array()
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
 }
 
 fn write_templates(root: &Path) -> std::io::Result<()> {

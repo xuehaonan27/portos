@@ -5,7 +5,8 @@
 //! a `serve` connection on which it declares its verbs and answers kernel
 //! calls (and receives event deliveries), and a `client` connection through
 //! which it reaches the kernel — `invoke` (call another plugin's verb,
-//! capability-checked kernel-side), `emit`/`subscribe` (event bus), and
+//! capability-checked kernel-side), `emit`/`subscribe` (event bus),
+//! `spawn_child` (parent/child instantiation, gated on `kernel:spawn`), and
 //! `put`/`read` (artifact dereference as chunked byte streams; payloads
 //! never ride inside JSON frames — decisions-v1.md D25).
 //!
@@ -55,6 +56,22 @@ impl KernelClient {
     pub fn unsubscribe(&self, sub: u64) -> Result<bool, String> {
         let ok = self.request(&json!({"op": "unsubscribe", "sub": sub}))?;
         Ok(ok["removed"].as_bool().unwrap_or(false))
+    }
+
+    /// Spawn a child plugin process (WP-04). The kernel gates this on the
+    /// caller's `kernel:spawn` capability; the child's holding becomes a
+    /// child of this plugin's own holding, so reclaiming this plugin tears
+    /// the child down first. Returns the child's plugin name.
+    pub fn spawn_child(&self, bin: &str, args: &[&str], env: &[(&str, &str)]) -> Result<String, String> {
+        let env: serde_json::Map<String, Value> =
+            env.iter().map(|(k, v)| (k.to_string(), json!(v))).collect();
+        let ok = self.request(&json!({
+            "op": "spawn_child", "bin": bin, "args": args, "env": env,
+        }))?;
+        ok["name"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| "no child name".into())
     }
 
     /// What this plugin may invoke right now: live grants joined with the

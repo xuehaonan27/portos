@@ -405,3 +405,46 @@ fn portos_chat_end_to_end() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// WP-04: a chat.json plugin entry may declare its F5 slot; a plugin whose
+/// declared `requires` exceed the slot is refused at spawn, and the refusal
+/// is reported (chat exits non-zero naming the reason).
+#[test]
+fn chat_json_slot_refusal_is_reported() {
+    let cli = Path::new(CLI_BIN);
+    let echo = cli.with_file_name("portos-echo");
+    let have = |n: &str| cli.with_file_name(n).exists();
+    if !echo.exists() || !have("portos-broker") || !have("portos-modeld") {
+        eprintln!("skipping: sibling binaries not built (run under cargo test --workspace)");
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("portos-chat-slot-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    write_json(
+        &root.join("chat.json"),
+        &json!({
+            "plugins": [{
+                "bin": echo.to_str().unwrap(),
+                "env": {"PORTOS_ECHO_FAMILY": "echoa",
+                        "PORTOS_ECHO_RELAY_REQUIRES": "echob::emit"},
+                "slot": {"offers": ["echob::digest"]},
+            }],
+        }),
+    );
+    let out = std::process::Command::new(cli)
+        .args(["chat", root.to_str().unwrap()])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "chat must fail when a plugin's requires exceed its slot.\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("slot admission failed"),
+        "the refusal is reported with its reason:\n{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

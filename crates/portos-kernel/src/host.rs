@@ -13,9 +13,11 @@
 //!     the calling plugin, audited, routed), `grants` (introspect what this
 //!     plugin may invoke, joined with the verbs' advertised metadata),
 //!     `emit`/`subscribe`/`unsubscribe` (event bus; topic patterns may end
-//!     in `*` for prefix matching), and `put`/`read` (artifact dereference
-//!     as chunked byte streams; see `portos_proto::chunk`). fd passing is
-//!     gone (D25).
+//!     in `*` for prefix matching), `spawn_child` (parent/child plugin
+//!     instantiation, gated on the caller's `kernel:spawn` capability; the
+//!     child's holding is parented under the caller's), and `put`/`read`
+//!     (artifact dereference as chunked byte streams; see
+//!     `portos_proto::chunk`). fd passing is gone (D25).
 //!   - an optional **events** channel: one-way kernel→plugin event
 //!     deliveries. A plugin that declares it can receive subscribed events
 //!     *while one of its own verbs is mid-call* — the serve channel is busy
@@ -203,226 +205,253 @@ impl Host {
         envs: &[(&str, &str)],
         slot: Option<&Slot>,
     ) -> Result<String, KernelError> {
-        let idx = self.inner.next_spawn.fetch_add(1, Ordering::SeqCst);
-        let sock_path = self
-            .inner
-            .sock_dir
-            .join(format!("plugin-{}-{idx}.sock", std::process::id()));
-        let _ = std::fs::remove_file(&sock_path);
-        let listener = UnixListener::bind(&sock_path)?;
-        listener.set_nonblocking(true)?;
-        let token = rand_token();
+        spawn_plugin(&self.kernel, &self.inner, bin, args, envs, slot, None)
+    }
+}
 
-        let mut cmd = std::process::Command::new(bin);
-        cmd.args(args)
-            .env("PORTOS_PLUGIN_SOCK", &sock_path)
-            .env("PORTOS_PLUGIN_TOKEN", &token);
-        for (k, v) in envs {
-            cmd.env(k, v);
+/// Spawn a plugin process: `bin args…` with `envs` added, wait for the
+/// hellos, register the plugin's verbs, and start its service threads.
+/// Returns the plugin name (from its hello).
+///
+/// With `parent = Some((parent_name, parent_holding))` the new plugin's
+/// `kernel/plugin` holding becomes a child of the parent's holding (decision
+/// 2: the instantiation edge is declared here, at spawn), so reclaiming the
+/// parent tears the child down first (F2 closure).
+#[allow(clippy::too_many_arguments)]
+fn spawn_plugin(
+    kernel: &Arc<Kernel>,
+    inner: &Arc<HostInner>,
+    bin: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    slot: Option<&Slot>,
+    parent: Option<(&str, u64)>,
+) -> Result<String, KernelError> {
+    let idx = inner.next_spawn.fetch_add(1, Ordering::SeqCst);
+    let sock_path = inner
+        .sock_dir
+        .join(format!("plugin-{}-{idx}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&sock_path);
+    let listener = UnixListener::bind(&sock_path)?;
+    listener.set_nonblocking(true)?;
+    let token = rand_token();
+
+    let mut cmd = std::process::Command::new(bin);
+    cmd.args(args)
+        .env("PORTOS_PLUGIN_SOCK", &sock_path)
+        .env("PORTOS_PLUGIN_TOKEN", &token);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn()?;
+
+    // The serve connection comes first and declares which extra channels
+    // follow ("client" always; "events" optionally). Bad token or an
+    // undeclared/duplicate role is fatal for the spawn.
+    let accept_hello = |child: &mut std::process::Child| -> Result<(UnixStream, Value), KernelError> {
+        let mut stream = accept_with_deadline(&listener, child, SPAWN_DEADLINE_MS)?;
+        let hello = frame::read_frame(&mut stream)
+            .map_err(|e| KernelError::Corrupt(format!("hello: {e}")))?;
+        if hello["hello"]["token"].as_str() != Some(token.as_str()) {
+            let _ = frame::write_frame(&mut stream, &json!({"err": "bad token"}));
+            return Err(KernelError::Denied("plugin hello: bad token".into()));
         }
-        let mut child = cmd.spawn()?;
+        frame::write_frame(&mut stream, &json!({"ok": {}}))
+            .map_err(|e| KernelError::Corrupt(format!("hello ack: {e}")))?;
+        Ok((stream, hello["hello"].clone()))
+    };
 
-        // The serve connection comes first and declares which extra channels
-        // follow ("client" always; "events" optionally). Bad token or an
-        // undeclared/duplicate role is fatal for the spawn.
-        let accept_hello = |child: &mut std::process::Child| -> Result<(UnixStream, Value), KernelError> {
-            let mut stream = accept_with_deadline(&listener, child, SPAWN_DEADLINE_MS)?;
-            let hello = frame::read_frame(&mut stream)
-                .map_err(|e| KernelError::Corrupt(format!("hello: {e}")))?;
-            if hello["hello"]["token"].as_str() != Some(token.as_str()) {
-                let _ = frame::write_frame(&mut stream, &json!({"err": "bad token"}));
-                return Err(KernelError::Denied("plugin hello: bad token".into()));
-            }
-            frame::write_frame(&mut stream, &json!({"ok": {}}))
-                .map_err(|e| KernelError::Corrupt(format!("hello ack: {e}")))?;
-            Ok((stream, hello["hello"].clone()))
-        };
-
-        let (serve_stream, hello) = match accept_hello(&mut child) {
-            Ok((stream, h)) if h["role"] == "serve" => (stream, h),
-            Ok(_) => {
-                let _ = child.kill();
-                return Err(KernelError::Corrupt(
-                    "plugin hello: first connection must be role serve".into(),
-                ));
-            }
+    let (serve_stream, hello) = match accept_hello(&mut child) {
+        Ok((stream, h)) if h["role"] == "serve" => (stream, h),
+        Ok(_) => {
+            let _ = child.kill();
+            return Err(KernelError::Corrupt(
+                "plugin hello: first connection must be role serve".into(),
+            ));
+        }
+        Err(e) => {
+            let _ = child.kill();
+            return Err(e);
+        }
+    };
+    let name = hello["name"].as_str().unwrap_or("?").to_string();
+    let verbs: Vec<String> = str_array(&hello["verbs"]);
+    // Optional per-verb tool metadata (description + schema + kind +
+    // requires): joined into `grants`, checked by the F4/F5 laws below.
+    let tools_meta = hello["tools"].clone();
+    let mut expected: Vec<String> = hello["channels"]
+        .as_array()
+        .map(|_| str_array(&hello["channels"]))
+        .unwrap_or_else(|| vec!["client".to_string()]);
+    if !expected.iter().any(|c| c == "client") {
+        let _ = child.kill();
+        return Err(KernelError::Corrupt(
+            "plugin hello: a client channel is required".into(),
+        ));
+    }
+    let mut client: Option<UnixStream> = None;
+    let mut events: Option<UnixStream> = None;
+    while !expected.is_empty() {
+        let (stream, h) = match accept_hello(&mut child) {
+            Ok(x) => x,
             Err(e) => {
                 let _ = child.kill();
                 return Err(e);
             }
         };
-        let name = hello["name"].as_str().unwrap_or("?").to_string();
-        let verbs: Vec<String> = str_array(&hello["verbs"]);
-        // Optional per-verb tool metadata (description + schema + kind +
-        // requires): joined into `grants`, checked by the F4/F5 laws below.
-        let tools_meta = hello["tools"].clone();
-        let mut expected: Vec<String> = hello["channels"]
-            .as_array()
-            .map(|_| str_array(&hello["channels"]))
-            .unwrap_or_else(|| vec!["client".to_string()]);
-        if !expected.iter().any(|c| c == "client") {
-            let _ = child.kill();
-            return Err(KernelError::Corrupt(
-                "plugin hello: a client channel is required".into(),
-            ));
-        }
-        let mut client: Option<UnixStream> = None;
-        let mut events: Option<UnixStream> = None;
-        while !expected.is_empty() {
-            let (stream, h) = match accept_hello(&mut child) {
-                Ok(x) => x,
-                Err(e) => {
-                    let _ = child.kill();
-                    return Err(e);
-                }
-            };
-            let role = h["role"].as_str().unwrap_or("?").to_string();
-            match expected.iter().position(|c| *c == role) {
-                Some(i) => {
-                    expected.remove(i);
-                    match role.as_str() {
-                        "client" => client = Some(stream),
-                        "events" => events = Some(stream),
-                        _ => {
-                            let _ = child.kill();
-                            return Err(KernelError::Corrupt(format!(
-                                "plugin hello: unknown channel role {role}"
-                            )));
-                        }
+        let role = h["role"].as_str().unwrap_or("?").to_string();
+        match expected.iter().position(|c| *c == role) {
+            Some(i) => {
+                expected.remove(i);
+                match role.as_str() {
+                    "client" => client = Some(stream),
+                    "events" => events = Some(stream),
+                    _ => {
+                        let _ = child.kill();
+                        return Err(KernelError::Corrupt(format!(
+                            "plugin hello: unknown channel role {role}"
+                        )));
                     }
                 }
-                None => {
-                    let _ = child.kill();
-                    return Err(KernelError::Corrupt(format!(
-                        "plugin hello: undeclared or duplicate role {role}"
-                    )));
-                }
             }
-        }
-        let client_stream = client.expect("client channel present");
-
-        // ---- F4: the verb character the plugin declared, checked at the door.
-        let table = match build_verb_table(&name, &verbs, &tools_meta, &hello) {
-            Ok(t) => t,
-            Err(e) => {
+            None => {
                 let _ = child.kill();
-                return Err(KernelError::Denied(format!(
-                    "plugin {name}: verb metadata rejected: {e}"
+                return Err(KernelError::Corrupt(format!(
+                    "plugin hello: undeclared or duplicate role {role}"
                 )));
             }
+        }
+    }
+    let client_stream = client.expect("client channel present");
+
+    // ---- F4: the verb character the plugin declared, checked at the door.
+    let table = match build_verb_table(&name, &verbs, &tools_meta, &hello) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = child.kill();
+            return Err(KernelError::Denied(format!(
+                "plugin {name}: verb metadata rejected: {e}"
+            )));
+        }
+    };
+    let protocol = table.derive_handler_policy(&name).protocol;
+
+    // ---- F5: slot admission — every verb's requires must fit the row.
+    if let Some(slot) = slot {
+        let manifest = manifest_from_meta(&name, &verbs, &tools_meta);
+        let mut provides: Vec<String> = slot.provides.clone();
+        provides.extend(routed_families(inner));
+        let mount = Mount {
+            name: "slot".into(),
+            offers: Flat(slot.offers.iter().cloned().collect()),
+            provides: Flat(provides.into_iter().collect()),
         };
-        let protocol = table.derive_handler_policy(&name).protocol;
-
-        // ---- F5: slot admission — every verb's requires must fit the row.
-        if let Some(slot) = slot {
-            let manifest = manifest_from_meta(&name, &verbs, &tools_meta);
-            let mut provides: Vec<String> = slot.provides.clone();
-            provides.extend(self.routed_families());
-            let mount = Mount {
-                name: "slot".into(),
-                offers: Flat(slot.offers.iter().cloned().collect()),
-                provides: Flat(provides.into_iter().collect()),
-            };
-            if let Err(e) = admit_mount(&manifest, &mount) {
-                let _ = child.kill();
-                return Err(KernelError::Denied(format!(
-                    "plugin {name}: slot admission failed: {e:?}"
-                )));
-            }
+        if let Err(e) = admit_mount(&manifest, &mount) {
+            let _ = child.kill();
+            return Err(KernelError::Denied(format!(
+                "plugin {name}: slot admission failed: {e:?}"
+            )));
         }
-        let offers: Option<Flat> = slot.map(|s| Flat(s.offers.iter().cloned().collect()));
+    }
+    let offers: Option<Flat> = slot.map(|s| Flat(s.offers.iter().cloned().collect()));
 
-        // ---- F1: the instance is a holding. Ledger first, host locks after.
-        let now = crate::db::now_unix();
-        let subject = format!("plugin:{name}");
-        let holding = match self.kernel.ledger.hold_exclusive(
-            &subject,
-            CLASS_PLUGIN,
-            &name,
-            &token,
-            None,
-            now,
-        ) {
+    // ---- F1: the instance is a holding. Ledger first, host locks after.
+    let now = crate::db::now_unix();
+    let subject = format!("plugin:{name}");
+    let holding = match parent {
+        Some((parent_name, parent_holding)) => kernel
+            .ledger
+            .hold_exclusive_child(
+                &subject,
+                CLASS_PLUGIN,
+                &name,
+                &token,
+                &format!("plugin:{parent_name}"),
+                parent_holding,
+                now,
+            )
+            .map_err(|e| {
+                let _ = child.kill();
+                KernelError::Denied(format!("plugin {name}: spawn under parent refused: {e}"))
+            })?,
+        None => match kernel.ledger.hold_exclusive(&subject, CLASS_PLUGIN, &name, &token, None, now) {
             Ok(id) => id,
             Err(_) => {
                 let _ = child.kill();
                 return Err(KernelError::Denied(format!("plugin name taken: {name}")));
             }
-        };
-        let pid = child.id();
+        },
+    };
+    let pid = child.id();
 
-        // Register verbs; a route conflict aborts the spawn (and releases the
-        // holding again — nothing in the ledger outlives a failed spawn).
-        {
-            let mut plugins = self.inner.plugins.lock().unwrap();
-            let mut routes = self.inner.routes.lock().unwrap();
-            if let Some(v) = verbs.iter().find(|v| routes.contains_key(*v)) {
-                let _ = child.kill();
-                let _ = self.kernel.ledger.release(holding, &token, now);
-                return Err(KernelError::Denied(format!("verb already routed: {v}")));
-            }
-            let (events_tx, events_rx) = sync_channel::<Value>(EVENT_QUEUE);
-            let handle = Arc::new(PluginHandle {
-                child: Mutex::new(child),
-                serve: Mutex::new(serve_stream),
-                events: events.map(Mutex::new),
-                events_tx,
-                sock_path: sock_path.clone(),
-                holding,
-                generation: token.clone(),
-                pid,
-                offers,
-                protocol,
-                proto_state: Mutex::new(None),
-                shutting_down: std::sync::atomic::AtomicBool::new(false),
-            });
-            for v in &verbs {
-                let meta = &tools_meta[v.as_str()];
-                let entry = table.lookup(&name, v).ok();
-                routes.insert(
-                    v.clone(),
-                    RouteEntry {
-                        plugin: name.clone(),
-                        description: meta["description"].as_str().unwrap_or("").to_string(),
-                        schema: if meta["schema"].is_object() {
-                            meta["schema"].clone()
-                        } else {
-                            json!({"type": "object"})
-                        },
-                        kind: entry.map(kind_label),
-                        budgeted: entry.map(|e| e.bears_budget()),
+    // Register verbs; a route conflict aborts the spawn (and releases the
+    // holding again — nothing in the ledger outlives a failed spawn).
+    {
+        let mut plugins = inner.plugins.lock().unwrap();
+        let mut routes = inner.routes.lock().unwrap();
+        if let Some(v) = verbs.iter().find(|v| routes.contains_key(*v)) {
+            let _ = child.kill();
+            let _ = kernel.ledger.release(holding, &token, now);
+            return Err(KernelError::Denied(format!("verb already routed: {v}")));
+        }
+        let (events_tx, events_rx) = sync_channel::<Value>(EVENT_QUEUE);
+        let handle = Arc::new(PluginHandle {
+            child: Mutex::new(child),
+            serve: Mutex::new(serve_stream),
+            events: events.map(Mutex::new),
+            events_tx,
+            sock_path: sock_path.clone(),
+            holding,
+            generation: token.clone(),
+            pid,
+            offers,
+            protocol,
+            proto_state: Mutex::new(None),
+            shutting_down: std::sync::atomic::AtomicBool::new(false),
+        });
+        for v in &verbs {
+            let meta = &tools_meta[v.as_str()];
+            let entry = table.lookup(&name, v).ok();
+            routes.insert(
+                v.clone(),
+                RouteEntry {
+                    plugin: name.clone(),
+                    description: meta["description"].as_str().unwrap_or("").to_string(),
+                    schema: if meta["schema"].is_object() {
+                        meta["schema"].clone()
+                    } else {
+                        json!({"type": "object"})
                     },
-                );
-            }
-            plugins.insert(name.clone(), handle.clone());
-            spawn_event_pump(handle.clone(), events_rx);
-            spawn_client_loop(
-                self.kernel.clone(),
-                self.inner.clone(),
-                name.clone(),
-                client_stream,
+                    kind: entry.map(kind_label),
+                    budgeted: entry.map(|e| e.bears_budget()),
+                },
             );
         }
-
-        self.audit(json!({
-            "event": "plugin.spawned", "plugin": name, "verbs": verbs,
-            "holding": holding, "pid": pid,
-        }));
-        Ok(name)
+        plugins.insert(name.clone(), handle.clone());
+        spawn_event_pump(handle.clone(), events_rx);
+        spawn_client_loop(kernel.clone(), inner.clone(), name.clone(), client_stream);
     }
 
-    /// Verb families currently routed (the services present for F5 `deps`).
-    fn routed_families(&self) -> Vec<String> {
-        let routes = self.inner.routes.lock().unwrap();
-        let mut fams: Vec<String> = routes
-            .keys()
-            .map(|v| v.split("::").next().unwrap_or(v).to_string())
-            .collect();
-        fams.sort();
-        fams.dedup();
-        fams
-    }
+    let _ = kernel.audit.lock().unwrap().append(json!({
+        "event": "plugin.spawned", "plugin": name, "verbs": verbs,
+        "holding": holding, "pid": pid, "parent": parent.map(|(p, _)| p),
+    }));
+    Ok(name)
+}
 
+/// Verb families currently routed (the services present for F5 `deps`).
+fn routed_families(inner: &HostInner) -> Vec<String> {
+    let routes = inner.routes.lock().unwrap();
+    let mut fams: Vec<String> = routes
+        .keys()
+        .map(|v| v.split("::").next().unwrap_or(v).to_string())
+        .collect();
+    fams.sort();
+    fams.dedup();
+    fams
+}
+
+impl Host {
     /// OS pid of a running plugin (tests kill plugins with it).
     pub fn pid(&self, plugin: &str) -> Option<u32> {
         self.inner.plugins.lock().unwrap().get(plugin).map(|h| h.pid)
@@ -557,10 +586,6 @@ impl Host {
         for n in names {
             self.shutdown(&n);
         }
-    }
-
-    fn audit(&self, body: Value) {
-        let _ = self.kernel.audit.lock().unwrap().append(body);
     }
 }
 
@@ -1187,6 +1212,55 @@ fn handle_client_op(
                 None => false,
             };
             Ok(json!({"ok": {"removed": removed}}))
+        }
+
+        // ---- parent/child instantiation (WP-04) ----
+        Some("spawn_child") => {
+            // Capability gate: the caller must hold `kernel:spawn` /
+            // `spawn_child`. The child's `kernel/plugin` holding becomes a
+            // child of the caller's holding, so reclaiming the caller tears
+            // the child down first (F2 closure).
+            let subject = format!("plugin:{name}");
+            let bin = req["bin"].as_str().unwrap_or("").to_string();
+            if let Err(e) = kernel.caps.find_and_exercise(&subject, "kernel:spawn", "spawn_child", now) {
+                let _ = kernel.audit.lock().unwrap().append(json!({
+                    "event": "spawn_child.denied", "from": name, "bin": bin,
+                    "reason": e.to_string(),
+                }));
+                return Err(e);
+            }
+            let parent_holding = inner
+                .plugins
+                .lock()
+                .unwrap()
+                .get(name)
+                .map(|h| h.holding)
+                .ok_or_else(|| KernelError::NotFound(format!("parent plugin gone: {name}")))?;
+            let args: Vec<String> = str_array(&req["args"]);
+            let envs: Vec<(String, String)> = req["env"]
+                .as_object()
+                .map(|m| {
+                    m.iter()
+                        .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+            let env_refs: Vec<(&str, &str)> =
+                envs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            if bin.is_empty() {
+                return Err(KernelError::Corrupt("spawn_child: missing bin".into()));
+            }
+            let child = spawn_plugin(
+                kernel,
+                inner,
+                Path::new(&bin),
+                &arg_refs,
+                &env_refs,
+                None,
+                Some((name, parent_holding)),
+            )?;
+            Ok(json!({"ok": {"name": child}}))
         }
 
         // ---- artifact dereference: put (frame, then chunk stream) ----
