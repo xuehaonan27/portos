@@ -53,6 +53,18 @@ pub fn open(root: &Path) -> Result<Connection, rusqlite::Error> {
             ON holdings(class_id, instance) WHERE released_at IS NULL;
         CREATE INDEX IF NOT EXISTS holdings_subject
             ON holdings(subject) WHERE released_at IS NULL;
+        -- F2 teardown journal (saga-log, spec §6.2 [SAGA]): one row per
+        -- holding ever torn down, written in the same transaction as the
+        -- tombstones. Non-'done' rows are world actions still owed; they are
+        -- replayed by the next teardown of their subject. Reference DDL:
+        -- crates/portos-rm/schema.sql `teardown_journal`.
+        CREATE TABLE IF NOT EXISTS journal (
+            holding_id INTEGER PRIMARY KEY,
+            grade      TEXT NOT NULL,   -- "inverse" | "compensable" | "external"
+            idem_key   TEXT NOT NULL,   -- [KEY] dedupe key, stable across crashes
+            state      TEXT NOT NULL,   -- "pending" | "in_flight" | "done" | "failed"
+            updated_at INTEGER NOT NULL
+        );
         "#,
     )?;
     Ok(conn)

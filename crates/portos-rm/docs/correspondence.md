@@ -111,13 +111,16 @@
 | h_table 入签、表变重准入（Q7）〔设计〕 | `table_change`／`resign` | `table_change_reruns_admission_paused_until_resign_or_detached` |
 | 每附着串行、min_interval（A4）〔设计〕 | `Reject::Serial`／`MinInterval` | `per_attachment_serial_and_min_interval_hold` |
 
-## 接线对照：法则 → 内核对象 → 集成测试（2026-09-05，`.dev/gen/rm-wiring-status.md`）
+## 接线对照：法则 → 内核对象 → 集成测试（2026-09-05，`.dev/gen/rm-wiring-status.md`；WP-01 增补 2026-09-06）
 
 | 法则 | 内核对象（`crates/portos-kernel`） | 测试 |
 |---|---|---|
 | F1 行式记账、发放方闸门、无减法（§6.1） | `ledger::LedgerStore::spend/spent`（写穿 `holdings` 表）；`caps::CapStore::exercise/counts_left`（`counts` 为池容量） | `caps::counting_exercise_never_overdraws`；`ledger::spend_rows_persist_and_gate_refuses_at_capacity`；echo `counting_budget_is_ledger_rows_and_survives_kernel_reopen` |
 | F1 世代化句柄、重启对账 | `kernel/plugin` 持有（世代＝spawn token）；`LedgerStore::reconcile_stale_process_rows` | `ledger::stale_plugin_rows_are_reconciled_on_open` |
 | F2 crash-only、子先于父、ownership 闭包、`World` | `host::reclaim`＋`host::HostWorld`（`teardown_with`） | echo `plugin_death_is_reclaimed_crash_only_children_first` |
+| ②③同事务、恢复规则（attachments §4.3 规则 5／§13.3 Q14；F1 后果一的实装形态） | `LedgerStore::transaction`（单 SQLite 事务＋内存快照回滚）；`spend_many`；`hold_exclusive`/`release`/`teardown`/对账全部经其路由 | `ledger::compound_ledger_write_is_atomic_under_injected_failure` |
+| F2 saga-log 持久化（§6.2 [SAGA]/[E-IDEM]：write-ahead、盲重放） | `journal` 表（`holding_id` 主键）；teardown 与墓碑同事务写穿；非 done 条目由该主体下一次 teardown 载入回放（Failed→Pending）；`open` 报告 `journal_pending`；对账落墓碑即解为 done（行即真相） | `ledger::journal_entries_survive_reopen_and_replay_once` |
+| 本地订阅＝`kernel/subscription` 持有，可显式退订 | `host::Host::subscribe_local`/`unsubscribe_local`（先查 subs 锁、账本释放、再移除） | `host::unsubscribe_local_releases_the_subscription_holding` |
 | F4 真理表一致性、按 handler 投影 | `host::build_verb_table`（hello `tools[verb].kind`、`holding_rho`）；`grants` 的 `kind`/`budgeted` | echo `verb_kind_metadata_is_checked_at_spawn_and_exposed_in_grants` |
 | F5 effect row（位置 ∩ 主体）、装载期集合包含 | `host::Slot`、`spawn_in`＋`admit_mount`、invoke 的 row 检查 | echo `slot_row_bounds_invoke_and_admits_requires` |
 | F6 协议＝safety，截停档精确执行 | `host::call_on` 步进（hello `protocol`） | echo `protocol_order_is_enforced_at_call` |

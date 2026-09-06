@@ -265,7 +265,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let db = Arc::new(Mutex::new(crate::db::open(&root).unwrap()));
-        let (ledger, _) = LedgerStore::open(db.clone()).unwrap();
+        let (ledger, _report) = LedgerStore::open(db.clone()).unwrap();
         (CapStore::new(db, Arc::new(ledger)), root)
     }
 

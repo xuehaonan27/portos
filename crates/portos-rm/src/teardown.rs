@@ -29,9 +29,10 @@ pub trait World {
 }
 
 // ---------------------------------------------------------------------------
-// 反向日志（saga-log）。演练中为进程内结构；实装落 SQLite（schema.sql 的
-// teardown_journal 表）。"耐久性"由崩溃模拟约定表达：崩溃丢 Executor、
-// 保 Ledger+Journal —— 正是"账本与日志活过内核崩溃"的模拟。
+// 反向日志（saga-log）。演练中为进程内结构；实装落 SQLite —— 内核
+// `crates/portos-kernel/src/ledger.rs` 的 `journal` 表，与墓碑同事务写穿，
+// 重启后由该主体的下一次 teardown 回放。"耐久性"由崩溃模拟约定表达：崩溃丢
+// Executor、保 Ledger+Journal —— 正是"账本与日志活过内核崩溃"的模拟。
 // ---------------------------------------------------------------------------
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum JState {
@@ -54,8 +55,15 @@ pub struct JournalEntry {
 pub struct Journal(pub Vec<JournalEntry>);
 
 impl Journal {
-    fn ensure(&mut self, holding_id: u64, grade: RevertGrade, key: &str) -> usize {
-        if let Some(i) = self.0.iter().position(|e| e.holding_id == holding_id) {
+    /// 实装回灌：从持久层载入的条目重建日志（内核 `journal` 表 → 内存日志）。
+    pub fn from_entries(entries: Vec<JournalEntry>) -> Journal {
+        Journal(entries)
+    }
+    /// 全部条目（实装写穿持久化用）。
+    pub fn entries(&self) -> &[JournalEntry] {
+        &self.0
+    }
+    fn ensure(&mut self, holding_id: u64, grade: RevertGrade, key: &str) -> usize {        if let Some(i) = self.0.iter().position(|e| e.holding_id == holding_id) {
             return i;
         }
         self.0.push(JournalEntry {

@@ -59,15 +59,21 @@ impl Kernel {
         let conn = db::open(root)?;
         let db = Arc::new(Mutex::new(conn));
         let cas = cas::Cas::new(root, db.clone())?;
-        let (ledger, stale) = ledger::LedgerStore::open(db.clone())?;
+        let (ledger, report) = ledger::LedgerStore::open(db.clone())?;
         let ledger = Arc::new(ledger);
         let caps = caps::CapStore::new(db.clone(), ledger.clone());
         caps.rebuild_pools()?;
         let audit = Arc::new(Mutex::new(audit::AuditLog::open(root)?));
-        if stale > 0 {
+        if report.stale_rows > 0 {
             let _ = audit.lock().unwrap().append(serde_json::json!({
-                "event": "ledger.reconciled", "stale_rows": stale,
+                "event": "ledger.reconciled", "stale_rows": report.stale_rows,
                 "note": "plugin/subscription holdings of a previous kernel process tombstoned",
+            }));
+        }
+        if report.journal_pending > 0 {
+            let _ = audit.lock().unwrap().append(serde_json::json!({
+                "event": "ledger.journal_pending", "pending": report.journal_pending,
+                "note": "failed teardown actions replayed by the next teardown of their subject",
             }));
         }
         let consent_key = consent::ConsentKey::load_or_create(root)?;

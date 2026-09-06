@@ -171,7 +171,7 @@ pub enum LedgerError {
     ParentAuthority,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Ledger {
     classes: std::collections::BTreeMap<String, ClassDecl>,
     capacities: std::collections::BTreeMap<(String, String), Frag>,

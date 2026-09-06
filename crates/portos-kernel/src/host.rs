@@ -472,7 +472,7 @@ impl Host {
             .kernel
             .ledger
             .hold_exclusive("kernel", CLASS_SUBSCRIPTION, &id.to_string(), "sub", None, crate::db::now_unix())
-            .unwrap_or(0);
+            .unwrap_or(u64::MAX); // cannot fail for a fresh unique instance; MAX never names a row
         self.inner.subs.lock().unwrap().push(Sub {
             id,
             topic: topic.to_string(),
@@ -480,6 +480,26 @@ impl Host {
             holding,
         });
         (id, rx)
+    }
+
+    /// Drop one of the kernel's own local subscriptions. Mirror of the client
+    /// `unsubscribe` op: find under the subs lock, release its holding in the
+    /// ledger without it (lock order: ledger → host), then remove.
+    pub fn unsubscribe_local(&self, sub_id: u64) -> bool {
+        let holding = {
+            let subs = self.inner.subs.lock().unwrap();
+            subs.iter()
+                .find(|s| s.id == sub_id && matches!(s.target, SubTarget::Local(_)))
+                .map(|s| s.holding)
+        };
+        match holding {
+            Some(h) => {
+                let _ = self.kernel.ledger.release(h, "sub", crate::db::now_unix());
+                self.inner.subs.lock().unwrap().retain(|s| s.id != sub_id);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Kernel-side event publish. Returns the number of subscribers the event
@@ -1257,4 +1277,39 @@ fn rand_token() -> String {
     let mut b = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut b);
     hex::encode(b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn host(tag: &str) -> (Host, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("portos-host-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let kernel = Arc::new(Kernel::open(&root).unwrap());
+        let host = Host::new(kernel, &root.join("sock")).unwrap();
+        (host, root)
+    }
+
+    /// A local subscription is a `kernel/subscription` holding: dropping it
+    /// releases the holding (tombstone, never a delete), and the bus no longer
+    /// delivers to it.
+    #[test]
+    fn unsubscribe_local_releases_the_subscription_holding() {
+        let (host, root) = host("unsub");
+        let (id, _rx) = host.subscribe_local("t::*");
+        assert_eq!(host.kernel.ledger.counts(CLASS_SUBSCRIPTION), (1, 0));
+        assert!(host.unsubscribe_local(id));
+        assert_eq!(
+            host.kernel.ledger.counts(CLASS_SUBSCRIPTION),
+            (0, 1),
+            "holding tombstoned"
+        );
+        assert_eq!(host.emit("t::x", json!({})), 0, "no delivery after unsubscribe");
+        assert!(!host.unsubscribe_local(id), "second drop is a no-op");
+        host.kernel.ledger.invariant().unwrap();
+        drop(host);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
