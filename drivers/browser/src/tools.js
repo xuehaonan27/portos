@@ -87,7 +87,8 @@ export function createWorkshop(opts = {}) {
       name: "browser_navigate",
       description: "导航到 url。",
       inputSchema: { type: "object", required: ["url"], properties: { url: { type: "string" } } },
-      character: EMIT,
+      // WP-06 sink target: the kernel extracts the origin of `url` per effect.
+      character: { ...EMIT, target: { arg: "url", kind: "origin" } },
       async handler({ url }) {
         const g = await policy.check({ verb: "navigate", kind: "navigate", targetOrigin: originOf(url) });
         if (g.decision === "deny") throw new Error(`policy denied: ${g.reason}`);

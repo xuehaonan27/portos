@@ -151,9 +151,19 @@ struct RouteEntry {
     schema: Value,
     kind: Option<&'static str>,
     budgeted: Option<bool>,
+    /// F3 hard list: emitting ∧ non-amortizable — plan runs withhold it.
+    withhold: bool,
+    /// Sink-target extraction (WP-06): which arg is the target, and how to
+    /// read it ("origin" normalizes to scheme://host[:port]).
+    target: Option<TargetSpec>,
 }
 
-struct HostInner {
+struct TargetSpec {
+    arg: String,
+    kind: String,
+}
+
+pub(crate) struct HostInner {
     plugins: Mutex<BTreeMap<String, Arc<PluginHandle>>>,
     routes: Mutex<BTreeMap<String, RouteEntry>>, // verb -> route
     subs: Mutex<Vec<Sub>>,
@@ -170,25 +180,26 @@ struct HostInner {
 pub struct Host {
     kernel: Arc<Kernel>,
     inner: Arc<HostInner>,
+    /// Plan runs (WP-06): admission → consent → run under the F3 monitor.
+    pub plans: Arc<crate::plans::PlanService>,
 }
 
 impl Host {
     pub fn new(kernel: Arc<Kernel>, sock_dir: &Path) -> Result<Host, KernelError> {
         std::fs::create_dir_all(sock_dir)?;
-        Ok(Host {
-            kernel,
-            inner: Arc::new(HostInner {
-                plugins: Mutex::new(BTreeMap::new()),
-                routes: Mutex::new(BTreeMap::new()),
-                subs: Mutex::new(Vec::new()),
-                next_sub: AtomicU64::new(1),
-                next_spawn: AtomicU64::new(1),
-                sock_dir: sock_dir.to_path_buf(),
-                meter: Mutex::new(crate::metrics::ContextMeter::default()),
-                sweeper_stop: Arc::new(AtomicBool::new(false)),
-                sweeper_handle: Mutex::new(None),
-            }),
-        })
+        let inner = Arc::new(HostInner {
+            plugins: Mutex::new(BTreeMap::new()),
+            routes: Mutex::new(BTreeMap::new()),
+            subs: Mutex::new(Vec::new()),
+            next_sub: AtomicU64::new(1),
+            next_spawn: AtomicU64::new(1),
+            sock_dir: sock_dir.to_path_buf(),
+            meter: Mutex::new(crate::metrics::ContextMeter::default()),
+            sweeper_stop: Arc::new(AtomicBool::new(false)),
+            sweeper_handle: Mutex::new(None),
+        });
+        let plans = crate::plans::PlanService::new(kernel.clone(), inner.clone());
+        Ok(Host { kernel, inner, plans })
     }
 
     /// Spawn `bin args…` with `envs` added, wait for both hellos, register
@@ -213,7 +224,7 @@ impl Host {
         envs: &[(&str, &str)],
         slot: Option<&Slot>,
     ) -> Result<String, KernelError> {
-        spawn_plugin(&self.kernel, &self.inner, bin, args, envs, slot, None)
+        spawn_plugin(&self.kernel, &self.inner, &self.plans, bin, args, envs, slot, None)
     }
 }
 
@@ -229,6 +240,7 @@ impl Host {
 fn spawn_plugin(
     kernel: &Arc<Kernel>,
     inner: &Arc<HostInner>,
+    plans: &Arc<crate::plans::PlanService>,
     bin: &Path,
     args: &[&str],
     envs: &[(&str, &str)],
@@ -420,6 +432,12 @@ fn spawn_plugin(
         for v in &verbs {
             let meta = &tools_meta[v.as_str()];
             let entry = table.lookup(&name, v).ok();
+            let target = meta.get("target").and_then(|t| {
+                Some(TargetSpec {
+                    arg: t["arg"].as_str()?.to_string(),
+                    kind: t["kind"].as_str().unwrap_or("literal").to_string(),
+                })
+            });
             routes.insert(
                 v.clone(),
                 RouteEntry {
@@ -432,12 +450,15 @@ fn spawn_plugin(
                     },
                     kind: entry.map(kind_label),
                     budgeted: entry.map(|e| e.bears_budget()),
+                    withhold: entry.map(kind_label) == Some("emitting")
+                        && meta.get("amortizable").and_then(|a| a.as_bool()) == Some(false),
+                    target,
                 },
             );
         }
         plugins.insert(name.clone(), handle.clone());
         spawn_event_pump(handle.clone(), events_rx);
-        spawn_client_loop(kernel.clone(), inner.clone(), name.clone(), client_stream);
+        spawn_client_loop(kernel.clone(), inner.clone(), plans.clone(), name.clone(), client_stream);
     }
 
     let _ = kernel.audit.lock().unwrap().append(json!({
@@ -503,20 +524,13 @@ impl Host {
     /// topic (exact or trailing-`*` prefix pattern). The subscription is a
     /// `kernel/subscription` holding of the kernel itself.
     pub fn subscribe_local(&self, topic: &str) -> (u64, Receiver<Value>) {
-        let (tx, rx) = sync_channel::<Value>(EVENT_QUEUE);
-        let id = self.inner.next_sub.fetch_add(1, Ordering::SeqCst);
-        let holding = self
-            .kernel
-            .ledger
-            .hold_exclusive("kernel", CLASS_SUBSCRIPTION, &id.to_string(), "sub", None, crate::db::now_unix())
-            .unwrap_or(u64::MAX); // cannot fail for a fresh unique instance; MAX never names a row
-        self.inner.subs.lock().unwrap().push(Sub {
-            id,
-            topic: topic.to_string(),
-            target: SubTarget::Local(tx),
-            holding,
-        });
-        (id, rx)
+        subscribe_with_subject(&self.kernel, &self.inner, "kernel", topic)
+    }
+
+    /// Subscribe an arbitrary kernel-side subject (e.g. a plan run's
+    /// segment) to a topic: the holding lands under that subject.
+    pub fn subscribe_for(&self, subject: &str, topic: &str) -> (u64, Receiver<Value>) {
+        subscribe_with_subject(&self.kernel, &self.inner, subject, topic)
     }
 
     /// Drop one of the kernel's own local subscriptions. Mirror of the client
@@ -604,6 +618,7 @@ impl Host {
     pub fn start_sweeper(&self, interval: std::time::Duration) {
         let kernel = self.kernel.clone();
         let inner = self.inner.clone();
+        let plans = self.plans.clone();
         let stop = inner.sweeper_stop.clone();
         let handle = std::thread::spawn(move || {
             loop {
@@ -637,6 +652,8 @@ impl Host {
                         }));
                     }
                 }
+                // [TTL] suspended plan runs expire on the same tick (WP-06).
+                plans.expire(now);
             }
         });
         *self.inner.sweeper_handle.lock().unwrap() = Some(handle);
@@ -649,6 +666,7 @@ impl Drop for Host {
         if let Some(h) = self.inner.sweeper_handle.lock().unwrap().take() {
             let _ = h.join();
         }
+        self.plans.shutdown();
         self.shutdown_all();
     }
 }
@@ -841,8 +859,8 @@ fn manifest_from_meta(name: &str, verbs: &[String], tools_meta: &Value) -> Manif
 
 /// The host as the F2 `World`: the physical inverses of the kernel's
 /// built-in holdings. Called with the ledger lock held; takes host locks only.
-struct HostWorld {
-    inner: Arc<HostInner>,
+pub(crate) struct HostWorld {
+    pub(crate) inner: Arc<HostInner>,
 }
 
 impl World for HostWorld {
@@ -953,10 +971,127 @@ fn spawn_event_pump(handle: Arc<PluginHandle>, rx: Receiver<Value>) {
     });
 }
 
+/// The fiber-side invoke (WP-06): a plan run (or another kernel-side
+/// subject) calls a verb through the same capability gate, budget spend and
+/// protocol step the plugin-facing `invoke` op uses.
+pub(crate) fn invoke_as(
+    kernel: &Arc<Kernel>,
+    inner: &Arc<HostInner>,
+    subject: &str,
+    verb: &str,
+    args: Value,
+) -> Result<Value, KernelError> {
+    let now = crate::db::now_unix();
+    let family = verb.split("::").next().unwrap_or(verb);
+    let short = verb.rsplit("::").next().unwrap_or(verb);
+    let resource = format!("driver:{family}");
+    if let Err(e) = kernel.caps.find_and_exercise(subject, &resource, short, now) {
+        let _ = kernel.audit.lock().unwrap().append(json!({
+            "event": "invoke.denied", "from": subject, "verb": verb,
+            "reason": e.to_string(),
+        }));
+        return Err(e);
+    }
+    let handle = {
+        let routes = inner.routes.lock().unwrap();
+        let target = routes
+            .get(verb)
+            .map(|e| e.plugin.clone())
+            .ok_or_else(|| KernelError::NotFound(format!("no route for verb: {verb}")))?;
+        inner
+            .plugins
+            .lock()
+            .unwrap()
+            .get(&target)
+            .cloned()
+            .ok_or_else(|| KernelError::NotFound(format!("plugin gone: {target}")))?
+    };
+    call_on(&handle, verb, args)
+}
+
+/// The kernel's verb-label schemas for plan admission and the sink rule,
+/// derived from the route table's declared verb characters. v0: reads carry
+/// no confidentiality (the taint plane lands with WP-09); emitting verbs are
+/// external sinks.
+pub(crate) fn kernel_schemas(inner: &HostInner) -> crate::plancheck::VerbSchemas {
+    let routes = inner.routes.lock().unwrap();
+    let mut s = crate::plancheck::VerbSchemas::default();
+    for (verb, e) in routes.iter() {
+        match e.kind {
+            Some("repeatable") | Some("repeatable_shared") => {
+                s.observe.insert(verb.clone(), Label::public_trusted());
+            }
+            Some("emitting") => {
+                s.external_effects.insert(verb.clone(), true);
+            }
+            _ => {}
+        }
+    }
+    s
+}
+
+/// The sink target of one effect (WP-06): the route's declared `target` arg,
+/// normalized by kind ("origin" → scheme://host[:port]); `*` when undeclared.
+pub(crate) fn target_of(inner: &HostInner, verb: &str, args: &Value) -> String {
+    let spec = {
+        let routes = inner.routes.lock().unwrap();
+        routes.get(verb).and_then(|e| e.target.as_ref().map(|t| (t.arg.clone(), t.kind.clone())))
+    };
+    let Some((arg, kind)) = spec else { return "*".into() };
+    let raw = args[&arg].as_str().unwrap_or("*");
+    match kind.as_str() {
+        "origin" => origin_of(raw).unwrap_or_else(|| raw.to_string()),
+        _ => raw.to_string(),
+    }
+}
+
+fn origin_of(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let hostport = rest.split('/').next().unwrap_or(rest);
+    if hostport.is_empty() {
+        return None;
+    }
+    Some(format!("{scheme}://{hostport}"))
+}
+
+/// Is this verb on the F3 hard list (emitting ∧ non-amortizable)?
+pub(crate) fn withholds(inner: &HostInner, verb: &str) -> bool {
+    inner
+        .routes
+        .lock()
+        .unwrap()
+        .get(verb)
+        .map(|e| e.withhold)
+        .unwrap_or(false)
+}
+
+/// Subscribe an arbitrary kernel-side subject (e.g. a plan run's segment) to
+/// a topic. `Host::subscribe_local` is this with the `kernel` subject.
+pub(crate) fn subscribe_with_subject(
+    kernel: &Arc<Kernel>,
+    inner: &Arc<HostInner>,
+    subject: &str,
+    topic: &str,
+) -> (u64, Receiver<Value>) {
+    let (tx, rx) = sync_channel::<Value>(EVENT_QUEUE);
+    let id = inner.next_sub.fetch_add(1, Ordering::SeqCst);
+    let holding = kernel
+        .ledger
+        .hold_exclusive(subject, CLASS_SUBSCRIPTION, &id.to_string(), "sub", None, crate::db::now_unix())
+        .unwrap_or(u64::MAX);
+    inner.subs.lock().unwrap().push(Sub {
+        id,
+        topic: topic.to_string(),
+        target: SubTarget::Local(tx),
+        holding,
+    });
+    (id, rx)
+}
+
 /// Deliver an event to every matching subscriber. Overflow policy: a local
 /// subscriber is dropped; a plugin subscriber's whole connection is cut
 /// (m0 §3 — never let a slow consumer wedge the kernel).
-fn dispatch_event(kernel: &Arc<Kernel>, inner: &Arc<HostInner>, topic: &str, data: Value) -> usize {
+pub(crate) fn dispatch_event(kernel: &Arc<Kernel>, inner: &Arc<HostInner>, topic: &str, data: Value) -> usize {
     enum Target {
         Local(u64, u64, SyncSender<Value>),
         Plugin(u64, u64, String),
@@ -1056,6 +1191,7 @@ fn topic_matches(pattern: &str, topic: &str) -> bool {
 fn spawn_client_loop(
     kernel: Arc<Kernel>,
     inner: Arc<HostInner>,
+    plans: Arc<crate::plans::PlanService>,
     name: String,
     mut stream: UnixStream,
 ) {
@@ -1085,7 +1221,7 @@ fn spawn_client_loop(
                 }
             };
             count_context(&inner, &req);
-            let resp = handle_client_op(&kernel, &inner, &name, &req, &mut stream);
+            let resp = handle_client_op(&kernel, &inner, &plans, &name, &req, &mut stream);
             let resp = match resp {
                 Ok(v) => v,
                 Err(e) => json!({"err": e.to_string()}),
@@ -1269,6 +1405,7 @@ fn op_renew(kernel: &Arc<Kernel>, name: &str, req: &Value, now: u64) -> Result<V
 fn handle_client_op(
     kernel: &Arc<Kernel>,
     inner: &Arc<HostInner>,
+    plans: &Arc<crate::plans::PlanService>,
     name: &str,
     req: &Value,
     stream: &mut UnixStream,
@@ -1488,6 +1625,7 @@ fn handle_client_op(
             let child = spawn_plugin(
                 kernel,
                 inner,
+                plans,
                 Path::new(&bin),
                 &arg_refs,
                 &env_refs,
@@ -1503,6 +1641,34 @@ fn handle_client_op(
         Some("hold") => op_hold(kernel, inner, name, req, now),
         Some("release") => op_release(kernel, inner, name, req, now),
         Some("renew") => op_renew(kernel, name, req, now),
+
+        // ---- plan submission (WP-06): admit only — the model proposes,
+        // never executes and never approves. Consent is the person's, given
+        // through the CLI.
+        Some("plan.submit") => {
+            let subject = format!("plugin:{name}");
+            let plan_val = req.get("plan").cloned().unwrap_or(Value::Null);
+            let bytes = serde_json::to_vec(&plan_val)
+                .map_err(|e| KernelError::Corrupt(format!("plan.submit encode: {e}")))?;
+            match plans.submit(&subject, &bytes) {
+                Ok(out) => {
+                    // Put the plan where the CLI can sign it.
+                    let dir = kernel.root.join("submitted-plans");
+                    let fname = out.plan_hash.replace(':', "_");
+                    let _ = std::fs::create_dir_all(&dir);
+                    let _ = std::fs::write(dir.join(format!("{fname}.json")), &bytes);
+                    Ok(json!({"ok": {
+                        "run_id": out.run_id,
+                        "plan_hash": out.plan_hash,
+                        "rendering": out.rendering,
+                        "budget": out.budget,
+                        "needs": "consent",
+                        "plan_path": dir.join(format!("{fname}.json")),
+                    }}))
+                }
+                Err(e) => Err(e),
+            }
+        }
 
         // ---- artifact dereference: put (frame, then chunk stream) ----
         Some("put") => {

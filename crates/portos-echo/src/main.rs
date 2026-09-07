@@ -51,6 +51,9 @@ fn main() -> std::io::Result<()> {
     };
     let emit_kind = if std::env::var("PORTOS_ECHO_BAD_KIND").is_ok() {
         json!({"kind": "repeatable", "idempotent": false})
+    } else if std::env::var("PORTOS_ECHO_HARD_EMIT").is_ok() {
+        // F3 hard-list shape for plan-run tests: emitting ∧ non-amortizable.
+        json!({"kind": "emitting", "world": "external", "amortizable": false})
     } else {
         json!({"kind": "emitting", "world": "external", "amortizable": true})
     };

@@ -48,29 +48,14 @@ pub fn run(root: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     write_templates(&root)?;
 
-    let exe = std::env::current_exe()?;
-    let sibling = |name: &str| -> Result<PathBuf, String> {
-        let p = exe.with_file_name(name);
-        if p.exists() {
-            Ok(p)
-        } else {
-            Err(format!("missing sibling binary: {}", p.display()))
-        }
-    };
-
-    let broker_dir = root.join("broker");
-    host.spawn(
-        &sibling("portos-broker")?,
-        &[],
-        &[("PORTOS_BROKER_DIR", broker_dir.to_str().unwrap())],
-    )?;
+    let broker = spawn_broker(&host, &root)?;
     let modeld_dir = root.join("modeld");
     let modeld = host.spawn(
         &sibling("portos-modeld")?,
         &[],
         &[("PORTOS_MODELD_DIR", modeld_dir.to_str().unwrap())],
     )?;
-    println!("[chat] plugins: portos-broker, {modeld}");
+    println!("[chat] plugins: {broker}, {modeld}");
 
     // The model driver always gets egress (its LLM calls go through the
     // broker; it holds no key and no network of its own).
@@ -92,38 +77,7 @@ pub fn run(root: &str) -> Result<(), Box<dyn std::error::Error>> {
             render_builtin = false;
             println!("[chat] builtin rendering off — renderer plugins own the output");
         }
-        if let Some(plugins) = cfg["plugins"].as_array() {
-            for p in plugins {
-                let bin = p["bin"].as_str().ok_or("chat.json plugin missing bin")?;
-                let args: Vec<String> = p["args"]
-                    .as_array()
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_str())
-                            .map(|s| resolve_arg(&root, s))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-                let envs: Vec<(String, String)> = p["env"]
-                    .as_object()
-                    .map(|m| {
-                        m.iter()
-                            .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let env_refs: Vec<(&str, &str)> =
-                    envs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-                // F5: an entry may declare the slot it spawns into.
-                let slot = p.get("slot").map(|s| portos_kernel::host::Slot {
-                    offers: str_list(&s["offers"]),
-                    provides: str_list(&s["provides"]),
-                });
-                let name = host.spawn_in(Path::new(bin), &arg_refs, &env_refs, slot.as_ref())?;
-                println!("[chat] plugin: {name}");
-            }
-        }
+        spawn_chat_plugins(&host, &root, &cfg)?;
         if let Some(grants) = cfg["grants"].as_array() {
             for g in grants {
                 let subject = g["subject"]
@@ -266,6 +220,69 @@ fn str_list(v: &Value) -> Vec<String> {
     v.as_array()
         .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
         .unwrap_or_default()
+}
+
+fn sibling(name: &str) -> Result<PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let p = exe.with_file_name(name);
+    if p.exists() {
+        Ok(p)
+    } else {
+        Err(format!("missing sibling binary: {}", p.display()))
+    }
+}
+
+/// Spawn the trusted egress broker (shared by `chat` and `run-plan`).
+pub fn spawn_broker(host: &Host, root: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let dir = root.join("broker");
+    let name = host.spawn(
+        &sibling("portos-broker")?,
+        &[],
+        &[("PORTOS_BROKER_DIR", dir.to_str().unwrap())],
+    )?;
+    Ok(name)
+}
+
+/// Spawn every plugin of a chat.json `plugins` array, honoring per-entry
+/// `slot` (shared by `chat` and `run-plan`).
+pub fn spawn_chat_plugins(
+    host: &Host,
+    root: &Path,
+    cfg: &Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(plugins) = cfg["plugins"].as_array() {
+        for p in plugins {
+            let bin = p["bin"].as_str().ok_or("chat.json plugin missing bin")?;
+            let args: Vec<String> = p["args"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| resolve_arg(root, s))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+            let envs: Vec<(String, String)> = p["env"]
+                .as_object()
+                .map(|m| {
+                    m.iter()
+                        .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let env_refs: Vec<(&str, &str)> =
+                envs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            // F5: an entry may declare the slot it spawns into.
+            let slot = p.get("slot").map(|s| portos_kernel::host::Slot {
+                offers: str_list(&s["offers"]),
+                provides: str_list(&s["provides"]),
+            });
+            let name = host.spawn_in(Path::new(bin), &arg_refs, &env_refs, slot.as_ref())?;
+            println!("[chat] plugin: {name}");
+        }
+    }
+    Ok(())
 }
 
 fn write_templates(root: &Path) -> std::io::Result<()> {

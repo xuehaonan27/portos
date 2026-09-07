@@ -127,4 +127,4 @@
 | F5 effect row（位置 ∩ 主体）、装载期集合包含 | `host::Slot`、`spawn_in`＋`admit_mount`、invoke 的 row 检查；chat.json plugin 条目暴露 `slot` | echo `slot_row_bounds_invoke_and_admits_requires`；chat `chat_json_slot_refusal_is_reported` |
 | F5 B̂＝出现之和（§6.5，effect-plan §5.2）＝M0 准入预算 | `plan_ir::to_ast_nodes`＋`coeffect::Plan::from_ast`（WP-05 投影链；kernel feature `plans`，G1 前默认关） | `plans::plancheck_budget_equals_demand_sum_on_all_small_plans`（2343 计划；`cargo test -p portos-kernel --features plans`） |
 | F6 协议＝safety，截停档精确执行 | `host::call_on` 步进（hello `protocol`） | echo `protocol_order_is_enforced_at_call` |
-| F3 monitor（sink／扣发／同意／三态／段事务） | **未接线**：以 D31 解禁为前提；预算闸经 F1 已在线 | — |
+| F3 monitor（sink／扣发／同意／三态／段事务） | **已成（2026-09-07，D43/WP-06）**：`plans::PlanService`；同意＝按族铸纤维能力（行式预算）；`suppression_buffer`＋跨进程 `approve`；三模式＋进程内 escalate；段＝`transfer_all`/teardown | `plans::` 十条内核集成测试（镜像法则名）＋ chat `plan_run_navigate_type_submit_withheld_then_approved` |

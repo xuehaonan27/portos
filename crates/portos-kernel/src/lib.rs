@@ -12,8 +12,8 @@
 //!
 //! ### M0 stage implementations
 //! Other components:
-//!   - a prototype of effect-plan interpreter ([`interp`]).
-//!   - consent quadruple ([`consent`]).
+//!   - plan runs: admission ([`plancheck`]) → consent ([`consent`]) → run
+//!     under the F3 monitor ([`plans`], WP-06).
 //!
 //! Plugin domain knowledges MUST NOT appear in this crate, which is an
 //! architectural invariant.
@@ -32,11 +32,11 @@ pub mod cas;
 pub mod consent;
 pub mod db;
 pub mod host;
-pub mod interp;
 pub mod ledger;
 pub mod metrics;
 pub mod plan_ir;
 pub mod plancheck;
+pub mod plans;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -52,6 +52,8 @@ pub struct Kernel {
     pub ledger: Arc<ledger::LedgerStore>,
     pub audit: Arc<Mutex<audit::AuditLog>>,
     pub consent_key: consent::ConsentKey,
+    /// The shared SQLite connection (holdings, journal, substrate, plan runs).
+    pub db: Arc<Mutex<rusqlite::Connection>>,
 }
 
 impl Kernel {
@@ -93,6 +95,7 @@ impl Kernel {
             ledger,
             audit,
             consent_key,
+            db,
         })
     }
 }

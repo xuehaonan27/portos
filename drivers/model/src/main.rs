@@ -102,6 +102,33 @@ fn load_tools(cfg: &Value) -> Result<Vec<ToolDef>, String> {
 /// kernel `read` op rather than an invoke — reads are free but audited.
 const ARTIFACT_READ: &str = "artifact::read";
 
+/// The built-in plan tool (WP-06): the model submits an effect plan for
+/// admission; the kernel admits and renders it, and the person decides
+/// consent out of band. The model can propose — it can never approve.
+const PLAN_SUBMIT: &str = "plan::submit";
+
+fn plan_submit_tool() -> ToolDef {
+    ToolDef {
+        verb: PLAN_SUBMIT.to_string(),
+        description: "Submit an effect plan (JSON tree: stmts of let/effect/if/foreach) for \
+                      admission. The kernel checks it and returns a deterministic rendering of \
+                      its per-verb budget plus a run id. Tell the user the rendering and the \
+                      plan path: only the person can sign consent (out of band, via the CLI). \
+                      The run executes nothing before that."
+            .to_string(),
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "plan": {"type": "object", "description": "the plan AST"},
+                "intent": {"type": "string", "description": "what the plan is for, in the model's words (rendered in the untrusted area)"},
+            },
+            "required": ["plan", "intent"],
+        }),
+        kind: Some("transforming".to_string()),
+        budgeted: Some(false),
+    }
+}
+
 fn artifact_read_tool() -> ToolDef {
     ToolDef {
         verb: ARTIFACT_READ.to_string(),
@@ -171,6 +198,8 @@ fn assemble_tools(
     }
     map.entry(ARTIFACT_READ.to_string())
         .or_insert_with(artifact_read_tool);
+    map.entry(PLAN_SUBMIT.to_string())
+        .or_insert_with(plan_submit_tool);
     map.into_values().collect()
 }
 
@@ -283,6 +312,11 @@ fn main() -> std::io::Result<()> {
                             "len_read": n,
                             "truncated": n == len,
                         }));
+                    }
+                    if verb == PLAN_SUBMIT {
+                        let plan = a.get("plan").cloned().ok_or("plan::submit: missing plan")?;
+                        let intent = a["intent"].as_str().unwrap_or("");
+                        return client.plan_submit(plan, intent);
                     }
                     client.invoke(verb, a)
                 };

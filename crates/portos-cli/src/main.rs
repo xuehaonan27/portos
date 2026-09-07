@@ -8,53 +8,25 @@
 //!   portos audit-verify <root>
 //!   portos consent <root> <plan.json> [--yes]
 //!   portos run-plan <root> <plan.json> <consent.json>
+//!   portos approve <root> <run_id>
+//!   portos resume <root> <run_id>
 //!   portos chat <root>
 //!
 //! `consent` renders the kernel-computed canonical budget (never model
-//! prose) and signs the quadruple on approval. `run-plan` executes under a
-//! toy executor wired to portos-compute.
+//! prose) and signs the quadruple on approval. `run-plan` executes the plan
+//! against the live driver stack under the F3 monitor (WP-06); `approve`
+//! releases a withheld batch; `resume` reports on paused runs (escalate
+//! resume is in-process, from the run-plan session).
 
 mod chat;
 
-use portos_kernel::consent::{render_budget, Budget, ConsentRecord};
-use portos_kernel::interp::{run_plan, EffectExec};
-use portos_kernel::plancheck::{admit, VerbSchemas};
+use portos_kernel::consent::{ConsentRecord, render_budget};
+use portos_kernel::host::Host;
 use portos_kernel::Kernel;
-use portos_proto::{Label, Plan};
-use serde_json::{json, Value};
+use portos_proto::Label;
+use serde_json::{Value, json};
 use std::io::Write;
-
-
-fn toy_schemas() -> VerbSchemas {
-    let mut s = VerbSchemas::default();
-    s.observe.insert("echo::list".into(), Label::with_integ("toy:echo"));
-    s.observe.insert("secret::read".into(), Label::with_conf("secret:demo"));
-    s.external_effects.insert("echo::emit".into(), false);
-    s.external_effects.insert("external::send".into(), true);
-    s
-}
-
-struct ToyExec {
-    compute: portos_compute::Registry,
-}
-
-impl EffectExec for ToyExec {
-    fn observe(&mut self, verb: &str, _args: &[Value]) -> Result<Value, String> {
-        match verb {
-            "echo::list" => Ok(json!(["alpha", "beta", "gamma"])),
-            "secret::read" => Ok(json!("A")),
-            other => Err(format!("toy observe: unknown {other}")),
-        }
-    }
-    fn effect(&mut self, verb: &str, args: &[Value]) -> Result<(), String> {
-        println!("[effect] {verb} {}", serde_json::to_string(args).unwrap_or_default());
-        Ok(())
-    }
-    fn pure(&mut self, func: &str, args: &[Value]) -> Result<Value, String> {
-        let mut fuel = portos_compute::FuelMeter::new(1_000_000);
-        self.compute.run(func, None, args, &mut fuel)
-    }
-}
+use std::sync::Arc;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -107,14 +79,20 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let root = need(args, 2, "root")?;
             let plan_path = need(args, 3, "plan.json")?;
             let auto_yes = args.iter().any(|a| a == "--yes");
-            let k = Kernel::open(std::path::Path::new(&root))?;
+            let root_path = std::path::PathBuf::from(&root);
+            let k = Arc::new(Kernel::open(&root_path)?);
+            let host = Host::new(k.clone(), &root_path.join("sock"))?;
+            // Admission runs against the real route tables (verbs' declared
+            // characters), so the driver stack comes up — plugins only, no
+            // browser window (Chromium opens lazily on first verb).
+            chat::spawn_broker(&host, &root_path)?;
+            if let Ok(text) = std::fs::read_to_string(root_path.join("chat.json")) {
+                let cfg: Value = serde_json::from_str(&text)?;
+                chat::spawn_chat_plugins(&host, &root_path, &cfg)?;
+            }
             let bytes = std::fs::read(&plan_path)?;
-            // The plan bytes ARE the artifact; h_plan is its CAS id.
-            let meta = k.cas.put_bytes(&bytes, "portos/plan", Label::public_trusted(), "cli")?;
-            let plan = Plan::from_bytes(&bytes)?;
-            let adm = admit(&plan, &toy_schemas()).map_err(|e| e.to_string())?;
-            let budget: Budget = adm.budget.clone();
-            print!("{}", render_budget(&meta.id, &budget));
+            let out = host.plans.submit("user", &bytes)?;
+            print!("{}", out.rendering);
             let approved = auto_yes || {
                 print!("Approve this plan? [y/N] ");
                 std::io::stdout().flush()?;
@@ -124,27 +102,161 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             };
             if !approved {
                 println!("Denied");
+                host.shutdown_all();
                 return Ok(());
             }
-            let rec = ConsentRecord::sign(&k.consent_key, &meta.id, budget, 3600);
-            let out = format!("{plan_path}.consent.json");
-            std::fs::write(&out, serde_json::to_string_pretty(&rec)?)?;
+            let rec = ConsentRecord::sign(&k.consent_key, &out.plan_hash, out.budget.clone(), 3600);
+            let out_path = format!("{plan_path}.consent.json");
+            std::fs::write(&out_path, serde_json::to_string_pretty(&rec)?)?;
             k.audit.lock().unwrap().append(json!({
-                "event": "consent.signed", "plan": meta.id, "nonce": rec.nonce,
+                "event": "consent.signed", "plan": out.plan_hash, "nonce": rec.nonce,
             }))?;
-            println!("consent → {out}");
+            println!("consent → {out_path}");
+            println!("run it with: portos run-plan {root} {plan_path} {out_path}");
+            host.shutdown_all();
         }
         "run-plan" => {
             let root = need(args, 2, "root")?;
             let plan_path = need(args, 3, "plan.json")?;
             let consent_path = need(args, 4, "consent.json")?;
-            let k = Kernel::open(std::path::Path::new(&root))?;
+            let root_path = std::path::PathBuf::from(&root);
+            let k = Arc::new(Kernel::open(&root_path)?);
+            let host = Host::new(k.clone(), &root_path.join("sock"))?;
+            host.start_sweeper(std::time::Duration::from_secs(1));
+            chat::spawn_broker(&host, &root_path)?;
+            if let Ok(text) = std::fs::read_to_string(root_path.join("chat.json")) {
+                let cfg: Value = serde_json::from_str(&text)?;
+                chat::spawn_chat_plugins(&host, &root_path, &cfg)?;
+            }
             let bytes = std::fs::read(&plan_path)?;
             let rec: ConsentRecord = serde_json::from_str(&std::fs::read_to_string(&consent_path)?)?;
-            let mut exec = ToyExec { compute: portos_compute::Registry::builtin() };
-            let mut audit = k.audit.lock().unwrap();
-            let out = run_plan(&bytes, &rec, &k.consent_key, &toy_schemas(), &mut exec, &mut audit)?;
-            println!("{}", serde_json::to_string_pretty(&out)?);
+            let plan_hash = portos_proto::artifact::id_for_bytes(&bytes);
+            // Prefer the run `consent` already admitted for this plan.
+            let run_id = match host.plans.admitted_run_for(&plan_hash)? {
+                Some(id) => id,
+                None => host.plans.submit("user", &bytes)?.run_id,
+            };
+            println!("[run] admitted {run_id} ({plan_hash})");
+            let (_sub, rx) = host.subscribe_local(&format!("plan::run::{run_id}"));
+            host.plans.start(&run_id, &rec)?;
+            let stdin = std::io::stdin();
+            loop {
+                let ev = match rx.recv() {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                let kind = ev["data"]["kind"].as_str().unwrap_or("").to_string();
+                println!("[run] {}", serde_json::to_string(&ev["data"]).unwrap_or_default());
+                match kind.as_str() {
+                    "finished" => break,
+                    "awaiting_approval" => {
+                        let batch = host.plans.withheld_batch(&run_id).unwrap_or_default();
+                        for (verb, target, cost) in &batch {
+                            println!("[run] withheld: {verb} @ {target} (cost {cost})");
+                        }
+                        print!("Approve and release this batch? [y/N] ");
+                        std::io::stdout().flush()?;
+                        let mut line = String::new();
+                        stdin.read_line(&mut line)?;
+                        if matches!(line.trim(), "y" | "Y" | "yes") {
+                            let mut budget = std::collections::BTreeMap::new();
+                            for (verb, _, cost) in &batch {
+                                *budget.entry(verb.clone()).or_insert(0u64) += cost;
+                            }
+                            let approval = ConsentRecord::sign(&k.consent_key, &plan_hash, budget, 3600);
+                            k.audit.lock().unwrap().append(json!({
+                                "event": "consent.signed", "plan": plan_hash, "nonce": approval.nonce,
+                            }))?;
+                            if let Err(e) = host.plans.approve(&run_id, &approval) {
+                                println!("[run] approve failed: {e}");
+                                break;
+                            }
+                            // keep watching for finished
+                        } else {
+                            println!("[run] left awaiting approval; it will be aborted at consent expiry");
+                            break;
+                        }
+                    }
+                    "paused" => {
+                        print!("Plan paused (escalate). Grant another batch with the same budget? [y/N] ");
+                        std::io::stdout().flush()?;
+                        let mut line = String::new();
+                        stdin.read_line(&mut line)?;
+                        if matches!(line.trim(), "y" | "Y" | "yes") {
+                            let inc = ConsentRecord::sign(
+                                &k.consent_key,
+                                &plan_hash,
+                                rec.budget.clone(),
+                                3600,
+                            );
+                            host.plans.resume(&run_id, &inc)?;
+                        } else {
+                            println!("[run] left paused; it will be aborted at consent expiry");
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            host.shutdown_all();
+        }
+        "approve" => {
+            let root = need(args, 2, "root")?;
+            let run_id = need(args, 3, "run_id")?;
+            let root_path = std::path::PathBuf::from(&root);
+            let k = Arc::new(Kernel::open(&root_path)?);
+            let host = Host::new(k.clone(), &root_path.join("sock"))?;
+            chat::spawn_broker(&host, &root_path)?;
+            if let Ok(text) = std::fs::read_to_string(root_path.join("chat.json")) {
+                let cfg: Value = serde_json::from_str(&text)?;
+                chat::spawn_chat_plugins(&host, &root_path, &cfg)?;
+            }
+            let plan_hash = host.plans.run_plan_hash(&run_id)?;
+            let batch = host.plans.withheld_batch(&run_id)?;
+            if batch.is_empty() {
+                println!("nothing to approve for {run_id}");
+                return Ok(());
+            }
+            let mut budget = std::collections::BTreeMap::new();
+            for (verb, _, cost) in &batch {
+                *budget.entry(verb.clone()).or_insert(0u64) += cost;
+            }
+            print!("{}", render_budget(&plan_hash, &budget));
+            println!("Withheld effects to release, in order:");
+            for (verb, target, cost) in &batch {
+                println!("  - {verb} @ {target} (cost {cost})");
+            }
+            print!("Approve and release this batch? [y/N] ");
+            std::io::stdout().flush()?;
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            if !matches!(line.trim(), "y" | "Y" | "yes") {
+                println!("Denied");
+                return Ok(());
+            }
+            let rec = ConsentRecord::sign(&k.consent_key, &plan_hash, budget, 3600);
+            host.plans.approve(&run_id, &rec)?;
+            k.audit.lock().unwrap().append(json!({
+                "event": "consent.signed", "plan": plan_hash, "nonce": rec.nonce,
+            }))?;
+            println!("[approve] batch released");
+            host.shutdown_all();
+        }
+        "resume" => {
+            // A paused run's continuation lives in the interpreter thread of
+            // the process that started it — a fresh CLI cannot resume it.
+            // (Opening the kernel aborts dead processes' runs as crashed.)
+            let root = need(args, 2, "root")?;
+            let run_id = need(args, 3, "run_id")?;
+            let root_path = std::path::PathBuf::from(&root);
+            let k = Arc::new(Kernel::open(&root_path)?);
+            let host = Host::new(k, &root_path.join("sock"))?;
+            let state = host.plans.run_state(&run_id)?;
+            return Err(format!(
+                "plan run {run_id} is {state}; escalate resume is in-process \
+                 (answer the prompt in the run-plan session)"
+            )
+            .into());
         }
         "chat" => {
             let root = need(args, 2, "root")?;

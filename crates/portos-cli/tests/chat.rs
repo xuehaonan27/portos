@@ -120,6 +120,37 @@ fn write_json(path: &Path, v: &Value) {
     std::fs::write(path, serde_json::to_string_pretty(v).unwrap()).unwrap();
 }
 
+/// A form fixture: GET / serves the form, POST /submit records the body.
+/// Returns (port, recorded bodies). Refs are deterministic: the input is e1.
+fn serve_form() -> (u16, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let rec = recorded.clone();
+    std::thread::spawn(move || {
+        let form = "<html><body><form method=\"post\" action=\"/submit\">\
+                    <input name=\"q\" type=\"text\"><button type=\"submit\">go</button>\
+                    </form></body></html>";
+        loop {
+            let Ok((mut conn, _)) = listener.accept() else { return };
+            let req = read_request(&mut conn);
+            let (body, ty) = if req.starts_with("POST /submit") {
+                rec.lock().unwrap().push(req);
+                ("submitted ok", "text/plain")
+            } else {
+                (form, "text/html")
+            };
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {ty}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = conn.write_all(head.as_bytes());
+            let _ = conn.write_all(body.as_bytes());
+        }
+    });
+    (port, recorded)
+}
+
 /// The adapter alone: browser::* verbs over the plugin ABI, the sink's
 /// kernel mode, screenshot-as-artifact, and origin taint labels.
 #[test]
@@ -541,5 +572,103 @@ fn browser_close_releases_process_and_profile_lock_holdings() {
     kernel.ledger.invariant().unwrap();
 
     host.shutdown_all();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// WP-06 Phase C acceptance in the real vertical: one consent buys a batch of
+/// autonomous actions — navigate and type execute under the monitor; submit
+/// (the hard list) is withheld unseen until the person approves; the batch is
+/// released in order exactly once and the form POST lands (budget stop and
+/// prefix reporting ride along as events).
+#[test]
+fn plan_run_navigate_type_submit_withheld_then_approved() {
+    let Some((plugin, _fixture)) = browser_ready() else { return };
+    let cli = Path::new(CLI_BIN);
+    if !cli.with_file_name("portos-broker").exists() {
+        eprintln!("skipping: portos-broker not built (run under cargo test --workspace)");
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("portos-planrun-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let (port, posted) = serve_form();
+    let url = format!("http://127.0.0.1:{port}/");
+
+    // The plan: navigate → type → submit (submit is the hard-list verb).
+    let plan = json!({"stmts": [
+        {"k": "effect", "verb": "browser::navigate",
+         "args": [{"k": "const", "value": {"url": url}}]},
+        {"k": "effect", "verb": "browser::type",
+         "args": [{"k": "const", "value": {"ref": "e1", "text": "hello portos"}}]},
+        {"k": "effect", "verb": "browser::submit",
+         "args": [{"k": "const", "value": {"ref": "e1"}}]},
+    ]});
+    let plan_path = root.join("plan.json");
+    std::fs::write(&plan_path, serde_json::to_string_pretty(&plan).unwrap()).unwrap();
+    write_json(
+        &root.join("chat.json"),
+        &json!({
+            "plugins": [{
+                "bin": "node",
+                "args": [plugin.to_str().unwrap()],
+                "env": {"WORKSHOP_HEADLESS": "1",
+                        "WORKSHOP_PROFILE_DIR": root.join("profile").to_str().unwrap()},
+            }],
+        }),
+    );
+
+    // Consent (WYSIWYS rendering computed against the real route tables).
+    let consent_out = std::process::Command::new(cli)
+        .args(["consent", root.to_str().unwrap(), plan_path.to_str().unwrap(), "--yes"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&consent_out.stdout);
+    let stderr = String::from_utf8_lossy(&consent_out.stderr);
+    assert!(consent_out.status.success(), "consent failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains("browser::navigate <= 1")
+            && stdout.contains("browser::type <= 1")
+            && stdout.contains("browser::submit <= 1"),
+        "the rendering shows the per-class budget:\n{stdout}"
+    );
+    let consent_path = format!("{}.consent.json", plan_path.display());
+    assert!(Path::new(&consent_path).exists(), "consent file written");
+
+    // Run it; the person approves the withheld batch at the inline prompt.
+    let mut child = std::process::Command::new(cli)
+        .args(["run-plan", root.to_str().unwrap(), plan_path.to_str().unwrap(), &consent_path])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"y\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "run-plan failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains("\"kind\":\"withheld\"")
+            || stdout.contains("withheld: browser::submit"),
+        "submit was withheld:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("\"kind\":\"approved\"") && stdout.contains("\"released\":1"),
+        "the batch was approved and released:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("\"status\":\"Completed\""),
+        "the run completed after approval:\n{stdout}"
+    );
+    let bodies = posted.lock().unwrap();
+    assert_eq!(bodies.len(), 1, "the form POST landed exactly once: {bodies:?}");
+    assert!(bodies[0].contains("hello"), "the typed text is in the POST body: {bodies:?}");
+
+    // The audit chain replays the whole run.
+    let verify = std::process::Command::new(cli)
+        .args(["audit-verify", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(verify.status.success(), "audit-verify failed");
     let _ = std::fs::remove_dir_all(&root);
 }

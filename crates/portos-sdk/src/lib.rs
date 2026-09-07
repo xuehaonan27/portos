@@ -74,6 +74,14 @@ impl KernelClient {
             .ok_or_else(|| "no child name".into())
     }
 
+    /// Submit an effect plan for admission (WP-06). The kernel admits and
+    /// renders it; consent is given by the person out of band (the model
+    /// never approves). Returns `{run_id, plan_hash, rendering, budget,
+    /// needs, plan_path}`.
+    pub fn plan_submit(&self, plan: Value, intent: &str) -> Result<Value, String> {
+        self.request(&json!({"op": "plan.submit", "plan": plan, "intent": intent}))
+    }
+
     /// Register a substrate holding (WP-02): a child process, port or lock
     /// file this plugin is responsible for. Restricted by the kernel to the
     /// built-in classes; the row is parented under this plugin's holding, so

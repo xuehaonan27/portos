@@ -451,6 +451,27 @@ impl LedgerStore {
         })
     }
 
+    /// Transfer every live row of `from_subject` to `to_subject` in one
+    /// transaction ([SEG-TX] segment commit: fragments untouched, FPU
+    /// trivial). Returns how many rows moved.
+    pub fn transfer_all(&self, from_subject: &str, to_subject: &str) -> Result<usize, KernelError> {
+        self.transaction(|l, conn| {
+            let rows: Vec<(u64, String)> = l
+                .live()
+                .filter(|h| h.subject == from_subject)
+                .map(|h| (h.id, h.generation.clone()))
+                .collect();
+            for (id, generation) in &rows {
+                l.transfer(*id, generation, from_subject, to_subject)
+                    .map_err(map_err)?;
+                if let Some(h) = l.holding(*id) {
+                    persist_on(conn, h)?;
+                }
+            }
+            Ok(rows.len())
+        })
+    }
+
     /// Hold a substrate resource (WP-02): one exclusive row of a holdable
     /// built-in class plus its substrate witness row (one transaction).
     /// `lease_secs`, when given, is a per-holding lease written to the row
