@@ -3,7 +3,7 @@
 //! the event bus, ephemeral refs, and the JS protocol client.
 
 use portos_kernel::host::{Host, Slot};
-use portos_kernel::ledger::{CLASS_PLUGIN, CLASS_SUBSCRIPTION};
+use portos_kernel::ledger::{CLASS_PLUGIN, CLASS_PROCESS, CLASS_SUBSCRIPTION};
 use portos_kernel::Kernel;
 use portos_proto::cap::Constraints;
 use serde_json::{Value, json};
@@ -684,6 +684,61 @@ fn spawn_child_is_capability_gated_and_parent_death_reclaims_children_first() {
             && e["plugin"] == "portos-echop"
             && e["released"] == 2),
         "one teardown released parent and child together"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// WP-02: a plugin registers its child process as a `kernel/process` holding
+/// (parented under its own plugin holding); when the plugin is kill -9'd, the
+/// one crash-only teardown path kills the exact witnessed incarnation —
+/// nothing leaks.
+#[test]
+fn plugin_registers_a_child_process_holding_and_kill_minus_nine_reaps_it() {
+    let (kernel, host, root) = setup("holdproc");
+    let a = spawn_echo(&host, "echoa");
+    let out = host.call(&a, "echoa::hold_process", json!([300])).unwrap();
+    let sleeper = out["pid"].as_u64().unwrap() as u32;
+
+    // The sleeper is alive, on the ledger, a child of the plugin holding.
+    let subject = "plugin:portos-echoa";
+    assert_eq!(kernel.ledger.counts(CLASS_PROCESS), (1, 0));
+    assert_eq!(kernel.ledger.live_closure(subject).len(), 2, "plugin row + process row");
+    let alive = |pid: u32| {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    assert!(alive(sleeper));
+
+    // kill -9 the plugin: reclaim must kill the witnessed incarnation too.
+    let ppid = host.pid(&a).expect("plugin pid");
+    std::process::Command::new("kill").args(["-9", &ppid.to_string()]).status().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while kernel.ledger.counts(CLASS_PROCESS).0 > 0 {
+        assert!(std::time::Instant::now() < deadline, "process holding never reclaimed");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    while alive(sleeper) {
+        assert!(std::time::Instant::now() < deadline, "sleeper never died");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(kernel.ledger.counts(CLASS_PLUGIN), (0, 1));
+    kernel.ledger.invariant().unwrap();
+
+    host.shutdown_all();
+    drop(host);
+    let events = audit_events(&root);
+    assert!(
+        events.iter().any(|e| e["event"] == "substrate.held" && e["class"] == "kernel/process"),
+        "the hold is audited"
+    );
+    assert!(
+        events.iter().any(|e| e["event"] == "plugin.reclaimed"
+            && e["plugin"] == "portos-echoa"
+            && e["released"] == 2),
+        "one teardown released plugin row and process row together"
     );
     let _ = std::fs::remove_dir_all(&root);
 }

@@ -18,6 +18,7 @@
 // every call).
 
 import { readFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { createWorkshop } from "./tools.js";
 import { makeSink } from "./sink.js";
 import { servePlugin } from "../../../sdk/js/client.js";
@@ -77,6 +78,53 @@ const protocol = {
   ],
 };
 
+// WP-02: once the browser is actually up, its substrate is on the ledger —
+// the Chromium process (the kernel kills the exact incarnation if this plugin
+// dies) and the profile's lock file when one exists. Registered lazily on the
+// first successful call (navigate opens the browser without `open` since D36);
+// released on `browser::close`. If the plugin dies without closing, the
+// kernel's teardown reclaims both, children first.
+const holdings = { process: null, lock: null };
+async function ensureHoldings(client) {
+  if (holdings.process || !driver.context) return;
+  // Playwright exposes no process handle for a persistent context; the pid
+  // comes from the browser-level CDP session (SystemInfo.getProcessInfo).
+  let pid = null;
+  try {
+    const cdp = await driver.context.browser().newBrowserCDPSession();
+    const info = await cdp.send("SystemInfo.getProcessInfo");
+    pid = info.processInfo.find((p) => p.type === "browser")?.id ?? null;
+    await cdp.detach();
+  } catch {
+    pid = null;
+  }
+  if (!pid) return; // no pid, no holding — the ledger stays honest
+  holdings.process = await client.hold("kernel/process", `portos-browser/${pid}`, { pid });
+  if (driver.userDataDir) {
+    // The lock file Chromium actually wrote (headed Chrome: SingletonLock;
+    // some builds: DevToolsActivePort). Headless Playwright writes neither —
+    // then there is no lock substrate to register.
+    for (const f of ["SingletonLock", "DevToolsActivePort"]) {
+      const p = `${driver.userDataDir}/${f}`;
+      if (existsSync(p)) {
+        holdings.lock = await client.hold("kernel/file-lock", p, { owner_pid: pid });
+        break;
+      }
+    }
+  }
+}
+async function releaseHoldings(client) {
+  for (const key of ["lock", "process"]) {
+    const h = holdings[key];
+    if (h) {
+      try {
+        await client.release(h.id, h.generation);
+      } catch {}
+      holdings[key] = null;
+    }
+  }
+}
+
 await servePlugin({
   name: "portos-browser",
   verbs: [...byVerb.keys()],
@@ -88,6 +136,11 @@ await servePlugin({
     const tool = byVerb.get(verb);
     if (!tool) throw new Error(`unknown verb: ${verb}`);
     const out = await tool.handler(args ?? {});
+    if (verb === "browser::close") {
+      await releaseHoldings(client);
+    } else {
+      await ensureHoldings(client);
+    }
     if (verb === "browser::screenshot" && out?.path) {
       const origin = originOf(driver.currentUrl());
       const meta = await client.put(await readFile(out.path), "image/png", labelsFor(origin));

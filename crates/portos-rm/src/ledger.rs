@@ -248,6 +248,34 @@ impl Ledger {
         self.classes.contains_key(class_id)
     }
 
+    /// 类声明的可逆档（实装：sweep 的世界动作按档选路，与 teardown 同纪律）。
+    pub fn grade_of(&self, class_id: &str) -> Option<RevertGrade> {
+        self.classes.get(class_id).map(|d| d.revert_grade)
+    }
+
+    /// 实装：逐持有租约覆盖。类声明的 `lease_secs` 只是缺省；内核 `hold` op 的
+    /// `lease_secs` 走这里（per-holding 租约，见实现计划 §10 的陷阱条目）。
+    pub fn set_lease(
+        &mut self,
+        id: u64,
+        generation: &str,
+        lease_expires_at: Option<u64>,
+    ) -> Result<(), LedgerError> {
+        let h = self
+            .holdings
+            .iter_mut()
+            .find(|h| h.id == id)
+            .ok_or(LedgerError::ForgedHandle)?;
+        if h.released_at.is_some() {
+            return Err(LedgerError::ForgedHandle);
+        }
+        if h.generation != generation {
+            return Err(LedgerError::StaleGeneration);
+        }
+        h.lease_expires_at = lease_expires_at;
+        Ok(())
+    }
+
     /// 某 (class, instance) 的容量元素（实装：cap 计数池的容量）。
     pub fn capacity(&self, class_id: &str, instance: &str) -> Option<&Frag> {
         self.capacities.get(&(class_id.to_string(), instance.to_string()))

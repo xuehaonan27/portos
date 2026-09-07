@@ -64,10 +64,18 @@ impl Kernel {
         let caps = caps::CapStore::new(db.clone(), ledger.clone());
         caps.rebuild_pools()?;
         let audit = Arc::new(Mutex::new(audit::AuditLog::open(root)?));
-        if report.stale_rows > 0 {
+        if report.stale_rows > 0 || !report.substrate.is_empty() {
             let _ = audit.lock().unwrap().append(serde_json::json!({
                 "event": "ledger.reconciled", "stale_rows": report.stale_rows,
-                "note": "plugin/subscription holdings of a previous kernel process tombstoned",
+                "substrate": {
+                    "process_killed": report.substrate.process_killed,
+                    "process_tombstoned": report.substrate.process_tombstoned,
+                    "ports_tombstoned": report.substrate.ports_tombstoned,
+                    "ports_still_bound": report.substrate.ports_still_bound,
+                    "locks_removed": report.substrate.locks_removed,
+                    "locks_kept": report.substrate.locks_kept,
+                },
+                "note": "previous kernel process reconciled: plugin/subscription rows tombstoned, substrate classes checked against the world",
             }));
         }
         if report.journal_pending > 0 {

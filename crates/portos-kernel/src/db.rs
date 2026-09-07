@@ -65,6 +65,15 @@ pub fn open(root: &Path) -> Result<Connection, rusqlite::Error> {
             state      TEXT NOT NULL,   -- "pending" | "in_flight" | "done" | "failed"
             updated_at INTEGER NOT NULL
         );
+        -- Substrate witnesses for built-in classes (WP-02): what a holding
+        -- corresponds to underneath (pid + start time, port, lock path), so a
+        -- restarted kernel can reconcile the ledger against the world.
+        -- Rows are never deleted, like the holdings they annotate.
+        CREATE TABLE IF NOT EXISTS substrate (
+            holding_id INTEGER PRIMARY KEY,
+            kind       TEXT NOT NULL,   -- "process" | "port" | "file-lock"
+            detail     TEXT NOT NULL    -- JSON per kind
+        );
         "#,
     )?;
     Ok(conn)

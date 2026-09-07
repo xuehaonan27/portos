@@ -57,6 +57,7 @@ export class PlaywrightDriver {
     this.opts = opts;
     this.context = null;
     this.page = null;
+    this.userDataDir = null;
     this._snapshotId = 0;
     this._lastRefs = new Map(); // ref -> { name, tag }  (compare-and-act seed)
   }
@@ -75,6 +76,7 @@ export class PlaywrightDriver {
     if (process.env.WORKSHOP_NO_SANDBOX === "1") args.push("--no-sandbox");
 
     this.context = await this._launch(userDataDir, { headless, channel, channelWasAuto }, args);
+    this.userDataDir = userDataDir;
     this.page = this.context.pages()[0] || (await this.context.newPage());
     // Re-inject the distiller on every navigation so refs are always fresh.
     await this.context.addInitScript(DISTILL_SCRIPT);

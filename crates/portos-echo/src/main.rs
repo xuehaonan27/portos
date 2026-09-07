@@ -29,6 +29,7 @@ fn main() -> std::io::Result<()> {
         "put_pattern",
         "grants",
         "spawn_child",
+        "hold_process",
     ]
     .iter()
     .map(|v| format!("{family}::{v}"))
@@ -67,6 +68,7 @@ fn main() -> std::io::Result<()> {
         v("put_pattern"): {"kind": "transforming"},
         v("subscribe"): {"kind": "consuming", "world": "held"},
         v("spawn_child"): {"kind": "transforming"},
+        v("hold_process"): {"kind": "transforming"},
         v("relay"): {"requires": {"caps": list("PORTOS_ECHO_RELAY_REQUIRES"), "deps": list("PORTOS_ECHO_RELAY_DEPS")}},
     });
     for (k, val) in emit_kind.as_object().unwrap() {
@@ -88,6 +90,11 @@ fn main() -> std::io::Result<()> {
     let mut next_ref = 0u32;
     let received: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let received_by_call = received.clone();
+    // Child processes this plugin registered as `kernel/process` holdings
+    // (kept so their handles outlive the call handler).
+    let children: Arc<Mutex<Vec<std::process::Child>>> = Arc::new(Mutex::new(Vec::new()));
+    let children_by_call = children.clone();
+    let plugin_name = name.clone();
 
     let prefix = format!("{family}::");
     portos_sdk::serve_hello(
@@ -155,6 +162,22 @@ fn main() -> std::io::Result<()> {
                     client
                         .spawn_child(bin, &[], &[("PORTOS_ECHO_FAMILY", family.as_str())])
                         .map(|name| json!({"name": name}))
+                }
+                // substrate holding (WP-02): spawn `sleep <n>` and register it
+                // as a `kernel/process` holding under this plugin — the kernel
+                // kills the exact incarnation when this plugin is reclaimed.
+                "hold_process" => {
+                    let secs = arg(0).as_u64().unwrap_or(300);
+                    let child = std::process::Command::new("sleep")
+                        .arg(secs.to_string())
+                        .spawn()
+                        .map_err(|e| e.to_string())?;
+                    let pid = child.id();
+                    children_by_call.lock().unwrap().push(child);
+                    let instance = format!("{plugin_name}/{pid}");
+                    let (id, generation) =
+                        client.hold("kernel/process", &instance, json!({"pid": pid}), None)?;
+                    Ok(json!({"pid": pid, "holding": id, "generation": generation}))
                 }
                 // two-layer naming demo: refs are driver-session-local,
                 // volatile, and never enter the kernel handle table.

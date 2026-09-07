@@ -13,3 +13,4 @@ rusqlite = { workspace = true }
 rand = { workspace = true }
 regex = { workspace = true }
 hex = { workspace = true }
+nix = { workspace = true }

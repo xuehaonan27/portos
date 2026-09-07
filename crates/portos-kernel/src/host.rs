@@ -68,7 +68,10 @@
 //! its `World` takes host locks; no host path takes a host lock and then the
 //! ledger.
 
-use crate::ledger::{CLASS_PLUGIN, CLASS_SUBSCRIPTION};
+use crate::ledger::{
+    CLASS_FILE_LOCK, CLASS_PLUGIN, CLASS_PORT, CLASS_PROCESS, CLASS_SUBSCRIPTION, kill_pid,
+    proc_alive, proc_start_time,
+};
 use crate::{Kernel, KernelError};
 use portos_proto::{Label, chunk, frame};
 use portos_rm::coeffect::{Flat, Manifest, Mount, Requires, admit_mount};
@@ -81,7 +84,7 @@ use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 
@@ -158,6 +161,9 @@ struct HostInner {
     next_spawn: AtomicU64,
     sock_dir: PathBuf,
     meter: Mutex<crate::metrics::ContextMeter>,
+    /// Lease sweeper (WP-02): stop flag and thread handle; stopped on drop.
+    sweeper_stop: Arc<AtomicBool>,
+    sweeper_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 /// The plugin host: spawn, route, event bus, artifact channel.
@@ -179,6 +185,8 @@ impl Host {
                 next_spawn: AtomicU64::new(1),
                 sock_dir: sock_dir.to_path_buf(),
                 meter: Mutex::new(crate::metrics::ContextMeter::default()),
+                sweeper_stop: Arc::new(AtomicBool::new(false)),
+                sweeper_handle: Mutex::new(None),
             }),
         })
     }
@@ -587,10 +595,60 @@ impl Host {
             self.shutdown(&n);
         }
     }
+
+    /// Start the lease sweeper (WP-02): every `interval`, due holdings expire
+    /// through `Ledger::sweep` (children first; a parent waits on a child
+    /// holding its own live lease) and the world side of each release runs
+    /// through `HostWorld`. Quiet ticks audit nothing; a tick that released
+    /// or failed anything audits `ledger.swept`. The thread stops on drop.
+    pub fn start_sweeper(&self, interval: std::time::Duration) {
+        let kernel = self.kernel.clone();
+        let inner = self.inner.clone();
+        let stop = inner.sweeper_stop.clone();
+        let handle = std::thread::spawn(move || {
+            loop {
+                // Sleep in slices so Host::drop stops the thread promptly.
+                let deadline = std::time::Instant::now() + interval;
+                while std::time::Instant::now() < deadline {
+                    if stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                let now = crate::db::now_unix();
+                let mut world = HostWorld { inner: inner.clone() };
+                match kernel.ledger.sweep_with_world(&mut world, now) {
+                    Ok(report) if !report.released.is_empty() || !report.failed.is_empty() => {
+                        let mut classes: BTreeMap<String, usize> = BTreeMap::new();
+                        for (_, class, _) in &report.released {
+                            *classes.entry(class.clone()).or_insert(0) += 1;
+                        }
+                        let _ = kernel.audit.lock().unwrap().append(json!({
+                            "event": "ledger.swept",
+                            "released": report.released.len(),
+                            "classes": classes,
+                            "failed": report.failed,
+                        }));
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        let _ = kernel.audit.lock().unwrap().append(json!({
+                            "event": "ledger.sweep_error", "error": e.to_string(),
+                        }));
+                    }
+                }
+            }
+        });
+        *self.inner.sweeper_handle.lock().unwrap() = Some(handle);
+    }
 }
 
 impl Drop for Host {
     fn drop(&mut self) {
+        self.inner.sweeper_stop.store(true, Ordering::SeqCst);
+        if let Some(h) = self.inner.sweeper_handle.lock().unwrap().take() {
+            let _ = h.join();
+        }
         self.shutdown_all();
     }
 }
@@ -813,6 +871,23 @@ impl World for HostWorld {
                 }
                 Ok(())
             }
+            CLASS_PROCESS => {
+                // Kill only the exact witnessed incarnation — generation is
+                // "<pid>:<start time>", so a recycled pid is never hit.
+                let mut parts = item.generation.split(':');
+                let pid: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+                let start: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                if proc_alive(pid, start) {
+                    kill_pid(pid);
+                }
+                Ok(())
+            }
+            CLASS_PORT => Ok(()), // nothing physical to release; reconcile bind-probes
+            CLASS_FILE_LOCK => match std::fs::remove_file(&item.instance) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(_) => Err(()),
+            },
             _ => Ok(()), // nothing physical behind other rows
         }
     }
@@ -1030,6 +1105,165 @@ fn count_context(inner: &Arc<HostInner>, v: &Value) {
     }
     let n = serde_json::to_vec(v).map(|b| b.len() as u64).unwrap_or(0);
     inner.meter.lock().unwrap().count_context(n);
+}
+
+// ---- substrate holdings (WP-02) ----
+
+/// `hold {class, instance, substrate, lease_secs?}` → `{id, generation}`.
+/// Restricted to the holdable built-in classes; the holding's parent is the
+/// caller's `kernel/plugin` holding, so plugin death reclaims it children
+/// first. For `kernel/process` the kernel derives the generation itself —
+/// `<pid>:<start time>` witnesses the exact incarnation.
+fn op_hold(
+    kernel: &Arc<Kernel>,
+    inner: &Arc<HostInner>,
+    name: &str,
+    req: &Value,
+    now: u64,
+) -> Result<Value, KernelError> {
+    let class = req["class"].as_str().unwrap_or("");
+    let instance = req["instance"].as_str().unwrap_or("").to_string();
+    let mut substrate = req.get("substrate").cloned().unwrap_or(Value::Null);
+    let lease_secs = req["lease_secs"].as_u64();
+    let generation = match class {
+        CLASS_PROCESS => {
+            let pid = substrate["pid"].as_u64().map(|p| p as u32).unwrap_or(0);
+            match pid > 0 {
+                true => match proc_start_time(pid) {
+                    Some(start) => {
+                        substrate = json!({"pid": pid, "start": start});
+                        format!("{pid}:{start}")
+                    }
+                    None => return hold_denied(kernel, name, class, "process not found"),
+                },
+                false => return hold_denied(kernel, name, class, "substrate.pid required"),
+            }
+        }
+        CLASS_FILE_LOCK => {
+            // Record the owner's start time when we can read it, so a
+            // later reconcile checks the exact incarnation, not a recycled pid.
+            if let Some(p) = substrate["owner_pid"].as_u64() {
+                if let Some(s) = proc_start_time(p as u32) {
+                    substrate["owner_start"] = json!(s);
+                }
+            }
+            rand_token()
+        }
+        _ => rand_token(),
+    };
+    if instance.is_empty() {
+        return hold_denied(kernel, name, class, "instance required");
+    }
+    let parent = inner.plugins.lock().unwrap().get(name).map(|h| h.holding);
+    let id = kernel
+        .ledger
+        .hold_substrate(
+            &format!("plugin:{name}"),
+            class,
+            &instance,
+            &generation,
+            parent,
+            &substrate,
+            lease_secs,
+            now,
+        )
+        .map_err(|e| {
+            let _ = kernel.audit.lock().unwrap().append(json!({
+                "event": "hold.denied", "from": name, "class": class,
+                "instance": instance, "reason": e.to_string(),
+            }));
+            e
+        })?;
+    let _ = kernel.audit.lock().unwrap().append(json!({
+        "event": "substrate.held", "plugin": name, "class": class,
+        "instance": instance, "holding": id, "generation": generation,
+        "lease_secs": lease_secs,
+    }));
+    Ok(json!({"ok": {"id": id, "generation": generation}}))
+}
+
+fn hold_denied(kernel: &Arc<Kernel>, name: &str, class: &str, reason: &str) -> Result<Value, KernelError> {
+    let _ = kernel.audit.lock().unwrap().append(json!({
+        "event": "hold.denied", "from": name, "class": class, "reason": reason,
+    }));
+    Err(KernelError::Denied(format!("hold: {reason}")))
+}
+
+/// `release {id, generation}`: a plugin releases only its own rows. The world
+/// side runs first (kill the witnessed process, remove the lock file — all
+/// idempotent), then the tombstone.
+fn op_release(
+    kernel: &Arc<Kernel>,
+    inner: &Arc<HostInner>,
+    name: &str,
+    req: &Value,
+    now: u64,
+) -> Result<Value, KernelError> {
+    let id = req["id"].as_u64().unwrap_or(0);
+    let generation = req["generation"].as_str().unwrap_or("").to_string();
+    let denied = |kernel: &Arc<Kernel>, reason: &str| {
+        let _ = kernel.audit.lock().unwrap().append(json!({
+            "event": "release.denied", "from": name, "holding": id, "reason": reason,
+        }));
+        Err(KernelError::Denied(format!("release: {reason}")))
+    };
+    let Some(h) = kernel.ledger.holding(id) else {
+        return denied(kernel, "unknown holding");
+    };
+    if h.subject != format!("plugin:{name}") || h.released_at.is_some() {
+        return denied(kernel, "not your holding");
+    }
+    if h.generation != generation {
+        return denied(kernel, "stale generation");
+    }
+    let mut world = HostWorld { inner: inner.clone() };
+    let item = LiveItem {
+        id: h.id,
+        parent: h.parent,
+        class_id: h.class_id.clone(),
+        instance: h.instance.clone(),
+        generation: h.generation.clone(),
+        grade: RevertGrade::Inverse, // all holdable built-ins are inverse-grade
+    };
+    let _ = world.release(&item);
+    kernel.ledger.release(id, &generation, now)?;
+    let _ = kernel.audit.lock().unwrap().append(json!({
+        "event": "substrate.released", "plugin": name, "holding": id,
+        "class": h.class_id, "instance": h.instance,
+    }));
+    Ok(json!({"ok": {"released": true}}))
+}
+
+/// `renew {id, generation, lease_secs?}`: heartbeat for a leased holding.
+fn op_renew(kernel: &Arc<Kernel>, name: &str, req: &Value, now: u64) -> Result<Value, KernelError> {
+    let id = req["id"].as_u64().unwrap_or(0);
+    let generation = req["generation"].as_str().unwrap_or("").to_string();
+    let lease_secs = req["lease_secs"].as_u64();
+    let owned = kernel
+        .ledger
+        .holding(id)
+        .map(|h| h.subject == format!("plugin:{name}") && h.released_at.is_none())
+        .unwrap_or(false);
+    if !owned {
+        let _ = kernel.audit.lock().unwrap().append(json!({
+            "event": "renew.denied", "from": name, "holding": id,
+        }));
+        return Err(KernelError::Denied("renew: not your holding".into()));
+    }
+    let expires = kernel
+        .ledger
+        .renew(id, &generation, lease_secs, now)
+        .map_err(|e| {
+            let _ = kernel.audit.lock().unwrap().append(json!({
+                "event": "renew.denied", "from": name, "holding": id, "reason": e.to_string(),
+            }));
+            e
+        })?;
+    let _ = kernel.audit.lock().unwrap().append(json!({
+        "event": "substrate.renewed", "plugin": name, "holding": id,
+        "lease_expires_at": expires,
+    }));
+    Ok(json!({"ok": {"lease_expires_at": expires}}))
 }
 
 fn handle_client_op(
@@ -1263,6 +1497,13 @@ fn handle_client_op(
             Ok(json!({"ok": {"name": child}}))
         }
 
+        // ---- substrate holdings (WP-02): plugin-registered child processes,
+        // ports, lock files — reclaimed with the plugin, children first;
+        // leased ones expire via the sweeper.
+        Some("hold") => op_hold(kernel, inner, name, req, now),
+        Some("release") => op_release(kernel, inner, name, req, now),
+        Some("renew") => op_renew(kernel, name, req, now),
+
         // ---- artifact dereference: put (frame, then chunk stream) ----
         Some("put") => {
             let ty = req["type"].as_str().unwrap_or("application/octet-stream");
@@ -1384,6 +1625,50 @@ mod tests {
         assert!(!host.unsubscribe_local(id), "second drop is a no-op");
         host.kernel.ledger.invariant().unwrap();
         drop(host);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The sweeper thread (WP-02) expires a leased holding and runs its world
+    /// action — the lock file is removed — and audits the sweep. Dropping the
+    /// host stops the thread (the test returning proves the join).
+    #[test]
+    fn sweeper_thread_expires_leased_holdings_and_removes_the_lock_file() {
+        let (host, root) = host("sweeper");
+        let lock = root.join("test.lock");
+        std::fs::write(&lock, b"x").unwrap();
+        let now = crate::db::now_unix();
+        let id = host
+            .kernel
+            .ledger
+            .hold_substrate(
+                "kernel",
+                CLASS_FILE_LOCK,
+                lock.to_str().unwrap(),
+                "g1",
+                None,
+                &json!({}),
+                Some(1),
+                now,
+            )
+            .unwrap();
+        host.start_sweeper(std::time::Duration::from_millis(100));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while lock.exists() {
+            assert!(std::time::Instant::now() < deadline, "sweeper never expired the lock");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            host.kernel.ledger.holding(id).unwrap().released_at.is_some(),
+            "holding tombstoned by the sweep"
+        );
+        host.kernel.ledger.invariant().unwrap();
+        drop(host); // stops and joins the sweeper
+        let events = crate::audit::AuditLog::verify(&root.join("audit.log")).unwrap();
+        assert!(
+            events.iter().any(|e| e["body"]["event"] == "ledger.swept"
+                && e["body"]["classes"]["kernel/file-lock"] == 1),
+            "the sweep is audited (never silent)"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

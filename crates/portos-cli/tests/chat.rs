@@ -7,6 +7,7 @@
 
 use portos_kernel::Kernel;
 use portos_kernel::host::Host;
+use portos_kernel::ledger::{CLASS_FILE_LOCK, CLASS_PROCESS};
 use serde_json::{Value, json};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -446,5 +447,99 @@ fn chat_json_slot_refusal_is_reported() {
         stderr.contains("slot admission failed"),
         "the refusal is reported with its reason:\n{stderr}"
     );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// WP-02 Phase D acceptance: the browser driver registers its Chromium
+/// process (pid via the browser-level CDP session) as a holding, child of its
+/// plugin holding — and the profile lock file when Chromium actually wrote
+/// one (headed Chrome: SingletonLock; headless Playwright writes none, so
+/// lock assertions here are conditional). `browser::close` releases the
+/// holdings; killing the plugin with SIGKILL reclaims them through the one
+/// teardown path — the exact Chromium incarnation dies.
+#[test]
+fn browser_close_releases_process_and_profile_lock_holdings() {
+    let Some((plugin, fixture)) = browser_ready() else { return };
+    let (kernel, host, root) = setup("holdings");
+    let profile = root.join("profile");
+    let name = host
+        .spawn(
+            Path::new("node"),
+            &[plugin.to_str().unwrap()],
+            &[
+                ("WORKSHOP_HEADLESS", "1"),
+                ("WORKSHOP_PROFILE_DIR", profile.to_str().unwrap()),
+            ],
+        )
+        .unwrap();
+
+    let alive = |pid: u32| {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    let chromium_pid_of = |kernel: &Kernel| -> u32 {
+        kernel
+            .ledger
+            .live_snapshot("plugin:portos-browser")
+            .iter()
+            .find(|i| i.class_id == CLASS_PROCESS)
+            .and_then(|i| i.generation.split(':').next().and_then(|p| p.parse().ok()))
+            .expect("a kernel/process row for Chromium")
+    };
+
+    // The browser comes up on navigate: the process holding appears.
+    let url = format!("file://{}", fixture.display());
+    host.call(&name, "browser::navigate", json!({"url": url})).unwrap();
+    assert_eq!(kernel.ledger.counts(CLASS_PROCESS), (1, 0), "Chromium process held");
+    let lock_exists = ["SingletonLock", "DevToolsActivePort"]
+        .iter()
+        .any(|f| profile.join(f).exists());
+    assert_eq!(
+        kernel.ledger.counts(CLASS_FILE_LOCK).0,
+        if lock_exists { 1 } else { 0 },
+        "the profile lock is held iff Chromium wrote one"
+    );
+    let cpid = chromium_pid_of(&kernel);
+    assert!(alive(cpid));
+
+    // Graceful close: the driver closes Chromium, then releases the rows.
+    host.call(&name, "browser::close", json!({})).unwrap();
+    assert_eq!(kernel.ledger.counts(CLASS_PROCESS), (0, 1), "process holding released");
+    assert_eq!(
+        kernel.ledger.counts(CLASS_FILE_LOCK).0,
+        0,
+        "lock holding released"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while alive(cpid) {
+        assert!(std::time::Instant::now() < deadline, "Chromium survived a graceful close");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    // Reopen, then kill -9 the plugin: the crash-only teardown kills the
+    // exact witnessed Chromium incarnation.
+    host.call(&name, "browser::navigate", json!({"url": url})).unwrap();
+    assert_eq!(kernel.ledger.counts(CLASS_PROCESS).0, 1, "reopened: held again");
+    let cpid2 = chromium_pid_of(&kernel);
+    let ppid = host.pid(&name).expect("plugin pid");
+    std::process::Command::new("kill").args(["-9", &ppid.to_string()]).status().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while kernel.ledger.counts(CLASS_PROCESS).0 > 0 {
+        assert!(std::time::Instant::now() < deadline, "process holding never reclaimed");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    while alive(cpid2) {
+        assert!(std::time::Instant::now() < deadline, "Chromium never died");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    for f in ["SingletonLock", "DevToolsActivePort"] {
+        assert!(!profile.join(f).exists(), "{f} must not survive the teardown");
+    }
+    kernel.ledger.invariant().unwrap();
+
+    host.shutdown_all();
     let _ = std::fs::remove_dir_all(&root);
 }

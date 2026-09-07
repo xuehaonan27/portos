@@ -169,6 +169,39 @@ export class KernelClient {
     });
   }
 
+  /** Register a substrate holding (WP-02): a child process, port or lock file
+   *  this plugin is responsible for. Restricted kernel-side to the built-in
+   *  classes; parented under this plugin's holding, so this plugin's death
+   *  reclaims it children-first. Resolves to {id, generation}. */
+  hold(klass, instance, substrate = null, leaseSecs = undefined) {
+    return this._serial(async () => {
+      const req = { op: "hold", class: klass, instance, substrate };
+      if (leaseSecs !== undefined) req.lease_secs = leaseSecs;
+      this.chan.writeFrame(req);
+      const ok = unwrapOk(await this.chan.readFrame());
+      return { id: ok.id, generation: ok.generation };
+    });
+  }
+
+  /** Give a holding back: the world side runs kernel-side (kill the witnessed
+   *  process, remove the lock file), then the row tombstones. */
+  release(id, generation) {
+    return this._serial(async () => {
+      this.chan.writeFrame({ op: "release", id, generation });
+      return unwrapOk(await this.chan.readFrame()).released ?? false;
+    });
+  }
+
+  /** Heartbeat a leased holding; `leaseSecs` extends from now. */
+  renew(id, generation, leaseSecs = undefined) {
+    return this._serial(async () => {
+      const req = { op: "renew", id, generation };
+      if (leaseSecs !== undefined) req.lease_secs = leaseSecs;
+      this.chan.writeFrame(req);
+      return unwrapOk(await this.chan.readFrame());
+    });
+  }
+
   /** Live grants for this plugin, joined with the target verbs' advertised
    *  metadata: [{verb, description, schema, counts_left?}]. */
   grants() {

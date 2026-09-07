@@ -32,6 +32,23 @@
 //!                            standing inbound channel is a holding, so
 //!                            unloading a plugin unsubscribes it, children
 //!                            first (endstate §8.5).
+//!       `kernel/process`     a plugin-registered child process (WP-02).
+//!                            Instance `<plugin>/<pid>`; generation witnesses
+//!                            the exact incarnation (`<pid>:<start time>`);
+//!                            world release = SIGKILL that incarnation.
+//!       `kernel/port`        a bound port (instance `<proto>:<port>`); world
+//!                            release is a no-op, reconcile bind-probes.
+//!       `kernel/file-lock`   a lock file (instance = path); world release =
+//!                            remove the file, reconcile removes it when the
+//!                            recorded owner pid is dead.
+//!   - **Time (WP-02)**: leases on holdings (`set_lease`), a sweeper
+//!     (`sweep_with_world`, driven by `Host::start_sweeper`) running
+//!     `Ledger::sweep` plus the world side of expiry, and substrate
+//!     reconciliation on open (`reconcile_substrate`): a previous kernel
+//!     incarnation's registered processes are killed, freed ports and stale
+//!     lock files tombstoned.
+//!     (`kernel/artifact` and its TTL are deferred with gate G5 — artifacts
+//!     never expire for now.)
 //!
 //! Lock discipline: the ledger mutex is the outermost lock. Teardown runs the
 //! F2 executor while holding it and calls back into the host's `World`, which
@@ -51,6 +68,12 @@ use std::sync::{Arc, Mutex};
 pub const CLASS_CAP_COUNT: &str = "kernel/cap-count";
 pub const CLASS_PLUGIN: &str = "kernel/plugin";
 pub const CLASS_SUBSCRIPTION: &str = "kernel/subscription";
+pub const CLASS_PROCESS: &str = "kernel/process";
+pub const CLASS_PORT: &str = "kernel/port";
+pub const CLASS_FILE_LOCK: &str = "kernel/file-lock";
+
+/// Classes a plugin may `hold` (WP-02; open registration is Phase G).
+pub const HOLDABLE_CLASSES: [&str; 3] = [CLASS_PROCESS, CLASS_PORT, CLASS_FILE_LOCK];
 
 /// Generation string of spend rows (they are never released individually).
 const SPEND_GENERATION: &str = "spend";
@@ -63,6 +86,48 @@ pub struct OpenReport {
     /// Journal entries still owed a world action (a failed teardown step
     /// persisted). Replayed by the next teardown of their subject.
     pub journal_pending: usize,
+    /// Substrate reconciliation of the WP-02 built-in classes.
+    pub substrate: SubstrateReconcile,
+}
+
+/// Per-class outcome of `reconcile_substrate` (audited on open).
+#[derive(Default)]
+pub struct SubstrateReconcile {
+    /// Live `kernel/process` rows whose incarnation was still running: killed
+    /// (crash-only: a previous incarnation never survives a kernel restart).
+    pub process_killed: usize,
+    /// `kernel/process` rows whose pid was already gone: tombstoned.
+    pub process_tombstoned: usize,
+    /// `kernel/port` rows tombstoned.
+    pub ports_tombstoned: usize,
+    /// …of which the bind probe still finds the port occupied (an orphan the
+    /// ledger never tracked holds it — reported, not hidden).
+    pub ports_still_bound: usize,
+    /// `kernel/file-lock` rows whose lock file was removed (owner dead).
+    pub locks_removed: usize,
+    /// `kernel/file-lock` rows whose owner pid is still alive (orphan): the
+    /// file stays, the row is tombstoned, the count is audited.
+    pub locks_kept: usize,
+}
+
+impl SubstrateReconcile {
+    pub fn is_empty(&self) -> bool {
+        self.process_killed == 0
+            && self.process_tombstoned == 0
+            && self.ports_tombstoned == 0
+            && self.locks_removed == 0
+            && self.locks_kept == 0
+    }
+}
+
+/// The world side of one sweep tick.
+#[derive(Default)]
+pub struct SweepReport {
+    /// (id, class, instance) per released row, world action executed.
+    pub released: Vec<(u64, String, String)>,
+    /// Rows whose world action failed (still tombstoned — a lease is a ledger
+    /// fact); reported so the caller can audit them (never silent).
+    pub failed: Vec<u64>,
 }
 
 pub struct LedgerStore {
@@ -79,6 +144,9 @@ impl LedgerStore {
             (CLASS_CAP_COUNT, AlgebraTag::Counted),
             (CLASS_PLUGIN, AlgebraTag::Exclusive),
             (CLASS_SUBSCRIPTION, AlgebraTag::Exclusive),
+            (CLASS_PROCESS, AlgebraTag::Exclusive),
+            (CLASS_PORT, AlgebraTag::Exclusive),
+            (CLASS_FILE_LOCK, AlgebraTag::Exclusive),
         ] {
             l.register_class(ClassDecl {
                 class_id: id.to_string(),
@@ -134,6 +202,9 @@ impl LedgerStore {
             inner: Mutex::new(l),
             db,
         };
+        // Substrate rows first: they are children of plugin rows, so the
+        // stale-process reconcile below can then release parents cleanly.
+        let substrate = store.reconcile_substrate()?;
         let stale_rows = store.reconcile_stale_process_rows()?;
         let journal_pending = {
             let conn = store.db.lock().unwrap();
@@ -148,6 +219,7 @@ impl LedgerStore {
             OpenReport {
                 stale_rows,
                 journal_pending,
+                substrate,
             },
         ))
     }
@@ -379,6 +451,184 @@ impl LedgerStore {
         })
     }
 
+    /// Hold a substrate resource (WP-02): one exclusive row of a holdable
+    /// built-in class plus its substrate witness row (one transaction).
+    /// `lease_secs`, when given, is a per-holding lease written to the row
+    /// directly — the built-in classes declare no class-level lease (the
+    /// declaration provides defaults only).
+    #[allow(clippy::too_many_arguments)]
+    pub fn hold_substrate(
+        &self,
+        subject: &str,
+        class: &str,
+        instance: &str,
+        generation: &str,
+        parent: Option<u64>,
+        substrate: &Value,
+        lease_secs: Option<u64>,
+        now: u64,
+    ) -> Result<u64, KernelError> {
+        if !HOLDABLE_CLASSES.contains(&class) {
+            return Err(KernelError::Denied(format!("class not holdable: {class}")));
+        }
+        self.transaction(|l, conn| {
+            if l.capacity(class, instance).is_none() {
+                l.set_capacity(class, instance, Frag::Ex(Ex::Token));
+            }
+            let id = l
+                .grant(subject, class, instance, Frag::Ex(Ex::Token), generation, parent, now)
+                .map_err(map_err)?;
+            if let Some(secs) = lease_secs {
+                l.set_lease(id, generation, Some(now + secs)).map_err(map_err)?;
+            }
+            if let Some(h) = l.holding(id) {
+                persist_on(conn, h)?;
+            }
+            let kind = class.strip_prefix("kernel/").unwrap_or(class);
+            conn.execute(
+                "INSERT OR REPLACE INTO substrate (holding_id, kind, detail) VALUES (?1, ?2, ?3)",
+                params![id as i64, kind, substrate.to_string()],
+            )?;
+            Ok(id)
+        })
+    }
+
+    /// Renew a leased holding (heartbeat). With `lease_secs`, extend the
+    /// per-holding lease from now; without, the law `renew` applies the class
+    /// declaration's lease (a no-op for the lease-less built-ins).
+    pub fn renew(
+        &self,
+        id: u64,
+        generation: &str,
+        lease_secs: Option<u64>,
+        now: u64,
+    ) -> Result<Option<u64>, KernelError> {
+        self.transaction(|l, conn| {
+            match lease_secs {
+                Some(secs) => l.set_lease(id, generation, Some(now + secs)).map_err(map_err)?,
+                None => l.renew(id, generation, now).map_err(map_err)?,
+            }
+            let expires = l.holding(id).and_then(|h| h.lease_expires_at);
+            if let Some(h) = l.holding(id) {
+                persist_on(conn, h)?;
+            }
+            Ok(expires)
+        })
+    }
+
+    /// The involuntary path (WP-02): expire due leases (children first,
+    /// parents wait on children with their own live lease — the conservative
+    /// sweep ruling), then execute each released row's world action. All row
+    /// tombstones commit in one transaction; a failed world action does not
+    /// un-expire the row (the lease is the ledger fact) but is reported in
+    /// the report's `failed` list — never silent.
+    pub fn sweep_with_world<W: World>(
+        &self,
+        world: &mut W,
+        now: u64,
+    ) -> Result<SweepReport, KernelError> {
+        self.transaction(|l, conn| {
+            let released = l.sweep(now);
+            let mut report = SweepReport::default();
+            for id in released {
+                let Some(h) = l.holding(id) else { continue };
+                let item = LiveItem {
+                    id: h.id,
+                    parent: h.parent,
+                    class_id: h.class_id.clone(),
+                    instance: h.instance.clone(),
+                    generation: h.generation.clone(),
+                    grade: l.grade_of(&h.class_id).unwrap_or(RevertGrade::Inverse),
+                };
+                let ok = match item.grade {
+                    RevertGrade::Inverse => world.release(&item).is_ok(),
+                    RevertGrade::Compensable => {
+                        world.compensate(&item, &format!("sw:{id}")).is_ok()
+                    }
+                    RevertGrade::External => true,
+                };
+                if ok {
+                    report.released.push((h.id, h.class_id.clone(), h.instance.clone()));
+                } else {
+                    report.failed.push(h.id);
+                }
+                persist_on(conn, h)?;
+            }
+            Ok(report)
+        })
+    }
+
+    /// Reconcile the substrate classes against the world on open: a previous
+    /// kernel incarnation is dead, so a live `kernel/process` row whose
+    /// incarnation is still running is killed (crash-only), freed ports and
+    /// owner-dead lock files are released. All tombstones commit in one
+    /// transaction; counts are returned for the audit chain.
+    fn reconcile_substrate(&self) -> Result<SubstrateReconcile, KernelError> {
+        let now = crate::db::now_unix();
+        self.transaction(|l, conn| {
+            let mut report = SubstrateReconcile::default();
+            let rows: Vec<Holding> = l
+                .live()
+                .filter(|h| HOLDABLE_CLASSES.contains(&h.class_id.as_str()))
+                .cloned()
+                .collect();
+            let mut details: std::collections::BTreeMap<u64, Value> = std::collections::BTreeMap::new();
+            for h in &rows {
+                let detail: Option<String> = conn
+                    .query_row(
+                        "SELECT detail FROM substrate WHERE holding_id = ?1",
+                        params![h.id as i64],
+                        |r| r.get(0),
+                    )
+                    .ok();
+                if let Some(d) = detail.and_then(|d| serde_json::from_str(&d).ok()) {
+                    details.insert(h.id, d);
+                }
+            }
+            // Processes first: a killed orphan may own a lock file below.
+            for class in [CLASS_PROCESS, CLASS_PORT, CLASS_FILE_LOCK] {
+                for h in rows.iter().filter(|h| h.class_id == class) {
+                    let detail = details.get(&h.id).cloned().unwrap_or(Value::Null);
+                    match class {
+                        CLASS_PROCESS => {
+                            let pid = detail["pid"].as_u64().unwrap_or(0) as u32;
+                            let start = detail["start"].as_u64().unwrap_or(0);
+                            if proc_alive(pid, start) {
+                                kill_pid(pid);
+                                report.process_killed += 1;
+                            } else {
+                                report.process_tombstoned += 1;
+                            }
+                        }
+                        CLASS_PORT => {
+                            report.ports_tombstoned += 1;
+                            if !port_free(&h.instance) {
+                                report.ports_still_bound += 1;
+                            }
+                        }
+                        CLASS_FILE_LOCK => {
+                            let owner = detail["owner_pid"].as_u64().map(|p| p as u32);
+                            let owner_start = detail["owner_start"].as_u64().unwrap_or(0);
+                            if owner.is_some_and(|p| proc_alive(p, owner_start)) {
+                                report.locks_kept += 1; // orphan still owns it; leave the file
+                            } else {
+                                let _ = std::fs::remove_file(&h.instance);
+                                report.locks_removed += 1;
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                    let _ = l.release(h.id, &h.generation, now);
+                    if let Some(row) = l.holding(h.id) {
+                        persist_on(conn, row)?;
+                        resolve_journal(conn, h.id, now)?;
+                    }
+                }
+            }
+            Ok(report)
+        })
+    }
+
     /// Crash-only teardown of everything `subject` holds (ownership closure,
     /// children first), executing the class inverses through `world`. The
     /// whole closure's tombstones and the journal entries commit in one
@@ -452,6 +702,46 @@ fn map_err(e: LedgerError) -> KernelError {
             KernelError::Corrupt(format!("ledger: {e:?}"))
         }
         other => KernelError::Denied(format!("ledger: {other:?}")),
+    }
+}
+
+// ---- substrate helpers (WP-02; Linux /proc) ----
+
+/// Start time (clock ticks since boot) of a live process, from /proc.
+/// Together with the pid it witnesses an exact incarnation (pids recycle).
+pub(crate) fn proc_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // comm (field 2) may contain spaces and parens; fields resume after the
+    // last ')'. starttime is field 22 → index 19 of the remainder.
+    let after = stat.rsplit_once(')')?.1.trim_start();
+    after.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// Is this exact process incarnation alive? `start == 0` checks existence only.
+pub(crate) fn proc_alive(pid: u32, start: u64) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    match proc_start_time(pid) {
+        Some(s) => start == 0 || s == start,
+        None => false,
+    }
+}
+
+/// SIGKILL a pid (best-effort; existence/incarnation checks are the caller's).
+pub(crate) fn kill_pid(pid: u32) {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+    let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+}
+
+/// Bind probe for a `<proto>:<port>` instance: free if we could bind it.
+fn port_free(instance: &str) -> bool {
+    let (proto, port) = instance.rsplit_once(':').unwrap_or(("tcp", "0"));
+    let port: u16 = port.parse().unwrap_or(0);
+    match proto {
+        "udp" => std::net::UdpSocket::bind(("0.0.0.0", port)).is_ok(),
+        _ => std::net::TcpListener::bind(("0.0.0.0", port)).is_ok(),
     }
 }
 
@@ -796,8 +1086,7 @@ mod tests {
     /// holdings: reopening tombstones them children first, and the instance
     /// becomes available again.
     #[test]
-    fn stale_plugin_rows_are_reconciled_on_open() {
-        let (db, root) = store("stale");
+    fn stale_plugin_rows_are_reconciled_on_open() {        let (db, root) = store("stale");
         {
             let (l, _) = LedgerStore::open(db.clone()).unwrap();
             let p = l.hold_exclusive("plugin:x", CLASS_PLUGIN, "x", "tok1", None, 1).unwrap();
@@ -816,6 +1105,122 @@ mod tests {
         assert_eq!(l.counts(CLASS_PLUGIN), (0, 2));
         assert_eq!(l.counts(CLASS_SUBSCRIPTION), (0, 1));
         l.hold_exclusive("plugin:x", CLASS_PLUGIN, "x", "tok2", None, 2).unwrap();
+        l.invariant().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[derive(Default)]
+    struct RecordingWorld {
+        released: Vec<u64>,
+    }
+    impl World for RecordingWorld {
+        fn release(&mut self, item: &LiveItem) -> Result<(), ()> {
+            self.released.push(item.id);
+            Ok(())
+        }
+        fn compensate(&mut self, _item: &LiveItem, _key: &str) -> Result<bool, ()> {
+            Ok(true)
+        }
+    }
+
+    fn register_test_class(l: &LedgerStore, class: &str, lease_secs: Option<u64>) {
+        l.inner.lock().unwrap().register_class(ClassDecl {
+            class_id: class.to_string(),
+            algebra: AlgebraTag::Exclusive,
+            release_idempotent: true,
+            lease_secs,
+            revert_grade: RevertGrade::Inverse,
+        });
+    }
+
+    /// Conservative sweep (ruling 3, mirror of the law): an expired parent
+    /// waits while a child holds its own unexpired lease; lease-None
+    /// descendants go with the parent, children first, world actions included.
+    #[test]
+    fn expired_parent_waits_for_child_with_its_own_lease() {
+        let (db, root) = store("sweep");
+        let (l, _report) = LedgerStore::open(db.clone()).unwrap();
+        register_test_class(&l, "test/leased", Some(1));
+        register_test_class(&l, "test/leased-long", Some(3600));
+        register_test_class(&l, "test/unleased", None);
+        let (p, c, g) = l
+            .transaction(|led, conn| {
+                for (class, instance) in
+                    [("test/leased", "p"), ("test/leased-long", "c"), ("test/unleased", "g")]
+                {
+                    led.set_capacity(class, instance, Frag::Ex(Ex::Token));
+                }
+                let p = led
+                    .grant("test", "test/leased", "p", Frag::Ex(Ex::Token), "gp", None, 0)
+                    .map_err(map_err)?;
+                let c = led
+                    .grant("test", "test/leased-long", "c", Frag::Ex(Ex::Token), "gc", Some(p), 0)
+                    .map_err(map_err)?;
+                let g = led
+                    .grant("test", "test/unleased", "g", Frag::Ex(Ex::Token), "gg", Some(c), 0)
+                    .map_err(map_err)?;
+                for id in [p, c, g] {
+                    persist_on(conn, &led.holding(id).unwrap())?;
+                }
+                Ok((p, c, g))
+            })
+            .unwrap();
+
+        let mut world = RecordingWorld::default();
+        let r = l.sweep_with_world(&mut world, 2).unwrap();
+        assert!(r.released.is_empty(), "the expired parent waits on the child's own lease");
+        assert_eq!(l.inner.lock().unwrap().live_count(), 3);
+        assert!(world.released.is_empty(), "no world action while waiting");
+
+        let r = l.sweep_with_world(&mut world, 3601).unwrap();
+        assert_eq!(r.released.len(), 3, "once the child is due, the whole chain goes");
+        assert_eq!(world.released, vec![g, c, p], "children first, world actions too");
+        l.invariant().unwrap();
+
+        // Tombstones are durable.
+        drop(l);
+        let (l, _report) = LedgerStore::open(db.clone()).unwrap();
+        assert_eq!(l.inner.lock().unwrap().live_count(), 0, "all rows stayed tombstoned");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Substrate reconcile (WP-02): a live `kernel/process` row of a previous
+    /// kernel incarnation whose process is still running is killed on open
+    /// and the row tombstoned — a previous incarnation never survives a
+    /// kernel restart (crash-only).
+    #[test]
+    fn reconcile_kills_a_live_process_of_a_previous_kernel_incarnation() {
+        use std::os::unix::process::ExitStatusExt;
+        let (db, root) = store("reconcile-substrate");
+        let mut child = std::process::Command::new("sleep").arg("300").spawn().unwrap();
+        let pid = child.id();
+        let start = proc_start_time(pid).expect("child visible in /proc");
+        {
+            let (l, _report) = LedgerStore::open(db.clone()).unwrap();
+            l.hold_substrate(
+                "plugin:x",
+                CLASS_PROCESS,
+                &format!("x/{pid}"),
+                &format!("{pid}:{start}"),
+                None,
+                &json!({"pid": pid, "start": start}),
+                None,
+                1,
+            )
+            .unwrap();
+            assert_eq!(l.counts(CLASS_PROCESS), (1, 0));
+            // drop without touching the sleeper: it plays the orphan of a
+            // kernel that died hard.
+        }
+        let (l, report) = LedgerStore::open(db.clone()).unwrap();
+        assert_eq!(report.substrate.process_killed, 1);
+        assert_eq!(l.counts(CLASS_PROCESS), (0, 1), "row tombstoned");
+        assert_eq!(
+            child.wait().unwrap().signal(),
+            Some(9),
+            "the sleeper got SIGKILL from the reconcile"
+        );
+        assert!(!proc_alive(pid, start), "the exact incarnation is gone");
         l.invariant().unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }

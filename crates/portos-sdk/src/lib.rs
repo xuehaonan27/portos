@@ -74,6 +74,45 @@ impl KernelClient {
             .ok_or_else(|| "no child name".into())
     }
 
+    /// Register a substrate holding (WP-02): a child process, port or lock
+    /// file this plugin is responsible for. Restricted by the kernel to the
+    /// built-in classes; the row is parented under this plugin's holding, so
+    /// this plugin's death reclaims it children-first. `lease_secs` sets a
+    /// per-holding lease (sweeper expiry). Returns `{id, generation}`.
+    pub fn hold(
+        &self,
+        class: &str,
+        instance: &str,
+        substrate: Value,
+        lease_secs: Option<u64>,
+    ) -> Result<(u64, String), String> {
+        let mut req = json!({"op": "hold", "class": class, "instance": instance, "substrate": substrate});
+        if let Some(s) = lease_secs {
+            req["lease_secs"] = json!(s);
+        }
+        let ok = self.request(&req)?;
+        let id = ok["id"].as_u64().ok_or_else(|| "no holding id".to_string())?;
+        let generation = ok["generation"].as_str().unwrap_or("").to_string();
+        Ok((id, generation))
+    }
+
+    /// Give a holding back: the world side runs kernel-side (kill the
+    /// witnessed process, remove the lock file), then the row tombstones.
+    pub fn release(&self, id: u64, generation: &str) -> Result<bool, String> {
+        let ok = self.request(&json!({"op": "release", "id": id, "generation": generation}))?;
+        Ok(ok["released"].as_bool().unwrap_or(false))
+    }
+
+    /// Heartbeat a leased holding. With `lease_secs`, extend from now.
+    pub fn renew(&self, id: u64, generation: &str, lease_secs: Option<u64>) -> Result<(), String> {
+        let mut req = json!({"op": "renew", "id": id, "generation": generation});
+        if let Some(s) = lease_secs {
+            req["lease_secs"] = json!(s);
+        }
+        self.request(&req)?;
+        Ok(())
+    }
+
     /// What this plugin may invoke right now: live grants joined with the
     /// target verbs' advertised metadata — each entry
     /// `{verb, description, schema, counts_left?}`, ready to become a tool

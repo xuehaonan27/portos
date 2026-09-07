@@ -43,6 +43,7 @@ pub fn run(root: &str) -> Result<(), Box<dyn std::error::Error>> {
     let root = PathBuf::from(root);
     let kernel = Arc::new(Kernel::open(&root)?);
     let host = Host::new(kernel.clone(), &root.join("sock"))?;
+    host.start_sweeper(std::time::Duration::from_secs(1)); // WP-02 lease sweeper
     host.audit_topic("egress::log");
 
     write_templates(&root)?;
