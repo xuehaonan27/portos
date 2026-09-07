@@ -3,15 +3,11 @@ name = "portos-kernel"
 version.workspace = true
 edition.workspace = true
 
-# `plans` (WP-05; default OFF until gate G1 lifts D31): makes the law crate's
-# metering plan shapes visible and links the proto plan AST to them. With the
-# feature off, the kernel cannot name those types at all.
-[features]
-plans = ["portos-rm/plan-shapes"]
-
 [dependencies]
+# plan-shapes enabled since D41 (G1): the D31 quarantine is lifted. The
+# `attach` feature stays off until WP-08.
 portos-proto = { path = "../portos-proto" }
-portos-rm = { path = "../portos-rm", default-features = false }
+portos-rm = { path = "../portos-rm", default-features = false, features = ["plan-shapes"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 blake3 = { workspace = true }

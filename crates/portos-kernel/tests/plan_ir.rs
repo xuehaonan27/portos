@@ -1,4 +1,3 @@
-#![cfg(feature = "plans")]
 //! WP-05 的投影法则：M0 准入（`plancheck::admit`）算出的预算，与法则 crate
 //! `demand_sum`（B̂＝出现之和，effect-plan §5.2）在全部小计划网格上逐效应类相等。
 //! 网格与法则侧 F5/F6 同工序（确定性穷举：深度 ≤2、三个语句原型、循环界 0..=3，

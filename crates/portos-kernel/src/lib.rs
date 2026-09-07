@@ -35,11 +35,8 @@ pub mod host;
 pub mod interp;
 pub mod ledger;
 pub mod metrics;
-pub mod plancheck;
-/// WP-05: the proto plan AST ↔ law-crate metering shapes bridge. Compiled only
-/// under the kernel feature `plans` (default off until gate G1 lifts D31).
-#[cfg(feature = "plans")]
 pub mod plan_ir;
+pub mod plancheck;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};

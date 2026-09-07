@@ -74,8 +74,48 @@ pub fn open(root: &Path) -> Result<Connection, rusqlite::Error> {
             kind       TEXT NOT NULL,   -- "process" | "port" | "file-lock"
             detail     TEXT NOT NULL    -- JSON per kind
         );
+        -- F3 plan runs (WP-06): one row per run, terminal outcome as JSON.
+        CREATE TABLE IF NOT EXISTS plan_runs (
+            run_id      TEXT PRIMARY KEY,
+            plan_hash   TEXT NOT NULL,
+            subject     TEXT NOT NULL,   -- fiber subject plan:<h>#<run>
+            nonce       TEXT NOT NULL,   -- active consent nonce
+            state       TEXT NOT NULL,   -- admitted | running | awaiting_approval | paused | done
+            started_at  INTEGER NOT NULL,
+            finished_at INTEGER,
+            outcome     TEXT             -- JSON terminal outcome
+        );
+        -- Withheld (staged) effects, in original order. Self-contained: an
+        -- approval in a later process replays from these rows alone.
+        CREATE TABLE IF NOT EXISTS suppression_buffer (
+            run_id  TEXT NOT NULL,
+            seq     INTEGER NOT NULL,
+            verb    TEXT NOT NULL,
+            target  TEXT NOT NULL,
+            args    TEXT NOT NULL,      -- JSON (evaluated values)
+            cost    INTEGER NOT NULL,
+            state   TEXT NOT NULL DEFAULT 'held',  -- held | inserted | aborted
+            PRIMARY KEY (run_id, seq)
+        );
+        -- Every emitted effect of a run, in order (the w-effect shadow).
+        CREATE TABLE IF NOT EXISTS emission_log (
+            run_id  TEXT NOT NULL,
+            seq     INTEGER NOT NULL,
+            verb    TEXT NOT NULL,
+            target  TEXT NOT NULL,
+            nonce   TEXT NOT NULL,      -- the consent that paid for it
+            at      INTEGER NOT NULL,
+            PRIMARY KEY (run_id, seq)
+        );
         "#,
     )?;
+    // consents.source: "signed" (user quadruple) | "derived" (WP-08
+    // attachments). Idempotent migration for existing roots.
+    match conn.execute_batch("ALTER TABLE consents ADD COLUMN source TEXT NOT NULL DEFAULT 'signed'") {
+        Ok(()) => {}
+        Err(e) if e.to_string().contains("duplicate column") => {}
+        Err(e) => return Err(e),
+    }
     Ok(conn)
 }
 

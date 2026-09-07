@@ -5,8 +5,7 @@
 //! (`Let`, and reads — `Observe`/`Pure` are repeatable, hence free via the
 //! truth table) collapse to transparent nodes.
 //!
-//! Compiled only under the kernel feature `plans` (default off until gate G1
-//! lifts D31): without it, the kernel cannot name the law crate's plan shapes.
+//! Compiled in since D41 (G1 lifted D31).
 
 use portos_proto::{Plan, Stmt};
 use portos_rm::coeffect::AstNode;
