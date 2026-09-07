@@ -3,6 +3,12 @@ name = "portos-kernel"
 version.workspace = true
 edition.workspace = true
 
+# `plans` (WP-05; default OFF until gate G1 lifts D31): makes the law crate's
+# metering plan shapes visible and links the proto plan AST to them. With the
+# feature off, the kernel cannot name those types at all.
+[features]
+plans = ["portos-rm/plan-shapes"]
+
 [dependencies]
 portos-proto = { path = "../portos-proto" }
 portos-rm = { path = "../portos-rm", default-features = false }

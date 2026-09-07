@@ -387,6 +387,52 @@ pub fn demand_paths(plan: &Plan, lookup: &Lookup) -> Requires {
 }
 
 // ---------------------------------------------------------------------------
+// WP-05：宿主计划 AST 的本地镜像与投影。零依赖纪律：法则 crate 不依赖
+// portos-proto；内核（feature `plans`，G1 前默认关）负责 proto AST → `AstNode`
+// 的转换，本侧只定义形状与投影。D31 未解禁前这条链对内核默认不可见。
+// ---------------------------------------------------------------------------
+/// 决定计量的计划节点镜像（effect-plan §3 的四形状＋"不计量"一档）。
+/// 守卫、变量、纯计算不进预算（读经真理表免费，法则
+/// `repeatable_verbs_cost_zero_via_truth_table`），它们在投影里塌缩成 `Opaque`。
+#[cfg(feature = "plan-shapes")]
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum AstNode {
+    /// 效应动词，`family::verb`（D29；投影劈成 handler/verb 两半）。
+    Effect { verb: String },
+    /// 有界循环（effect-plan §3：界是静态的）。
+    Loop { bound: u64, body: Vec<AstNode> },
+    /// 分支（两臂都计——B̂ 的过近似点）。
+    Branch { then: Vec<AstNode>, else_: Vec<AstNode> },
+    /// 顺序。
+    Seq(Vec<AstNode>),
+    /// 不计量的语句（Let/Observe/Pure）：投影为透明。
+    Opaque,
+}
+
+#[cfg(feature = "plan-shapes")]
+impl Plan {
+    /// 投影：宿主 AST（镜像形态）→ 计量形状。`Let`/`Observe`/`Pure` 不计量，
+    /// 塌缩为空序；效应动词按首个 `::` 劈 handler/verb。
+    pub fn from_ast(nodes: &[AstNode]) -> Plan {
+        fn one(n: &AstNode) -> Plan {
+            match n {
+                AstNode::Effect { verb } => {
+                    let (handler, v) = verb.split_once("::").unwrap_or(("kernel", verb));
+                    Plan::Verb { handler: handler.into(), verb: v.into() }
+                }
+                AstNode::Loop { bound, body } => Plan::loop_(*bound, Plan::from_ast(body)),
+                AstNode::Branch { then, else_ } => {
+                    Plan::branch(Plan::from_ast(then), Plan::from_ast(else_))
+                }
+                AstNode::Seq(items) => Plan::from_ast(items),
+                AstNode::Opaque => Plan::Seq(vec![]),
+            }
+        }
+        Plan::Seq(nodes.iter().map(one).collect())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Manifest 与挂载点，以及两道准入：装载期（驱动 vs 挂载点）与运行期（计划 vs 天花板∩预算）。
 // ---------------------------------------------------------------------------
 /// 驱动 manifest：每个动词一份 requires。文件格式（TOML）不在本决策——冻结的是类型与运算。
