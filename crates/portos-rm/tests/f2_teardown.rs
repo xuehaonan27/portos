@@ -230,3 +230,43 @@ fn crash_only_single_path_holds_with_journal() {
     }
     assert_eq!(fingerprint(&graceful), fingerprint(&crashed));
 }
+
+/// [TREE] 撤销子树（WP-03 的参照语义）：以某持有为根的清理——跨主体后代同收、
+/// 子先于父、根最后；主体名下不在子树内的持有不动。
+#[test]
+fn subtree_teardown_is_children_first_and_spares_off_tree_holdings() {
+    let fixture = || {
+        let mut l = Ledger::new();
+        for cid in ["cap", "pool", "route"] {
+            l.register_class(ClassDecl {
+                class_id: cid.into(),
+                algebra: AlgebraTag::Exclusive,
+                release_idempotent: true,
+                lease_secs: None,
+                revert_grade: RevertGrade::Inverse,
+            });
+        }
+        for (c, i) in [("cap", "c1"), ("pool", "p1"), ("route", "r1"), ("cap", "other")] {
+            l.set_capacity(c, i, Frag::Ex(Ex::Token));
+        }
+        let cap = l.grant("plugin:a", "cap", "c1", Frag::Ex(Ex::Token), "c1", None, 0).unwrap();
+        let pool = l.grant("plugin:a", "pool", "p1", Frag::Ex(Ex::Token), "p1", Some(cap), 0).unwrap();
+        // 跨主体后代：附着实例的路由挂在授权持有下（决策 2 的实例化边）。
+        l.declare_instantiation("attach:x", "plugin:a");
+        let route = l.grant("attach:x", "route", "r1", Frag::Ex(Ex::Token), "r1", Some(cap), 0).unwrap();
+        let other = l.grant("plugin:a", "cap", "other", Frag::Ex(Ex::Token), "other", None, 0).unwrap();
+        (l, cap, pool, route, other)
+    };
+    for seed in 0..8u64 {
+        let (mut l, cap, pool, route, other) = fixture();
+        let mut j = Journal::default();
+        let mut w = MockWorld::default();
+        let out = teardown_subtree_with(&mut l, &mut j, &mut w, cap, "c1", seed, None, 1);
+        assert!(matches!(out, RunOutcome::Completed { ref failed } if failed.is_empty()));
+        let pos = |id: u64| w.action_order.iter().position(|x| *x == id).unwrap();
+        assert!(pos(pool) < pos(cap) && pos(route) < pos(cap), "子先于父，根最后");
+        assert!(l.holding(other).unwrap().released_at.is_none(), "子树外的持有不动");
+        assert!(l.holding(cap).unwrap().released_at.is_some(), "根本人落碑");
+        l.invariant().unwrap();
+    }
+}

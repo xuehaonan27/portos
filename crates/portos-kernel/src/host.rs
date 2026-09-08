@@ -503,6 +503,19 @@ impl Host {
         reclaim(&self.kernel, &self.inner, plugin, reason)
     }
 
+    /// Revoke a capability (WP-03): the derivation-tree cascade, each revoked
+    /// cap's holding subtree torn down through the one teardown path. Returns
+    /// how many caps the cascade newly revoked.
+    pub fn revoke_capability(&self, cap_id: &str) -> Result<u64, KernelError> {
+        let now = crate::db::now_unix();
+        let mut world = HostWorld { inner: self.inner.clone() };
+        let n = self.kernel.caps.revoke(cap_id, &mut world, now)?;
+        let _ = self.kernel.audit.lock().unwrap().append(json!({
+            "event": "cap.revoked", "cap": cap_id, "cascade": n,
+        }));
+        Ok(n)
+    }
+
     /// Kernel-initiated verb call on a named plugin (no capability check:
     /// kernel-side callers act with root authority; user-session grants come
     /// later via consent).
@@ -1490,13 +1503,24 @@ fn handle_client_op(
         Some("grants") => {
             let subject = format!("plugin:{name}");
             let caps = kernel.caps.list_live(&subject, now)?;
-            // Pass 1: merge per verb. `counts`: None = unlimited grant seen;
-            // Some(n) = best counted balance so far.
-            let mut merged: BTreeMap<String, Option<u64>> = BTreeMap::new();
+            // Pass 1: merge per verb. Each entry tracks the strongest single
+            // contributing grant: unlimited counts beat counted (then the
+            // larger balance wins); no-expiry beats expiring (then the later
+            // one wins). The winner's holding id is reported (WP-03).
+            struct Best {
+                counts: Option<u64>,
+                expires_at: Option<u64>,
+                holding: u64,
+            }
+            let key = |counts: Option<u64>, expires: Option<u64>| {
+                (counts.unwrap_or(u64::MAX), expires.unwrap_or(u64::MAX))
+            };
+            let mut merged: BTreeMap<String, Best> = BTreeMap::new();
             for cap in &caps {
                 let Some(family) = cap.resource.strip_prefix("driver:") else {
                     continue;
                 };
+                let holding = kernel.ledger.cap_holding(&cap.cap_id).map(|h| h.id).unwrap_or(0);
                 for short in &cap.verbs {
                     let verb = format!("{family}::{short}");
                     // Balance = capacity − fold of spend rows (F1), a snapshot.
@@ -1504,28 +1528,39 @@ fn handle_client_op(
                     merged
                         .entry(verb)
                         .and_modify(|acc| {
-                            *acc = match (*acc, this) {
-                                (None, _) | (_, None) => None, // unlimited wins
-                                (Some(a), Some(b)) => Some(a.max(b)),
+                            if key(this, cap.constraints.expires_at) > key(acc.counts, acc.expires_at) {
+                                *acc = Best {
+                                    counts: this,
+                                    expires_at: cap.constraints.expires_at,
+                                    holding,
+                                };
                             }
                         })
-                        .or_insert(this);
+                        .or_insert(Best {
+                            counts: this,
+                            expires_at: cap.constraints.expires_at,
+                            holding,
+                        });
                 }
             }
             // Pass 2: join with the route table's advertised metadata.
             let routes = inner.routes.lock().unwrap();
             let grants: Vec<Value> = merged
                 .into_iter()
-                .map(|(verb, counts)| {
+                .map(|(verb, best)| {
                     let (description, schema, kind, budgeted) = routes
                         .get(&verb)
                         .map(|e| (e.description.clone(), e.schema.clone(), e.kind, e.budgeted))
                         .unwrap_or_else(|| (String::new(), json!({"type": "object"}), None, None));
                     let mut g = json!({
                         "verb": verb, "description": description, "schema": schema,
+                        "holding": best.holding,
                     });
-                    if let Some(n) = counts {
+                    if let Some(n) = best.counts {
                         g["counts_left"] = json!(n);
+                    }
+                    if let Some(t) = best.expires_at {
+                        g["expires_at"] = json!(t);
                     }
                     // F4: the verb character the serving plugin declared.
                     if let Some(k) = kind {

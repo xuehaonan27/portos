@@ -41,6 +41,16 @@
 //!       `kernel/file-lock`   a lock file (instance = path); world release =
 //!                            remove the file, reconcile removes it when the
 //!                            recorded owner pid is dead.
+//!       `kernel/cap`         a granted capability as a holding (WP-03):
+//!                            instance = generation = the cap id, lease =
+//!                            `constraints.expires_at` (absolute), parent =
+//!                            None. The holding is the single source of truth
+//!                            for liveness: revocation tears down its ownership
+//!                            subtree (what exists because of the grant goes
+//!                            first), expiry rides the sweeper, and the issuer
+//!                            gate (`CapStore::exercise`) refuses a cap whose
+//!                            holding is gone. World release is a no-op — the
+//!                            physical side of a grant lives in its children.
 //!   - **Time (WP-02)**: leases on holdings (`set_lease`), a sweeper
 //!     (`sweep_with_world`, driven by `Host::start_sweeper`) running
 //!     `Ledger::sweep` plus the world side of expiry, and substrate
@@ -60,7 +70,7 @@ use portos_rm::ledger::{
     AlgebraTag, ClassDecl, Frag, Holding, Ledger, LedgerError, LiveItem, RevertGrade,
 };
 use portos_rm::ra::{Count, Ex, Frac, GSet, Ranges};
-use portos_rm::teardown::{JState, Journal, JournalEntry, RunOutcome, World, teardown_with};
+use portos_rm::teardown::{JState, Journal, JournalEntry, RunOutcome, World, teardown_subtree_with, teardown_with};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
@@ -71,6 +81,7 @@ pub const CLASS_SUBSCRIPTION: &str = "kernel/subscription";
 pub const CLASS_PROCESS: &str = "kernel/process";
 pub const CLASS_PORT: &str = "kernel/port";
 pub const CLASS_FILE_LOCK: &str = "kernel/file-lock";
+pub const CLASS_CAP: &str = "kernel/cap";
 
 /// Classes a plugin may `hold` (WP-02; open registration is Phase G).
 pub const HOLDABLE_CLASSES: [&str; 3] = [CLASS_PROCESS, CLASS_PORT, CLASS_FILE_LOCK];
@@ -147,6 +158,7 @@ impl LedgerStore {
             (CLASS_PROCESS, AlgebraTag::Exclusive),
             (CLASS_PORT, AlgebraTag::Exclusive),
             (CLASS_FILE_LOCK, AlgebraTag::Exclusive),
+            (CLASS_CAP, AlgebraTag::Exclusive),
         ] {
             l.register_class(ClassDecl {
                 class_id: id.to_string(),
@@ -685,6 +697,57 @@ impl LedgerStore {
         self.inner.lock().unwrap().live_snapshot(subject)
     }
 
+    /// The live `kernel/cap` holding for a capability, if any (WP-03): the
+    /// single source of truth for the cap's liveness — revoked, expired and
+    /// swept, or died with its holder all read as `None`.
+    pub fn cap_holding(&self, cap_id: &str) -> Option<Holding> {
+        self.inner
+            .lock()
+            .unwrap()
+            .live()
+            .find(|h| h.class_id == CLASS_CAP && h.instance == cap_id)
+            .cloned()
+    }
+
+    /// Revocation-scoped teardown (WP-03): release the ownership subtree rooted
+    /// at `root` — the cap holding and everything that exists because the grant
+    /// does (children first, the root last) — through `world`, journaled exactly
+    /// like [`teardown`](Self::teardown) ([SAGA] write-ahead, non-done entries
+    /// replayed on the next attempt). `key_scope` anchors the idempotency keys
+    /// (use the cap id — stable across crashes). `extra` runs inside the same
+    /// transaction after the teardown loop, so the caller's bookkeeping (mark
+    /// the caps row revoked, release the cap's spend rows, close its pools)
+    /// commits or rolls back with the tombstones.
+    pub fn teardown_subtree<W: World>(
+        &self,
+        root: u64,
+        key_scope: &str,
+        world: &mut W,
+        now: u64,
+        extra: impl FnOnce(&mut Ledger, &Connection) -> Result<(), KernelError>,
+    ) -> Result<(RunOutcome, usize), KernelError> {
+        self.transaction(|l, conn| {
+            let before: Vec<u64> = l.live_subtree(root).iter().map(|it| it.id).collect();
+            let mut journal = load_pending_journal(conn, &before)?;
+            let outcome =
+                teardown_subtree_with(l, &mut journal, world, root, key_scope, 0, None, now);
+            let mut released = 0;
+            for id in &before {
+                if let Some(h) = l.holding(*id) {
+                    if h.released_at.is_some() {
+                        released += 1;
+                    }
+                    persist_on(conn, h)?;
+                }
+            }
+            for e in journal.entries() {
+                upsert_journal(conn, e, now)?;
+            }
+            extra(l, conn)?;
+            Ok((outcome, released))
+        })
+    }
+
     pub fn live_closure(&self, subject: &str) -> Vec<LiveItem> {
         self.inner.lock().unwrap().live_closure(subject)
     }
@@ -713,11 +776,11 @@ impl LedgerStore {
     }
 }
 
-fn pool_instance(cap_id: &str, verb: &str) -> String {
+pub(crate) fn pool_instance(cap_id: &str, verb: &str) -> String {
     format!("{cap_id}/{verb}")
 }
 
-fn map_err(e: LedgerError) -> KernelError {
+pub(crate) fn map_err(e: LedgerError) -> KernelError {
     match e {
         LedgerError::UnknownClass | LedgerError::AlgebraMismatch => {
             KernelError::Corrupt(format!("ledger: {e:?}"))
@@ -768,7 +831,7 @@ fn port_free(instance: &str) -> bool {
 
 /// Write one row through. Takes the connection, not the store's `Arc`: every
 /// caller runs inside [`LedgerStore::transaction`], which already holds it.
-fn persist_on(conn: &Connection, h: &Holding) -> Result<(), KernelError> {
+pub(crate) fn persist_on(conn: &Connection, h: &Holding) -> Result<(), KernelError> {
     conn.execute(
         "INSERT OR REPLACE INTO holdings (id, subject, class_id, instance, frag, generation, \
          parent, lease_expires_at, acquired_at, released_at) \

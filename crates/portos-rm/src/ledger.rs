@@ -605,6 +605,31 @@ impl Ledger {
         items
     }
 
+    /// 子树闭包：`root` 本人及其全部后代（不论后代记在哪个主体名下）——与
+    /// [`live_closure`](Self::live_closure) 同纪律，只沿 ownership 边走。撤销（revoke）
+    /// 的清理域：能力入帐本后（WP-03），撤销一项授权＝释放它的持有子树——因该授权
+    /// 而存在的东西（池、路由）子先于父收掉，根最后；主体名下的其他持有不动。
+    pub fn live_subtree(&self, root: u64) -> Vec<LiveItem> {
+        let mut items: Vec<LiveItem> = self
+            .live()
+            .find(|h| h.id == root)
+            .map(|h| self.live_item(h))
+            .into_iter()
+            .collect();
+        let mut i = 0;
+        while i < items.len() {
+            let p = items[i].id;
+            let kids: Vec<LiveItem> = self
+                .live()
+                .filter(|h| h.parent == Some(p) && !items.iter().any(|it| it.id == h.id))
+                .map(|h| self.live_item(h))
+                .collect();
+            items.extend(kids);
+            i += 1;
+        }
+        items
+    }
+
     pub fn live_count(&self) -> usize {
         self.live().count()
     }

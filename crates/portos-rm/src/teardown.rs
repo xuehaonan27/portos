@@ -163,7 +163,11 @@ impl World for MockWorld {
 // ---------------------------------------------------------------------------
 pub fn plan_waves(ledger: &Ledger, subject: &str) -> Vec<Vec<u64>> {
     // [B15] 规划对象是主体持有的 ownership 闭包（含跨主体后代），不是主体本人的行。
-    let items = ledger.live_closure(subject);
+    plan_waves_over(&ledger.live_closure(subject))
+}
+
+/// 波次规划的共享核：对任意存活集（主体的闭包、某持有的子树）按"集内深度"分层。
+fn plan_waves_over(items: &[LiveItem]) -> Vec<Vec<u64>> {
     if items.is_empty() {
         return Vec::new();
     }
@@ -178,7 +182,7 @@ pub fn plan_waves(ledger: &Ledger, subject: &str) -> Vec<Vec<u64>> {
     };
     let maxd = items.iter().map(|it| depth_of(it.id)).max().unwrap_or(0);
     let mut waves = vec![Vec::new(); maxd + 1];
-    for it in &items {
+    for it in items {
         // 深度最大的最先清：waves[0] = 最深层（叶），末波 = 根。
         waves[maxd - depth_of(it.id)].push(it.id);
     }
@@ -250,6 +254,39 @@ pub fn teardown_with<W: World>(
     crash_at_step: Option<u64>,
     now: u64,
 ) -> RunOutcome {
+    run(ledger, journal, world, &|l| l.live_closure(subject), subject, order_seed, crash_at_step, now)
+}
+
+/// 子树形态（WP-03 撤销级联）：清理域是以 `root` 为根的 ownership 子树（含跨主体
+/// 后代），子先于父、根最后；主体名下的其他持有不受影响。`key_scope` 是 [KEY] 去重
+/// 钥匙的稳定前缀（主体名，或根持有的稳定名如 cap_id）——跨崩溃必须稳定。
+#[allow(clippy::too_many_arguments)]
+pub fn teardown_subtree_with<W: World>(
+    ledger: &mut Ledger,
+    journal: &mut Journal,
+    world: &mut W,
+    root: u64,
+    key_scope: &str,
+    order_seed: u64,
+    crash_at_step: Option<u64>,
+    now: u64,
+) -> RunOutcome {
+    run(ledger, journal, world, &|l| l.live_subtree(root), key_scope, order_seed, crash_at_step, now)
+}
+
+/// 执行器内核：`scope` 给出当前存活集（每次从账本现状重算——计划无状态，
+/// 状态全在账本与日志），其余纪律两形态同一。
+#[allow(clippy::too_many_arguments)]
+fn run<W: World>(
+    ledger: &mut Ledger,
+    journal: &mut Journal,
+    world: &mut W,
+    scope: &dyn Fn(&Ledger) -> Vec<LiveItem>,
+    key_scope: &str,
+    order_seed: u64,
+    crash_at_step: Option<u64>,
+    now: u64,
+) -> RunOutcome {
     let mut step: u64 = 0;
     let mut failed = Vec::new();
     let mut passes: u32 = 0;
@@ -258,8 +295,7 @@ pub fn teardown_with<W: World>(
         matches!(crash_at_step, Some(c) if *step >= c)
     };
     loop {
-        // 每次（含崩溃重启后）从账本现状重算计划 —— 计划无状态，状态全在账本与日志。
-        let waves = plan_waves(ledger, subject);
+        let waves = plan_waves_over(&scope(ledger));
         if waves.is_empty() {
             return RunOutcome::Completed { failed };
         }
@@ -276,7 +312,7 @@ pub fn teardown_with<W: World>(
             }
             for hid in order {
                 // [B15] 守卫与规划器看同一视图：闭包（跨主体子项也算"存活子项"）。
-                let snap = ledger.live_closure(subject);
+                let snap = scope(ledger);
                 let item = match snap.iter().find(|it| it.id == hid) {
                     Some(it) => it.clone(),
                     None => continue, // 已被此前（或崩溃前）清掉
@@ -293,7 +329,7 @@ pub fn teardown_with<W: World>(
                     }
                     continue;
                 }
-                let key = format!("td:{subject}:{hid}");
+                let key = format!("td:{key_scope}:{hid}");
                 // [SAGA] write-ahead：动手之前先记日志。
                 let ji = journal.ensure(hid, item.grade, &key);
                 journal.0[ji].state = JState::InFlight;

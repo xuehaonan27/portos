@@ -380,7 +380,15 @@ fn segment_abort_rolls_back_subscriptions_and_holds_made_by_the_run() {
     let outcome2 = wait_outcome(&host.plans, &out2.run_id);
     assert!(matches!(outcome2, Outcome::Completed), "{outcome2:?}");
     let moved = kernel.ledger.live_snapshot(&fiber2);
-    assert_eq!(moved.len(), 1, "the subscription was transferred to the fiber");
+    assert_eq!(
+        moved.len(),
+        2,
+        "the transferred subscription plus the fiber's own cap holding (WP-03)"
+    );
+    assert!(
+        moved.iter().any(|it| it.class_id == "kernel/subscription"),
+        "the subscription was transferred to the fiber"
+    );
     assert!(kernel.ledger.live_snapshot(&seg2).is_empty());
     host.shutdown_all();
     let _ = std::fs::remove_dir_all(&root);

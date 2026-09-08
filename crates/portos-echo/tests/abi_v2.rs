@@ -302,17 +302,33 @@ fn audit_events(root: &Path) -> Vec<Value> {
 /// never mutated, each exercise is a spend row through the issuer gate, the
 /// balance is a fold — and the rows are durable: reopening the kernel picks
 /// the budget up where it was.
+///
+/// WP-03 sharpens whose budget that is: a grant is a `kernel/cap` holding of
+/// its grantee, so a plugin-held grant dies with the plugin's teardown (the
+/// issuer — chat.json, a consent — re-mints on the next start), while a grant
+/// anchored to a stable subject (here `session:cli`) survives with its budget
+/// intact.
 #[test]
 fn counting_budget_is_ledger_rows_and_survives_kernel_reopen() {
     let (kernel, host, root) = setup("rows");
     let a = spawn_echo(&host, "echoa");
     let _b = spawn_echo(&host, "echob");
-    let mut counts = BTreeMap::new();
-    counts.insert("emit".to_string(), 2u64);
+    let counts = BTreeMap::from([("emit".to_string(), 2u64)]);
     let cap = kernel
         .caps
         .mint(
             "plugin:portos-echoa",
+            "driver:echob",
+            BTreeSet::from(["emit".to_string()]),
+            Constraints { expires_at: None, counts: counts.clone() },
+            None,
+        )
+        .unwrap();
+    // A standing grant anchored to a non-plugin subject: no teardown takes it.
+    let standing = kernel
+        .caps
+        .mint(
+            "session:cli",
             "driver:echob",
             BTreeSet::from(["emit".to_string()]),
             Constraints { expires_at: None, counts },
@@ -320,25 +336,30 @@ fn counting_budget_is_ledger_rows_and_survives_kernel_reopen() {
         )
         .unwrap();
     host.call(&a, "echoa::relay", json!(["echob::emit", ["one"]])).unwrap();
+    kernel.caps.exercise(&standing.cap_id, "emit", 1).unwrap();
     let stored = kernel.caps.get(&cap.cap_id).unwrap();
     assert_eq!(stored.constraints.counts["emit"], 2, "capacity is immutable");
     assert_eq!(kernel.caps.counts_left(&stored, "emit"), Some(1), "balance = capacity − spend rows");
     kernel.ledger.invariant().unwrap();
     host.shutdown_all();
+    // WP-03: a grant is exactly as alive as its holder — the plugin's teardown
+    // tombstoned its holding; the standing grant's holding survives.
+    assert!(kernel.ledger.cap_holding(&cap.cap_id).is_none(), "grant died with its holder");
+    assert!(kernel.ledger.cap_holding(&standing.cap_id).is_some());
     drop(host);
     drop(kernel);
     std::thread::sleep(std::time::Duration::from_millis(200));
 
     // Reopen the same root: spend rows reload, plugin rows of the previous
-    // process are tombstoned, and the same plugin names spawn again.
+    // process are tombstoned. The plugin-held grant stays dead (the gate
+    // refuses it); the standing grant's budget continues where it was.
     let kernel = Arc::new(Kernel::open(&root).unwrap());
     let host = Host::new(kernel.clone(), &root.join("sock")).unwrap();
-    let a = spawn_echo(&host, "echoa");
-    let _b = spawn_echo(&host, "echob");
-    let stored = kernel.caps.get(&cap.cap_id).unwrap();
+    assert!(kernel.caps.exercise(&cap.cap_id, "emit", 2).is_err(), "dead grant stays dead");
+    let stored = kernel.caps.get(&standing.cap_id).unwrap();
     assert_eq!(kernel.caps.counts_left(&stored, "emit"), Some(1), "budget continues across restart");
-    assert!(host.call(&a, "echoa::relay", json!(["echob::emit", ["two"]])).is_ok());
-    assert!(host.call(&a, "echoa::relay", json!(["echob::emit", ["three"]])).is_err(), "gate refuses at capacity");
+    kernel.caps.exercise(&standing.cap_id, "emit", 2).unwrap();
+    assert!(kernel.caps.exercise(&standing.cap_id, "emit", 2).is_err(), "gate refuses at capacity");
     assert_eq!(kernel.caps.counts_left(&stored, "emit"), Some(0));
     kernel.ledger.invariant().unwrap();
     host.shutdown_all();
@@ -348,7 +369,7 @@ fn counting_budget_is_ledger_rows_and_survives_kernel_reopen() {
         !events.iter().any(|e| e["event"] == "ledger.reconciled"),
         "a graceful shutdown leaves no stale rows for the reopen to reconcile"
     );
-    assert_eq!(kernel.ledger.counts(CLASS_PLUGIN), (0, 4), "two incarnations of each plugin, all tombstoned");
+    assert_eq!(kernel.ledger.counts(CLASS_PLUGIN), (0, 2), "both plugins tombstoned");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -626,18 +647,20 @@ fn spawn_child_is_capability_gated_and_parent_death_reclaims_children_first() {
     let p_row = kernel
         .ledger
         .live_snapshot("plugin:portos-echop")
-        .pop()
+        .into_iter()
+        .find(|it| it.class_id == CLASS_PLUGIN)
         .expect("parent row");
     let c_row = kernel
         .ledger
         .live_snapshot("plugin:portos-echoc")
-        .pop()
+        .into_iter()
+        .find(|it| it.class_id == CLASS_PLUGIN)
         .expect("child row");
     assert_eq!(c_row.parent, Some(p_row.id), "child holding parented under the parent's");
     assert_eq!(
         kernel.ledger.live_closure("plugin:portos-echop").len(),
-        2,
-        "the parent's ownership closure is parent + child"
+        3,
+        "the parent's ownership closure is parent + its spawn cap (WP-03) + child"
     );
     assert_eq!(
         host.call("portos-echoc", "echoc::events", json!([])).unwrap(),
@@ -682,8 +705,8 @@ fn spawn_child_is_capability_gated_and_parent_death_reclaims_children_first() {
     assert!(
         events.iter().any(|e| e["event"] == "plugin.reclaimed"
             && e["plugin"] == "portos-echop"
-            && e["released"] == 2),
-        "one teardown released parent and child together"
+            && e["released"] == 3),
+        "one teardown released the child, the parent's spawn cap and the parent"
     );
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -739,6 +762,78 @@ fn plugin_registers_a_child_process_holding_and_kill_minus_nine_reaps_it() {
             && e["plugin"] == "portos-echoa"
             && e["released"] == 2),
         "one teardown released plugin row and process row together"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// WP-03: revocation cascades along the derivation tree — an attenuated
+/// child capability dies with its parent grant — and the teardown is scoped
+/// to the grant's ownership subtree: holdings that exist because of the
+/// grant go with it, while the plugin holding the grant keeps serving.
+#[test]
+fn attenuated_child_capability_dies_with_its_parent_grant() {
+    let (kernel, host, root) = setup("casc");
+    let a = spawn_echo(&host, "echoa");
+    let _b = spawn_echo(&host, "echob");
+    let subject = format!("plugin:{a}");
+    let parent = kernel
+        .caps
+        .mint(
+            &subject,
+            "driver:echob",
+            BTreeSet::from(["emit".to_string()]),
+            Constraints {
+                expires_at: None,
+                counts: BTreeMap::from([("emit".to_string(), 4u64)]),
+            },
+            None,
+        )
+        .unwrap();
+    // A child narrowed in budget, held by another subject.
+    let kid = kernel
+        .caps
+        .attenuate(
+            &parent.cap_id,
+            "plugin:kid",
+            BTreeSet::from(["emit".to_string()]),
+            Constraints {
+                expires_at: None,
+                counts: BTreeMap::from([("emit".to_string(), 2u64)]),
+            },
+        )
+        .unwrap();
+    kernel.caps.exercise(&kid.cap_id, "emit", 1).unwrap();
+    let parent_holding = kernel.ledger.cap_holding(&parent.cap_id).unwrap().id;
+    let kid_holding = kernel.ledger.cap_holding(&kid.cap_id).unwrap().id;
+    // A dependent under the parent grant's holding (WP-08's pools and routes
+    // will hang exactly here).
+    let dep = kernel
+        .ledger
+        .hold_exclusive(&subject, CLASS_SUBSCRIPTION, "route-1", "dep", Some(parent_holding), 1)
+        .unwrap();
+
+    let n = host.revoke_capability(&parent.cap_id).unwrap();
+    assert_eq!(n, 2, "parent and child both revoked");
+    for id in [parent_holding, kid_holding, dep] {
+        assert!(
+            kernel.ledger.holding(id).unwrap().released_at.is_some(),
+            "holding {id} tombstoned by the cascade"
+        );
+    }
+    assert!(kernel.caps.exercise(&kid.cap_id, "emit", 2).is_err(), "dead child cap refused");
+    // The revocation is subtree-scoped: the plugin holding the grant keeps
+    // serving (its own holdings were never in the grant's tree).
+    assert_eq!(host.call(&a, "echoa::events", json!([])).unwrap(), json!([]));
+    kernel.ledger.invariant().unwrap();
+
+    host.shutdown_all();
+    drop(host);
+    let events = audit_events(&root);
+    assert!(
+        events
+            .iter()
+            .any(|e| e["event"] == "cap.revoked" && e["cap"] == parent.cap_id && e["cascade"] == 2),
+        "the revocation is audited"
     );
     let _ = std::fs::remove_dir_all(&root);
 }

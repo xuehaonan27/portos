@@ -111,7 +111,7 @@
 | h_table 入签、表变重准入（Q7）〔设计〕 | `table_change`／`resign` | `table_change_reruns_admission_paused_until_resign_or_detached` |
 | 每附着串行、min_interval（A4）〔设计〕 | `Reject::Serial`／`MinInterval` | `per_attachment_serial_and_min_interval_hold` |
 
-## 接线对照：法则 → 内核对象 → 集成测试（2026-09-05，`.dev/gen/rm-wiring-status.md`；WP-01 增补 2026-09-06）
+## 接线对照：法则 → 内核对象 → 集成测试（2026-09-05，`.dev/gen/rm-wiring-status.md`；WP-01 增补 2026-09-06；WP-03 增补 2026-09-08）
 
 | 法则 | 内核对象（`crates/portos-kernel`） | 测试 |
 |---|---|---|
@@ -128,3 +128,5 @@
 | F5 B̂＝出现之和（§6.5，effect-plan §5.2）＝M0 准入预算 | `plan_ir::to_ast_nodes`＋`coeffect::Plan::from_ast`（WP-05 投影链；kernel feature `plans`，G1 前默认关） | `plans::plancheck_budget_equals_demand_sum_on_all_small_plans`（2343 计划；`cargo test -p portos-kernel --features plans`） |
 | F6 协议＝safety，截停档精确执行 | `host::call_on` 步进（hello `protocol`） | echo `protocol_order_is_enforced_at_call` |
 | F3 monitor（sink／扣发／同意／三态／段事务） | **已成（2026-09-07，D43/WP-06）**：`plans::PlanService`；同意＝按族铸纤维能力（行式预算）；`suppression_buffer`＋跨进程 `approve`；三模式＋进程内 escalate；段＝`transfer_all`/teardown | `plans::` 十条内核集成测试（镜像法则名）＋ chat `plan_run_navigate_type_submit_withheld_then_approved` |
+| 能力＝持有（spec §6.1；WP-03/D48，2026-09-08） | `kernel/cap` 类；`CapStore::mint/attenuate` 同事务铸持有（租约＝`expires_at`）；`exercise`/`find_and_exercise`/`list_live` 以持行为活性真相；`revoke`＝CDT 级联＋逐能力 `LedgerStore::teardown_subtree`（释放花费行＋池归零同事务）；`Host::revoke_capability` | `caps::revoking_a_grant_releases_its_holding_and_children_first`；`caps::expired_capability_is_refused_by_the_gate_after_sweep`；`caps::caps_and_holdings_agree_after_reopen`；echo `attenuated_child_capability_dies_with_its_parent_grant` |
+| F2 子树清理域（撤销级联的参照语义） | `Ledger::live_subtree`＋`teardown_subtree_with`（与 `teardown_with` 共享执行器内核 `run`；[SAGA]/[TREE]/[KEY] 纪律同一） | `f2_teardown::subtree_teardown_is_children_first_and_spares_off_tree_holdings` |
