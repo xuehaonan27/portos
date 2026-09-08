@@ -19,6 +19,8 @@ use crate::ledger::{Ledger, LiveItem, RevertGrade};
 /// F2 的世界接口：执行器对基底的动作。演练用 [`MockWorld`]；内核实装用真基底
 /// （kill 进程、撤订阅、关 target……）。执行器只按类声明的 ρ 选动作（[ρ]），
 /// 世界只负责"做"与"报告成败"——恰好一次的承重仍在钥匙去重（[KEY]）。
+/// 调用方须为所声明的状态与观察范围建立恢复契约，并保证同一波中动作及其逆两两独立。
+/// parent 图只提供生命周期次序；没有 parent 边或 RA 组合合法，都不足以证明此独立性。
 pub trait World {
     /// 有逆档：释放持有。须幂等——对已释放实例为空操作（[E-IDEM]：盲重放安全）。
     fn release(&mut self, item: &LiveItem) -> Result<(), ()>;
@@ -159,7 +161,7 @@ impl World for MockWorld {
 
 // ---------------------------------------------------------------------------
 // 规划器：[TREE] 约束图只含 ownership 边；波次 = 按"子树深度"由深到浅分层。
-// 同一波内的项两两无约束 —— [T43] 许可任意执行序。
+// 同一波内没有 parent 次序约束；还须由 World 的独立性契约满足 [T43] 的前提。
 // ---------------------------------------------------------------------------
 pub fn plan_waves(ledger: &Ledger, subject: &str) -> Vec<Vec<u64>> {
     // [B15] 规划对象是主体持有的 ownership 闭包（含跨主体后代），不是主体本人的行。
@@ -218,7 +220,8 @@ impl<W: World> Orchestrator<W> {
         Self { ledger, journal: Journal::default(), world }
     }
 
-    /// [CRASH] 唯一清理通道。`order_seed` 决定波内执行序（[T43]：任何种子终态相同）；
+    /// [CRASH] 唯一清理通道。`order_seed` 决定波内执行序；满足 World 的独立性契约时，
+    /// [T43] 保证不同种子的终态在所声明的观察下等价。
     /// `crash_at_step`：全局步进计数到达即"断电"（丢执行栈、保 ledger+journal+world）。
     pub fn teardown(
         &mut self,
@@ -304,7 +307,7 @@ fn run<W: World>(
         let mut progressed = false;
         for wave in waves {
             let mut order = wave.clone();
-            // [T43] 波内乱序：用种子洗牌 —— 定理保证任何顺序等效，测试据此断言。
+            // [T43] 波内洗牌；任意次序等效依赖 World 的独立性契约，MockWorld 测试覆盖其特例。
             let mut s = order_seed.wrapping_add(order.len() as u64);
             for i in (1..order.len()).rev() {
                 s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);

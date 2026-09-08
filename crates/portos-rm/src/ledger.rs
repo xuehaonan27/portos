@@ -1,11 +1,11 @@
 //! The holding ledger — freeze drill F1's engineering translation.
 //!
-//! Schema (mirrored in schema.sql): one row per fragment (see auth.rs consequence 1),
+//! Schema (mirrored in schema.sql): one row per fragment for lifecycle tracking,
 //! generation-stable handles, ownership tree via `parent`, leases, tombstones.
 //! Error taxonomy = the "⊕ 无定义的三种运行时对应" of theory-spec §2.2 plus the
 //! generation/teardown checks.
 
-use crate::auth::{auth_valid, can_mint};
+use crate::auth::auth_valid;
 use crate::ra::{Count, Ex, Frac, GSet, Ra, Ranges};
 
 // ---------------------------------------------------------------------------
@@ -96,7 +96,7 @@ fn frag_auth_valid(capacity: &Frag, outstanding: &Option<Frag>) -> bool {
         (Frag::Range(c), None) => auth_valid(c, &None),
         (Frag::Range(c), Some(Frag::Range(o))) => auth_valid(c, &Some(o.clone())),
         (Frag::Frac(c), None) => auth_valid(c, &None),
-        (Frag::Frac(c), Some(Frag::Frac(o))) => auth_valid(c, &Some(*o)),
+        (Frag::Frac(c), Some(Frag::Frac(o))) => auth_valid(c, &Some(o.clone())),
         _ => false,
     }
 }
@@ -203,8 +203,9 @@ impl Ledger {
         self.instantiations.insert(child.to_string(), parent_subject.to_string());
     }
 
-    /// 转授＝持有转移（endstate §8.2 库清单"转授/委托"）：只改持有者，碎片不变 ⇒ 每个 (class, instance)
-    /// 的合成值不变 ⇒ frame-preserving update 平凡成立。用途：F3 段提交（段主体 → fiber）、将来跨主体转授。
+    /// Change the holder, preserving every pool's aggregate and capacity invariant.
+    /// `parent` remains an existence dependency: transferring a child does not
+    /// detach it from the old provider's cleanup closure or transfer that provider.
     /// 世代不符拒（ABA）；来源主体不符拒（句柄不是你的）；已释放拒。
     pub fn transfer(&mut self, id: u64, generation: &str, from_subject: &str, to_subject: &str) -> Result<(), LedgerError> {
         let h = self
@@ -236,7 +237,7 @@ impl Ledger {
         self.holdings.iter().find(|h| h.id == id)
     }
 
-    /// 实装重启时从持久层回灌一行：**不过闸门**——行已是记账真相（后果一），只恢复 id 计数。
+    /// 实装重启时从持久层回灌一行：**不过闸门**——行来自持久层，只恢复 id 计数；完整账本的验证由恢复流程负责。
     /// 回灌后 `invariant()` 仍应成立；不成立即持久层已损坏（实装应拒绝启动或走对账）。
     pub fn restore_row(&mut self, h: Holding) {
         self.next_id = self.next_id.max(h.id + 1);
@@ -288,7 +289,7 @@ impl Ledger {
             .collect()
     }
 
-    /// Grant = issuer-gated mint (auth.rs::can_mint over the closed world).
+    /// Grant checks the complete pool composition against capacity.
     #[allow(clippy::too_many_arguments)]
     pub fn grant(
         &mut self,
@@ -325,60 +326,12 @@ impl Ledger {
             .get(&(class_id.to_string(), instance.to_string()))
             .ok_or(LedgerError::UnknownClass)?;
         let live = self.live_frags(class_id, instance);
-        let ok = match (cap, &want) {
-            (Frag::Ex(c), Frag::Ex(w)) => {
-                let lv: Vec<Ex> = live
-                    .iter()
-                    .map(|f| match f {
-                        Frag::Ex(x) => *x,
-                        _ => Ex::Bot,
-                    })
-                    .collect();
-                can_mint(c, &lv, w)
-            }
-            (Frag::Count(c), Frag::Count(w)) => {
-                let lv: Vec<Count> = live
-                    .iter()
-                    .map(|f| match f {
-                        Frag::Count(x) => *x,
-                        _ => Count(u64::MAX),
-                    })
-                    .collect();
-                can_mint(c, &lv, w)
-            }
-            (Frag::Set(c), Frag::Set(w)) => {
-                let lv: Vec<GSet> = live
-                    .iter()
-                    .map(|f| match f {
-                        Frag::Set(x) => x.clone(),
-                        _ => GSet::default(),
-                    })
-                    .collect();
-                can_mint(c, &lv, w)
-            }
-            (Frag::Range(c), Frag::Range(w)) => {
-                let lv: Vec<Ranges> = live
-                    .iter()
-                    .map(|f| match f {
-                        Frag::Range(x) => x.clone(),
-                        _ => Ranges::bot(),
-                    })
-                    .collect();
-                can_mint(c, &lv, w)
-            }
-            (Frag::Frac(c), Frag::Frac(w)) => {
-                let lv: Vec<Frac> = live
-                    .iter()
-                    .map(|f| match f {
-                        Frag::Frac(x) => *x,
-                        _ => Frac::new(2, 1), // 类型错位 ⇒ 非法元（>1）
-                    })
-                    .collect();
-                can_mint(c, &lv, w)
-            }
-            _ => return Err(LedgerError::AlgebraMismatch),
-        };
-        if !ok {
+        if cap.tag() != want.tag() {
+            return Err(LedgerError::AlgebraMismatch);
+        }
+        let mut all = live;
+        all.push(want.clone());
+        if !frag_auth_valid(cap, &compose_frags(&all)?) {
             return Err(LedgerError::Conflict);
         }
         let id = self.next_id;
@@ -403,7 +356,7 @@ impl Ledger {
         self.live().any(|h| h.parent == Some(id))
     }
 
-    /// Release = drop the row (no algebraic subtraction exists — consequence 1).
+    /// Release marks the holding as a tombstone; aggregates follow the remaining live rows.
     pub fn release(&mut self, id: u64, generation: &str, now: u64) -> Result<(), LedgerError> {
         let idx = self
             .holdings

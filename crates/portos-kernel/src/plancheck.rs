@@ -97,11 +97,6 @@ pub fn admit(plan: &Plan, schemas: &VerbSchemas) -> Result<Admission, AdmitError
             nodes: w.out.node_count,
         });
     }
-    if w.out.worst_case_steps > S_MAX {
-        return Err(AdmitError::StepCeiling {
-            worst_case: w.out.worst_case_steps,
-        });
-    }
     Ok(w.out)
 }
 
@@ -118,6 +113,14 @@ fn walk_stmts(
     for s in stmts {
         w.out.node_count += 1;
         w.out.worst_case_steps = w.out.worst_case_steps.saturating_add(mult);
+        // Reject before updating any per-verb budget. Every accepted budget is
+        // bounded by this step total, so its exact u64 addition cannot overflow.
+        // Saturation here is only an excess witness, never an accepted amount.
+        if w.out.worst_case_steps > S_MAX {
+            return Err(AdmitError::StepCeiling {
+                worst_case: w.out.worst_case_steps,
+            });
+        }
         match s {
             Stmt::Let { var, expr } => {
                 let l = expr_label(w, expr)?;
@@ -265,6 +268,25 @@ mod tests {
         assert_eq!(adm.budget.get("echo::emit"), Some(&3));
         // the effect's effective label carries the list's taint (pc + arg)
         assert!(adm.effects[0].effective.integ.contains("toy:echo"));
+    }
+
+    #[test]
+    fn oversized_nested_budget_is_refused_without_arithmetic_overflow() {
+        let effect = Stmt::Effect { verb: "echo::emit".into(), args: vec![] };
+        let mut body = vec![effect.clone(), effect];
+        for _ in 0..3 {
+            body = vec![Stmt::Foreach {
+                var: "x".into(),
+                list: Expr::Const { value: serde_json::json!([]) },
+                bound: u32::MAX,
+                mode: Mode::Strict,
+                body,
+            }];
+        }
+        assert!(matches!(
+            admit(&Plan { stmts: body }, &toy_schemas()),
+            Err(AdmitError::StepCeiling { .. })
+        ));
     }
 
     #[test]

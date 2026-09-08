@@ -73,7 +73,7 @@ fn plancheck_budget_equals_demand_sum_on_all_small_plans() {
             adm.budget.iter().filter(|(_, n)| **n > 0).map(|(k, v)| (k, *v)).collect();
         let law = demand_sum(&LawPlan::from_ast(&to_ast_nodes(plan)), &all_budgeted);
         let want: BTreeMap<&String, u64> =
-            law.uses.0.iter().map(|(k, c)| (k, c.0)).collect();
+            law.uses.0.iter().map(|(k, c)| (k, c.value().expect("small fixture budget"))).collect();
         assert_eq!(got, want, "plancheck 预算 ≠ demand_sum（逐效应类）：{plan:?}");
     }
 }

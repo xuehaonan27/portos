@@ -1,6 +1,6 @@
 //! 法则表的可执行形态 —— 每个测试名注明它执行的法则与其冻结来源。
 //! 来源缩写：[RA]=Iris RA 公理；[FPU]=frame-preserving update；[AUTH]=Auth 合法性；
-//! [C1]=无消去性⇒行式碎片；[C2]=开放世界 mint 非 FPU⇒发放方闸门；
+//! [C1]=行式生命周期记账；[C2]=中央容量检查与 FPU 的区别；
 //! [GEN]=世代化句柄；[CRASH]=crash-only 单路径；[T]=租约/对账。
 
 use portos_rm::auth::{auth_valid, can_mint, compose};
@@ -8,7 +8,7 @@ use portos_rm::ledger::*;
 use portos_rm::ra::*;
 
 fn sample_counts(rng: &mut Lcg, n: usize) -> Vec<Count> {
-    (0..n).map(|_| Count(rng.next() % 7)).collect()
+    (0..n).map(|_| Count::Value(rng.next() % 7)).collect()
 }
 fn sample_sets(rng: &mut Lcg, n: usize) -> Vec<GSet> {
     let names = ["a", "b", "c", "d"];
@@ -62,10 +62,10 @@ fn ra_laws_all_algebras() {
 /// [AUTH] ✓(●a·◯b) ⟺ b ≼ a ∧ ✓a —— 构造正反例。
 #[test]
 fn auth_validity_iff() {
-    assert!(auth_valid(&Count(5), &Some(Count(5))));
-    assert!(auth_valid(&Count(5), &Some(Count(3))));
-    assert!(!auth_valid(&Count(5), &Some(Count(6))));
-    assert!(auth_valid(&Count(5), &None));
+    assert!(auth_valid(&Count::Value(5), &Some(Count::Value(5))));
+    assert!(auth_valid(&Count::Value(5), &Some(Count::Value(3))));
+    assert!(!auth_valid(&Count::Value(5), &Some(Count::Value(6))));
+    assert!(auth_valid(&Count::Value(5), &None));
     assert!(auth_valid(&Ex::Token, &Some(Ex::Token)));
     assert!(!auth_valid(&Ex::Token, &Some(Ex::Bot)));
     assert!(!auth_valid(&Ex::Bot, &None)); // ✓a 失败
@@ -95,7 +95,7 @@ fn drill_ledger() -> Ledger {
         revert_grade: RevertGrade::Inverse,
     });
     l.set_capacity("tcp-port", "8080", Frag::Ex(Ex::Token));
-    l.set_capacity("quota", "pool", Frag::Count(Count(5)));
+    l.set_capacity("quota", "pool", Frag::Count(Count::Value(5)));
     for i in 0..8 {
         l.set_capacity("proc-tree", &format!("slot{i}"), Frag::Ex(Ex::Token));
     }
@@ -117,9 +117,9 @@ fn exclusive_double_grant_refused() {
 #[test]
 fn counting_no_overdraft() {
     let mut l = drill_ledger();
-    l.grant("a", "quota", "pool", Frag::Count(Count(3)), "g", None, 0).unwrap();
-    l.grant("b", "quota", "pool", Frag::Count(Count(2)), "g", None, 0).unwrap();
-    let over = l.grant("c", "quota", "pool", Frag::Count(Count(1)), "g", None, 0);
+    l.grant("a", "quota", "pool", Frag::Count(Count::Value(3)), "g", None, 0).unwrap();
+    l.grant("b", "quota", "pool", Frag::Count(Count::Value(2)), "g", None, 0).unwrap();
+    let over = l.grant("c", "quota", "pool", Frag::Count(Count::Value(1)), "g", None, 0);
     assert_eq!(over.unwrap_err(), LedgerError::Conflict);
     l.invariant().unwrap();
 }
@@ -166,7 +166,7 @@ fn invariant_under_random_ops() {
     for step in 0..300u64 {
         match rng.next() % 3 {
             0 => {
-                let want = Frag::Count(Count(rng.next() % 3));
+                let want = Frag::Count(Count::Value(rng.next() % 3));
                 if let Ok(id) = l.grant("s", "quota", "pool", want, "g", None, step) {
                     lives.push((id, "g".into()));
                 }
@@ -241,26 +241,76 @@ fn crash_only_single_path() {
     crashed.invariant().unwrap();
 }
 
-/// Auth 复合元素（● 容量 · ◯ 碎片）：容量固定、碎片部分参与合成；合法性 = 碎片 ≼ 容量。
-/// FPU 只有在这种"合法性会随帧变化"的载体上才有内容——裸 Count 碎片恒合法，任何 a⤳b 都空洞成立。
+/// A concrete Auth(Count) fixture: frames may carry fragments or an authority.
+/// Two authorities conflict; fragment-only ownership does not carry a capacity.
 #[derive(Clone, PartialEq, Debug)]
 struct AuthC {
-    cap: Count,
+    cap: Option<Count>,
+    conflicting_authorities: bool,
     frag: Count,
+}
+impl AuthC {
+    fn full(cap: u64, frag: Count) -> Self {
+        Self { cap: Some(Count::Value(cap)), conflicting_authorities: false, frag }
+    }
+    fn fragment(frag: u64) -> Self {
+        Self { cap: None, conflicting_authorities: false, frag: Count::Value(frag) }
+    }
 }
 impl Ra for AuthC {
     fn op(&self, o: &Self) -> Self {
-        AuthC { cap: self.cap, frag: self.frag.op(&o.frag) }
+        let conflicting_authorities = self.conflicting_authorities
+            || o.conflicting_authorities || (self.cap.is_some() && o.cap.is_some());
+        AuthC {
+            cap: if conflicting_authorities { None } else { self.cap.or(o.cap) },
+            conflicting_authorities,
+            frag: self.frag.op(&o.frag),
+        }
     }
     fn valid(&self) -> bool {
-        auth_valid(&self.cap, &Some(self.frag))
+        !self.conflicting_authorities && match self.cap {
+            None => self.frag.valid(),
+            Some(cap) => auth_valid(&cap, &Some(self.frag)),
+        }
     }
     fn pcore(&self) -> Option<Self> {
-        Some(AuthC { cap: self.cap, frag: Count(0) })
+        Some(AuthC {
+            cap: None,
+            conflicting_authorities: self.conflicting_authorities,
+            frag: Count::Value(0),
+        })
     }
     fn included_in(&self, b: &Self) -> bool {
-        self.frag.included_in(&b.frag)
+        let authority_included = b.conflicting_authorities || (!self.conflicting_authorities
+            && match (self.cap, b.cap) {
+                (None, _) => true,
+                (Some(a), Some(b)) => a == b,
+                (Some(_), None) => false,
+            });
+        authority_included && self.frag.included_in(&b.frag)
     }
+}
+
+#[test]
+fn auth_fixture_has_exclusive_authority_and_satisfies_ra_laws() {
+    let mut elems = Vec::new();
+    for n in 0..=3 {
+        elems.push(AuthC::fragment(n));
+        for cap in 0..=2 {
+            elems.push(AuthC::full(cap, Count::Value(n)));
+        }
+        elems.push(AuthC::full(0, Count::Value(n)).op(&AuthC::full(1, Count::Value(0))));
+    }
+    for a in &elems {
+        assert!(law_core_id(a) && law_core_idem(a));
+        for b in &elems {
+            assert!(law_comm(a, b) && law_valid_op_l(a, b) && law_core_mono(a, b));
+            for c in &elems {
+                assert!(law_assoc(a, b, c));
+            }
+        }
+    }
+    assert!(!AuthC::full(1, Count::Value(0)).op(&AuthC::full(1, Count::Value(0))).valid());
 }
 
 /// [FPU] release（丢一笔碎片）是 frame-preserving update：a ⤳ b ⟺ ∀f. ✓(a·f) ⇒ ✓(b·f)。
@@ -274,12 +324,12 @@ fn release_is_frame_preserving() {
         for x in 0..=cap {
             for y in 0..=(cap - x) {
                 for z in 0..=(cap - x - y) {
-                    let live = [Count(x), Count(y), Count(z)];
+                    let live = [Count::Value(x), Count::Value(y), Count::Value(z)];
                     for drop_idx in 0..3 {
                         let kept: Vec<Count> = live.iter().enumerate().filter(|(i, _)| *i != drop_idx).map(|(_, c)| *c).collect();
-                        let a = AuthC { cap: Count(cap), frag: compose(&live.to_vec()).unwrap() };
-                        let b = AuthC { cap: Count(cap), frag: compose(&kept).unwrap() };
-                        let frames: Vec<AuthC> = (0..=cap + 1).map(|k| AuthC { cap: Count(cap), frag: Count(k) }).collect();
+                        let a = AuthC::full(cap, compose(&live).unwrap());
+                        let b = AuthC::full(cap, compose(&kept).unwrap());
+                        let frames: Vec<AuthC> = (0..=cap + 1).map(AuthC::fragment).collect();
                         assert!(fpu_holds(&a, &b, &frames), "release 破坏了 FPU：cap={cap} live={live:?} drop={drop_idx}");
                         bites_valid |= frames.iter().any(|f| a.op(f).valid());
                         bites_invalid |= frames.iter().any(|f| !a.op(f).valid());
@@ -300,7 +350,7 @@ fn sweep_cascades_to_parent_bound_children() {
     // 场景一：proc(租约 60) ⊃ quota(租约 None)：sweep(100) 两者皆回收，子先于父。
     let mut l = drill_ledger();
     let proc_ = l.grant("drv", "proc-tree", "slot0", Frag::Ex(Ex::Token), "p", None, 0).unwrap();
-    let quota = l.grant("drv", "quota", "pool", Frag::Count(Count(2)), "g", Some(proc_), 0).unwrap();
+    let quota = l.grant("drv", "quota", "pool", Frag::Count(Count::Value(2)), "g", Some(proc_), 0).unwrap();
     let swept = l.sweep(100);
     assert_eq!(swept, vec![quota, proc_], "租约 None 的子项随父项一起回收，且子先于父");
     assert_eq!(l.live_count(), 0);
@@ -356,42 +406,41 @@ fn cross_subject_parent_requires_instantiation_authority() {
     assert_eq!(l.live_closure("host").len(), 4);
 }
 
-/// [TRANSFER] 转授＝持有转移（endstate §8.2 库清单"转授/委托"）：只改持有者，碎片不变 ⇒
-/// 每个 (class, instance) 的合成值不变 ⇒ FPU 平凡成立、全局不变量保持；
+/// [TRANSFER] 转授保持每个 (class, instance) 的合成值与容量不变量；
 /// 世代不符拒（ABA）、来源主体不符拒（句柄不是你的）、已释放拒。
 #[test]
-fn transfer_changes_holder_only_and_is_trivially_frame_preserving() {
+fn transfer_preserves_aggregate_and_holder_checks() {
     let mut l = drill_ledger();
-    let a = l.grant("fib:seg", "quota", "pool", Frag::Count(Count(3)), "g", None, 0).unwrap();
-    let b = l.grant("other", "quota", "pool", Frag::Count(Count(2)), "g", None, 0).unwrap();
-    let outstanding_before: u64 = l.live().map(|h| match h.frag { Frag::Count(Count(n)) => n, _ => 0 }).sum();
+    let a = l.grant("fib:seg", "quota", "pool", Frag::Count(Count::Value(3)), "g", None, 0).unwrap();
+    let b = l.grant("other", "quota", "pool", Frag::Count(Count::Value(2)), "g", None, 0).unwrap();
+    let outstanding_before: u64 = l.live().map(|h| match h.frag { Frag::Count(Count::Value(n)) => n, _ => 0 }).sum();
     assert_eq!(l.transfer(a, "wrong", "fib:seg", "fib").unwrap_err(), LedgerError::StaleGeneration);
     assert_eq!(l.transfer(a, "g", "someone-else", "fib").unwrap_err(), LedgerError::ForgedHandle);
     l.transfer(a, "g", "fib:seg", "fib").unwrap();
     assert_eq!(l.live_snapshot("fib:seg").len(), 0);
     assert_eq!(l.live_snapshot("fib").iter().map(|it| it.id).collect::<Vec<_>>(), vec![a]);
-    let outstanding_after: u64 = l.live().map(|h| match h.frag { Frag::Count(Count(n)) => n, _ => 0 }).sum();
+    let outstanding_after: u64 = l.live().map(|h| match h.frag { Frag::Count(Count::Value(n)) => n, _ => 0 }).sum();
     assert_eq!(outstanding_before, outstanding_after, "合成值不变——转授不是 mint 也不是 release");
     l.invariant().unwrap();
     // 转授后池仍然按同一闸门守：再要 1 就超（3+2+1 > 5）。
-    assert_eq!(l.grant("x", "quota", "pool", Frag::Count(Count(1)), "g", None, 1).unwrap_err(), LedgerError::Conflict);
+    assert_eq!(l.grant("x", "quota", "pool", Frag::Count(Count::Value(1)), "g", None, 1).unwrap_err(), LedgerError::Conflict);
     l.release(b, "g", 2).unwrap();
     assert_eq!(l.transfer(b, "g", "other", "fib").unwrap_err(), LedgerError::ForgedHandle, "已释放不可转授");
 }
 
-/// [C2] 开放世界的裸 mint 不是 FPU（存在破坏帧）⇒ 授予必须过发放方闸门；
-/// 闸门内（内核看见全部帧的封闭世界）同一授予合法。
+/// A central capacity check can pass while the proposed Auth update is not FPU.
 #[test]
-fn mint_not_fpu_in_open_world_hence_issuer() {
-    let a = AuthC { cap: Count(5), frag: Count(1) };
-    let b = AuthC { cap: Count(5), frag: Count(4) }; // 裸 mint +3
-    let breaking_frame = AuthC { cap: Count(5), frag: Count(2) };
-    assert!(a.op(&breaking_frame).valid()); // 1+2 ≤ 5
-    assert!(!b.op(&breaking_frame).valid()); // 4+2 > 5 —— FPU 被破坏
+fn capacity_check_does_not_imply_fpu() {
+    let a = AuthC::full(10, Count::Value(3));
+    let b = AuthC::full(10, Count::Value(4));
+    let breaking_frame = AuthC::fragment(7);
+    assert!(can_mint(&Count::Value(10), &[Count::Value(3)], &Count::Value(1)));
+    assert!(a.op(&breaking_frame).valid());
+    assert!(!b.op(&breaking_frame).valid());
     assert!(!fpu_holds(&a, &b, &[breaking_frame]));
-    // 发放方闸门：封闭世界里对照全部 live 碎片检查后，同一授予合法且不变量保持。
-    assert!(can_mint(&Count(5), &[Count(1), Count(2)], &Count(2)));
-    assert!(!can_mint(&Count(5), &[Count(1), Count(2)], &Count(3)));
+    // Complete-ledger accounting separately enforces the pool capacity.
+    assert!(can_mint(&Count::Value(5), &[Count::Value(1), Count::Value(2)], &Count::Value(2)));
+    assert!(!can_mint(&Count::Value(5), &[Count::Value(1), Count::Value(2)], &Count::Value(3)));
 }
 
 /// [T] 基底对账：检出衰变（基底已亡）与账外（基底有而账本无）。

@@ -14,10 +14,10 @@
 //!           ＝n_max。零预算（全 Repeatable）计划的 n_max 仍由它封顶【推导，锚 F1 每实例容量】。
 //!   [Q13]   结账用 F1/F2 已有的词：触发终态＝段主体 teardown（子先于父），③容量置 0（段拆完后
 //!           ③下无存活碎片，置 0 是平凡的 frame-preserving update），②为 `attach/<id>:spent` 下的
-//!           花费行、永不释放（释放即退款，F1 无减法）【推导】。
+//!           花费行在附着存续期保留；不退余额是满额计费政策【设计】。
 //!   [Q14]   ②③同一事务；恢复规则：有②无③的 seq 按"已触发、空跑"计（占 n_max，宁紧勿漏）【设计】。
 //!   [SEQ]   seq_i 从账本行读（fire 碎片行数＋1，行的 generation 记 seq）；nonce_i＝H(h_attach‖seq_i)
-//!           可预测但无妨——它是防重放记账不是秘密（Q10）【推导，锚 F1 后果一】。
+//!           可预测但无妨——它是防重放记账不是秘密（Q10）【推导，锚 F1 行式记账契约】。
 //!   [EMIT-TX] 用户裁定 2026-09-06：触发 fail-stop 撤回**本次触发自己投递的未消费**事件；已消费的
 //!           不可撤（人不能被反通知）；撤回跨主体但有界、可审计【设计，锚裁定四】。
 //!   [LEASE] 附着 ttl＝根持有的租约；到期由 `Ledger::sweep` 释放（唯一到期路径，Q9）。触发段与
@@ -46,7 +46,7 @@ pub const CLASS_SUB: &str = "kernel/subscription";
 pub const CLASS_TIMER: &str = "kernel/timer";
 /// 投递路由（到 user/inbox；detach 只释放它，事件留在收件箱）。
 pub const CLASS_ROUTE: &str = "attach/route";
-/// 收件箱类：M＝Ex 每消费方一份，ρ＝Inverse（未消费事件可撤回）。
+/// 收件箱类：M＝Ex 每消费方一份，ρ＝Inverse（以仍未消费的队列状态为恢复范围；既有观察不撤回）。
 pub const CLASS_INBOX: &str = "kernel/inbox";
 /// powerbox 主体与其根持有（附着由它实例化，裁定二）。
 pub const CLASS_USER_ROOT: &str = "user/root";
@@ -65,8 +65,11 @@ impl Budget {
         self.0.get(class).copied().unwrap_or(0)
     }
     /// F5 application 规则：`scale(N, body) = numeral(N) ~ body`（逐分量乘）。
-    pub fn scale(&self, n: u64) -> Budget {
-        Budget(self.0.iter().map(|(k, v)| (k.clone(), v.saturating_mul(n))).collect())
+    pub fn scale(&self, n: u64) -> Option<Budget> {
+        let scaled: Option<BTreeMap<_, _>> = self.0.iter()
+            .map(|(k, v)| v.checked_mul(n).map(|amount| (k.clone(), amount)))
+            .collect();
+        scaled.map(Budget)
     }
 }
 
@@ -298,6 +301,7 @@ struct InFlight {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AttachError {
+    BudgetOverflow,
     Duplicate,
     Ledger(LedgerError),
 }
@@ -308,7 +312,7 @@ pub struct Scheduler {
     pub attachments: BTreeMap<String, AttachState>,
     pub inbox: Vec<InboxEvent>,
     pub audit: Vec<Audit>,
-    /// `cached_outstanding`：按池实例缓存的存活碎片合计——只是缓存，真相是行（F1 后果一）。
+    /// `cached_outstanding`：按池实例缓存的存活碎片合计——只是缓存，真相是行（F1 行式记账契约）。
     pub cached_outstanding: BTreeMap<String, u64>,
     /// [Q14] ②③是否在同一事务里写入。
     pub transactional: bool,
@@ -404,10 +408,10 @@ impl Scheduler {
         let id = decl.id.clone();
         let h_attach = decl.h_attach();
         // ① 附着池：B_total = scale(n_max, B_firing) ⊕ attach::fire = n_max。
-        let total = decl.budget_firing.scale(decl.n_max);
+        let total = decl.budget_firing.scale(decl.n_max).ok_or(AttachError::BudgetOverflow)?;
         for (class, cap) in total.0.iter().chain(std::iter::once((&FIRE_CLASS.to_string(), &decl.n_max))) {
             self.ledger
-                .set_capacity(CLASS_POOL, &pool_instance(&id, class), Frag::Count(Count(*cap)));
+                .set_capacity(CLASS_POOL, &pool_instance(&id, class), Frag::Count(Count::Value(*cap)));
             self.cached_outstanding.insert(pool_instance(&id, class), 0);
         }
         // 根持有：类＝声明含 T（租约＝ttl）。
@@ -639,7 +643,7 @@ impl Scheduler {
             &spent,
             CLASS_POOL,
             &pool_instance(id, FIRE_CLASS),
-            Frag::Count(Count(1)),
+            Frag::Count(Count::Value(1)),
             &generation,
             None,
             now,
@@ -653,7 +657,7 @@ impl Scheduler {
         for (class, n) in budget.0.iter().filter(|(_, n)| **n > 0) {
             let h = self
                 .ledger
-                .grant(&spent, CLASS_POOL, &pool_instance(id, class), Frag::Count(Count(*n)), &generation, None, now)
+                .grant(&spent, CLASS_POOL, &pool_instance(id, class), Frag::Count(Count::Value(*n)), &generation, None, now)
                 .expect("B_total = scale(n_max, B_firing): a class pool cannot run out before the fire pool");
             spend_rows.push(h);
         }
@@ -681,7 +685,7 @@ impl Scheduler {
         // ---- ③ 触发池（容量＝②的值）＋ 段持有：与②同一事务 ----
         for (class, n) in budget.0.iter().filter(|(_, n)| **n > 0) {
             self.ledger
-                .set_capacity(CLASS_POOL, &firing_pool_instance(id, seq, class), Frag::Count(Count(*n)));
+                .set_capacity(CLASS_POOL, &firing_pool_instance(id, seq, class), Frag::Count(Count::Value(*n)));
             self.cached_outstanding.insert(firing_pool_instance(id, seq, class), 0);
         }
         let h_attach = self.attachments[id].h_attach.clone();
@@ -746,7 +750,7 @@ impl Scheduler {
                 &seg,
                 CLASS_POOL,
                 &firing_pool_instance(id, seq, class),
-                Frag::Count(Count(*n)),
+                Frag::Count(Count::Value(*n)),
                 "eff",
                 Some(seg_holding),
                 now,
@@ -784,7 +788,7 @@ impl Scheduler {
         for h in released {
             if let Some(row) = self.ledger.holding(h) {
                 if row.class_id == CLASS_POOL {
-                    if let Frag::Count(Count(n)) = row.frag {
+                    if let Frag::Count(Count::Value(n)) = row.frag {
                         if let Some(c) = self.cached_outstanding.get_mut(&row.instance) {
                             *c -= n;
                         }
@@ -796,7 +800,7 @@ impl Scheduler {
         for class in classes {
             let inst = firing_pool_instance(id, seq, &class);
             if self.ledger.capacity(CLASS_POOL, &inst).is_some() {
-                self.ledger.set_capacity(CLASS_POOL, &inst, Frag::Count(Count(0)));
+                self.ledger.set_capacity(CLASS_POOL, &inst, Frag::Count(Count::Value(0)));
             }
         }
         let paused = {
@@ -891,7 +895,7 @@ impl Scheduler {
         };
         for class in classes {
             let inst = pool_instance(id, &class);
-            self.ledger.set_capacity(CLASS_POOL, &inst, Frag::Count(Count(0)));
+            self.ledger.set_capacity(CLASS_POOL, &inst, Frag::Count(Count::Value(0)));
             self.cached_outstanding.insert(inst, 0);
         }
         let firing_pools: Vec<String> = self
@@ -904,7 +908,7 @@ impl Scheduler {
             .into_iter()
             .collect();
         for inst in firing_pools {
-            self.ledger.set_capacity(CLASS_POOL, &inst, Frag::Count(Count(0)));
+            self.ledger.set_capacity(CLASS_POOL, &inst, Frag::Count(Count::Value(0)));
             self.cached_outstanding.insert(inst, 0);
         }
         self.queues.remove(id);
@@ -1050,7 +1054,7 @@ impl Scheduler {
     }
 
     // ------------------------------------------------------------------
-    // 真相与缓存（F1 后果一）
+    // 真相与缓存（F1 行式记账契约）
     // ------------------------------------------------------------------
 
     /// outstanding 的真相：按池实例折叠存活碎片行。
@@ -1062,7 +1066,7 @@ impl Scheduler {
             }
         }
         for h in self.ledger.live().filter(|h| h.class_id == CLASS_POOL) {
-            if let Frag::Count(Count(n)) = h.frag {
+            if let Frag::Count(Count::Value(n)) = h.frag {
                 *out.entry(h.instance.clone()).or_insert(0) += n;
             }
         }
@@ -1087,7 +1091,7 @@ impl Scheduler {
     pub fn firing_pool_closed(&self, id: &str, seq: u64, class: &str) -> bool {
         matches!(
             self.ledger.capacity(CLASS_POOL, &firing_pool_instance(id, seq, class)),
-            Some(Frag::Count(Count(0)))
+            Some(Frag::Count(Count::Value(0)))
         )
     }
 
@@ -1107,7 +1111,7 @@ impl Scheduler {
                 _ => None,
             })
             .collect();
-        !crate::auth::can_mint(&cap, &live, &Count(1))
+        !crate::auth::can_mint(&cap, &live, &Count::Value(1))
     }
 
     pub fn nonces(&self, id: &str) -> Vec<String> {
@@ -1171,7 +1175,7 @@ impl Scheduler {
                     return Err(format!("{id}: terminal but live rows remain"));
                 }
                 for class in a.decl.budget_firing.0.keys().chain(std::iter::once(&FIRE_CLASS.to_string())) {
-                    if self.ledger.capacity(CLASS_POOL, &pool_instance(id, class)) != Some(&Frag::Count(Count(0))) {
+                    if self.ledger.capacity(CLASS_POOL, &pool_instance(id, class)) != Some(&Frag::Count(Count::Value(0))) {
                         return Err(format!("{id}: terminal but pool {class} not closed"));
                     }
                 }

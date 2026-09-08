@@ -37,7 +37,7 @@ fn workspace_entry_passes_all_frozen_gates() {
     for (c, i) in [("tap", "tap0"), ("rootfs-overlay", "ov-1"), ("snapshot", "snap-0"), ("mount", "m-1"), ("proc", "shell")] {
         l.grant("agent", c, i, Frag::Ex(Ex::Token), "g", Some(vm), 0).unwrap();
     }
-    l.grant("agent", "vcpu", "host", Frag::Count(portos_rm::ra::Count(2)), "g", Some(vm), 0).unwrap();
+    l.grant("agent", "vcpu", "host", Frag::Count(portos_rm::ra::Count::Value(2)), "g", Some(vm), 0).unwrap();
     l.grant("agent", "image", "ubuntu-24.04", Frag::Set(portos_rm::ra::GSet::of(&["ro"])), "g", Some(vm), 0).unwrap();
     l.grant("other", "image", "ubuntu-24.04", Frag::Set(portos_rm::ra::GSet::of(&["ro"])), "g", None, 0).unwrap(); // 镜像可复制共享
     l.invariant().unwrap();

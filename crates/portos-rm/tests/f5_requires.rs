@@ -16,7 +16,7 @@ use portos_rm::verbs::*;
 // 固定键集 K={p,q} 的向量取 0..=2 × 0..=2（它是 Counting²，逐分量 Definition 1）。
 // ---------------------------------------------------------------------------
 fn counting_carrier() -> Vec<Counting> {
-    (0..=5).map(Counting).collect()
+    (0..=5).map(Counting::new).collect()
 }
 fn flat_carrier(universe: &[&str]) -> Vec<Flat> {
     let n = universe.len();
@@ -55,7 +55,7 @@ fn fixed2_carrier() -> Vec<Fixed2> {
     let mut v = Vec::new();
     for a in 0..=2u64 {
         for b in 0..=2u64 {
-            v.push(Fixed2(Counting(a), Counting(b)));
+            v.push(Fixed2(Counting::new(a), Counting::new(b)));
         }
     }
     v
@@ -172,7 +172,7 @@ fn budget_vector_is_a_semimodule_over_counting() {
         }
     }
     // 缺席与 0 同一：{p:0,q:1} 与 {q:1} 相等，且 leq 两向皆成立。
-    let explicit = Budget([("p".to_string(), Counting(0)), ("q".to_string(), Counting(1))].into_iter().collect());
+    let explicit = Budget([("p".to_string(), Counting::new(0)), ("q".to_string(), Counting::new(1))].into_iter().collect());
     let sparse = Budget::of(&[("q", 1)]);
     assert!(explicit.leq(&sparse) && sparse.leq(&explicit));
     assert_eq!(explicit.merge(&Budget::zero()), sparse, "经运算规范化后表示同一");
@@ -192,18 +192,18 @@ fn budget_vector_is_a_semimodule_over_counting() {
 #[test]
 fn loop_scaling_is_application_rule_numeral_seq_body() {
     for n in 0..=5u64 {
-        assert_eq!(Counting::numeral(n), Counting(n), "counting 的 numeral 就是数字");
+        assert_eq!(Counting::numeral(n), Counting::new(n), "counting 的 numeral 就是数字");
         assert_eq!(Flat::numeral(n), Flat::empty(), "flat 的 numeral 恒为 ∅");
         for body in 0..=4u64 {
-            let b = Counting(body);
-            assert_eq!(Counting::scale(n, &b), Counting(n * body));
+            let b = Counting::new(body);
+            assert_eq!(Counting::scale(n, &b), Counting::new(n * body));
             let mut rep = Counting::ign();
             for _ in 0..n {
                 rep = rep.merge(&b);
             }
             assert_eq!(Counting::scale(n, &b), rep, "缩放 ≠ N 次合并——分配律被破坏");
             for m in 0..=3u64 {
-                assert_eq!(Counting::scale(n, &Counting::scale(m, &b)), Counting(n * m * body), "嵌套循环界相乘");
+                assert_eq!(Counting::scale(n, &Counting::scale(m, &b)), Counting::new(n * m * body), "嵌套循环界相乘");
             }
         }
     }
@@ -332,7 +332,7 @@ fn consent_monotonicity_downset() {
     assert!(admit_plan(&plan, &lookup, &ceil, &Flat::empty(), &Budget::of(&[("h::a", 7), ("h::b", 1)])).is_ok());
     assert_eq!(
         admit_plan(&plan, &lookup, &ceil, &Flat::empty(), &Budget::of(&[("h::a", 2)])),
-        Err(AdmitError::OverBudget { class: "h::a".into(), demand: 3, budget: 2 })
+        Err(AdmitError::OverBudget { class: "h::a".into(), demand: 3u64.into(), budget: 2u64.into() })
     );
 }
 
@@ -349,7 +349,7 @@ fn budget_is_per_effect_class_not_a_total() {
     assert_eq!(d.uses.total(), consent.total(), "总量恰好相等——单计数会误判为在预算内");
     assert_eq!(
         admit_plan(&five_clicks, &lookup, &ceil, &Flat::empty(), &consent),
-        Err(AdmitError::OverBudget { class: "page::click".into(), demand: 5, budget: 4 }),
+        Err(AdmitError::OverBudget { class: "page::click".into(), demand: 5u64.into(), budget: 4u64.into() }),
         "逐类判定：click 超了就是超了，send 的余额救不了它"
     );
     let four_and_one = Plan::Seq(vec![Plan::loop_(4, Plan::verb("page", "click")), Plan::verb("page", "send")]);
@@ -358,7 +358,7 @@ fn budget_is_per_effect_class_not_a_total() {
     let stray = Plan::verb("page", "delete");
     assert_eq!(
         admit_plan(&stray, &lookup, &ceil, &Flat::empty(), &consent),
-        Err(AdmitError::OverBudget { class: "page::delete".into(), demand: 1, budget: 0 })
+        Err(AdmitError::OverBudget { class: "page::delete".into(), demand: 1u64.into(), budget: 0u64.into() })
     );
 }
 
@@ -386,29 +386,29 @@ fn repeatable_verbs_cost_zero_via_truth_table() {
     assert!(admit_plan(&reads, &lookup, &ceil, &Flat::empty(), &Budget::zero()).is_ok(), "零预算也能读");
     assert_eq!(
         admit_plan(&clicks, &lookup, &ceil, &Flat::empty(), &Budget::zero()),
-        Err(AdmitError::OverBudget { class: "page::click".into(), demand: 1000, budget: 0 })
+        Err(AdmitError::OverBudget { class: "page::click".into(), demand: 1000u64.into(), budget: 0u64.into() })
     );
 }
 
 /// [TWO] 预算半环与 F1 `Count` RA 是同一幺半群的两读（theory-spec §3.2）：
 /// ⊕ 逐点＝`Count::op`；≤ 逐点＝`≼`；"某类 demand ∈ ↓B" 逐点＝`auth_valid(● B, ◯ demand)`；
-/// 且 F3 的花费闸门 `can_mint(● B, 已花, 再花)` ＝ 本模块对累计需求的 ↓B 判定——同一个谓词，
+/// 且 F3 的花费闸门 `can_mint(● B, 已花, 再花)` ＝ 本模块对累计需求的 ↓B 判定——可表示数值范围内的同一上界谓词，
 /// 逐效应类各自成立（每类一个池，正是 F3 per-nonce 池的逐类形态）。
 #[test]
 fn budget_merge_is_count_ra_op_and_downset_is_auth_valid() {
     for n in 0..=6u64 {
         for m in 0..=6u64 {
-            assert_eq!(Counting(n).merge(&Counting(m)).0, Count(n).op(&Count(m)).0, "⊕ ≠ Count::op");
-            assert_eq!(Counting(n).leq(&Counting(m)), Count(n).included_in(&Count(m)), "≤ ≠ ≼");
+            assert_eq!(Counting::new(n).merge(&Counting::new(m)).value(), Count::Value(n).op(&Count::Value(m)).value(), "⊕ ≠ Count::op within the representable range");
+            assert_eq!(Counting::new(n).leq(&Counting::new(m)), Count::Value(n).included_in(&Count::Value(m)), "≤ ≠ ≼");
             let demand = Budget::of(&[("k", n)]);
             let bound = Budget::of(&[("k", m)]);
-            assert_eq!(demand.leq(&bound), auth_valid(&Count(m), &Some(Count(n))), "↓B ≠ auth_valid");
+            assert_eq!(demand.leq(&bound), auth_valid(&Count::Value(m), &Some(Count::Value(n))), "↓B ≠ auth_valid");
         }
     }
     for b in 0..=6u64 {
         for spent in 0..=6u64 {
             for cost in 0..=3u64 {
-                let gate = can_mint(&Count(b), &[Count(spent)], &Count(cost));
+                let gate = can_mint(&Count::Value(b), &[Count::Value(spent)], &Count::Value(cost));
                 let admit = Budget::of(&[("k", spent)]).merge(&Budget::of(&[("k", cost)])).leq(&Budget::of(&[("k", b)]));
                 assert_eq!(gate, admit, "B={b} spent={spent} cost={cost}");
             }

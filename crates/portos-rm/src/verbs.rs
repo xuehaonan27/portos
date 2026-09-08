@@ -22,7 +22,7 @@
 //!   [D1]    位置判据（theory-spec §1.2；Plotkin–Pretnar "含义由 handler 赋予"）【文献✓】：
 //!           动词性格随 (handler, 动词) 对——表以 (class, verb) 为键，投影按类。
 //!   [TRI]   动词三分类 可重复/消耗/发射（endstate §8.3）【设计＋推导】：
-//!           可重复＝不动世界、盲重放安全；消耗＝线性（读两次≠读一次）；发射＝w-effect，
+//!           可重复＝不动世界、盲重放安全；消耗＝新的调用消耗资源，重试可凭操作标识去重；发射＝w-effect，
 //!           是影子、不入 RA。
 //!   [ρ]     持有的可逆档 ρ 是**类**对世界的关系（theory-spec §2.5：release∘acquire≈id
 //!           在哪个等价下成立）【文献✓（TISSEC 2.5 警告）＋推导】——注册期固定、
@@ -87,7 +87,9 @@ pub struct VerbEntry {
     pub kind: Kind,
     /// E 等式：幂等 ⇒ 盲重放许可（F1 release 幂等、F2 盲重放同源）。
     pub idempotent: bool,
-    /// E 等式：与同类动作（就世界状态而言）可交换 ⇒ 并行/乱序许可（F2 T43 前提）。
+    /// Summary of a declared commutation law, including its operation pairs,
+    /// parameters, observations and inverse interactions. The flag alone does
+    /// not establish the independence required by F2/T43.
     pub commutes: bool,
     /// [EDIT] 降档声明：越界时可改写为同类的哪个动词（F3 Policy.degrade 的来源）。
     pub degrade: Option<String>,
@@ -141,7 +143,7 @@ impl VerbEntry {
     ///     但结果依赖交错，声明 commutes=false——不许被当作可乱序/并行重排的项。
     ///     （B11：v2 曾把 §8.1b 对不可变源的断言推广到全部可重复读，强于来源，且让第二等
     ///     通道无处安放——措辞纪律，与 B1 同类。）
-    ///   · 消耗 ⟹ ¬幂等（§8.3"每条消息恰好消费一次"＝线性，读两次≠读一次）。
+    ///   · 消耗：不加幂等旗标约束；新的消费与同一请求的幂等重试是不同概念。
     ///   · 发射：不加旗标约束（带幂等键的 PUT 是幂等发射，合法）。
     ///   · 界内变换：不加旗标约束（chmod 幂等、append 不幂等，皆合法）；类级约束在 register。
     /// 不主张的：可重复 ⇔ 某代数（可重复观察独占资源不要求资源可复制——那会 overstate）。
@@ -149,9 +151,6 @@ impl VerbEntry {
         match self.kind {
             Kind::Repeatable if !self.idempotent => {
                 Err(VerbError::Incoherent("repeatable verb must be idempotent (blind-replay safe)"))
-            }
-            Kind::Consuming { .. } if self.idempotent => {
-                Err(VerbError::Incoherent("consuming read is linear, cannot be idempotent (§8.3)"))
             }
             _ => Ok(()),
         }

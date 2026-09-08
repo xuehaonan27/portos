@@ -26,7 +26,7 @@
 //!   [WYS]   WYSIWYS 四元组 (plan_hash, budget, nonce, ttl)：同意可判定——准入闸
 //!           只看四元组与计划字节哈希；哈希不符/nonce 重放/ttl 过期 ⇒ 0 个效应。
 //!   [GATE]  预算＝counting capability 的塌缩（effect-plan §5.5）在 F1 语义下的
-//!           正名：同意即铸造预算池（● 容量），花费即碎片行（◯，一行一笔，无减法），
+//!           正名：同意即铸造预算池（● 容量），花费即碎片行（◯，一行一笔，按结算契约留存），
 //!           闸门即发放方闸门（can_mint 全量合成检查）。透支不是"扣减失败"，
 //!           是 mint 被拒。
 //!   [ESC]   escalate 超界语义（effect-plan §6.3 / m0 收尾清单#2）：停下——增量同意
@@ -37,7 +37,7 @@
 //!           （roadmap Phase C"不做"、Phase D 解锁的那一项）。
 //!   [LOUD]  截断/降档/改写/回滚一律入 trace——绝不静默（审计观）。
 //!   [SEG-TX] 段＝事务（决策 4，用户裁定 2026-09-05）：段内获取侧持有记在 `{fiber}:seg` 主体；
-//!           commit（Completed）⇒ 段内持有全部转授给 fiber（F1 `transfer`，FPU 平凡成立）；
+//!           commit（Completed）⇒ 段内持有全部转授给 fiber（F1 `transfer`，聚合值不变，parent 依赖保持）；
 //!           任何非 commit 终态（FailStop／Truncated／Aborted）⇒ 段内未提前 promote 的持有由
 //!           **monitor 自己**回滚（经 F2 teardown），不靠上层记得调；`promote`＝提前 commit 一笔，
 //!           使其在之后的 abort 中幸存。一条路径，与 crash-only 同形。
@@ -302,7 +302,7 @@ impl Monitor {
     fn mint_pool(&mut self, c: &Consent) {
         self.orch
             .ledger
-            .set_capacity("budget", &c.nonce, Frag::Count(Count(c.budget)));
+            .set_capacity("budget", &c.nonce, Frag::Count(Count::Value(c.budget)));
         self.used_nonces.insert(c.nonce.clone());
         self.active_pool = c.nonce.clone();
     }
@@ -337,13 +337,13 @@ impl Monitor {
         Ok(())
     }
 
-    /// [GATE] 花费＝碎片行的 mint：无减法，透支＝发放方闸门拒绝。
+    /// [GATE] 花费＝碎片行的 mint：完整账本检查拒绝透支。
     fn spend(&mut self, cost: u64, now: u64) -> Result<(), LedgerError> {
         let pool = self.active_pool.clone();
         let spender = format!("{}:spent", self.fiber);
         self.orch
             .ledger
-            .grant(&spender, "budget", &pool, Frag::Count(Count(cost)), "consent", None, now)
+            .grant(&spender, "budget", &pool, Frag::Count(Count::Value(cost)), "consent", None, now)
             .map(|_| ())
     }
 
@@ -354,7 +354,7 @@ impl Monitor {
             .live()
             .filter(|h| h.class_id == "budget" && h.instance == nonce)
             .map(|h| match &h.frag {
-                Frag::Count(Count(n)) => *n,
+                Frag::Count(Count::Value(n)) => *n,
                 _ => 0,
             })
             .sum()
@@ -571,7 +571,7 @@ impl Monitor {
         Ok(())
     }
 
-    /// [SEG-TX] commit：段内剩余持有全部转授给 fiber（一笔一转，碎片不变、FPU 平凡成立）；
+    /// [SEG-TX] commit：段内剩余持有全部转授给 fiber（一笔一转，碎片不变、聚合值不变，parent 依赖保持）；
     /// 界内变换的触及清单作废（不 restore）；状态 Done(Completed)。
     fn finish_commit(&mut self) {
         let seg = self.seg_subject();

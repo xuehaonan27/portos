@@ -42,7 +42,7 @@ fn ra_laws_all_triples<A: Ra>(elems: &[A]) -> usize {
 
 /// [RA] 区间与分数满足 F1 采纳的全部 RA 公理（Iris TR appendix-4.5）；≼ 的定义逐对核对：
 /// 区间：a ≼ b ⟺ ∃c. b = a·c（载体含全部补集，故可穷举 c）；
-/// 分数：取自反闭包（与 F1 对 Ex 的申报同款；Iris 原为严格 <），a ≼ b ⟺ a ≤ b。
+/// 分数：基元上为严格包含，Option<Frac> 上自然获得自反性。
 #[test]
 fn ranges_and_frac_satisfy_ra_laws_and_inclusion_definition() {
     let rs = ranges_carrier();
@@ -72,11 +72,9 @@ fn ranges_and_frac_satisfy_ra_laws_and_inclusion_definition() {
             if !a.valid() || !b.valid() {
                 continue;
             }
-            let leq = a.num as u128 * b.den as u128 <= b.num as u128 * a.den as u128;
-            assert_eq!(a.included_in(b), leq, "分数 ≼ ≠ ≤：{a:?} {b:?}");
-            if a.included_in(b) && a != b {
-                assert!(fs.iter().any(|c| c.valid() && a.op(c) == *b), "严格小于时应存在补差 c：{a:?} < {b:?}");
-            }
+            let exists_c = fs.iter().any(|c| c.valid() && a.op(c) == *b);
+            assert_eq!(a.included_in(b), exists_c, "分数包含关系与补差不符：{a:?} {b:?}");
+            assert_eq!(Some(a.clone()).included_in(&Some(b.clone())), a == b || exists_c);
         }
     }
     assert!(!Frac::new(1, 2).op(&Frac::new(2, 3)).valid(), "1/2 + 2/3 > 1 非法");

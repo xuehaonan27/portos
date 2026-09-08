@@ -6,11 +6,11 @@ description = "PortOS resource-management laws (可运行的法则表): F1 ledge
 
 [features]
 default = ["plan-shapes", "attach"]
-# D31 隔离区：计划形状（Plan AST、demand_sum、admit_plan、check_plan…）仍在讨论中。
-# 内核以 `default-features = false` 依赖本 crate，于是在编译期就不能依赖它们；法则测试默认开启。
+# 计划形状与分析 API；D41 已解除 D31 隔离，内核显式开启此 feature。
 plan-shapes = []
-# F8 附着演练（attachments-v0.md v0.5 的行形）。与计划形状同属 D31 隔离区：内核
-# `default-features = false` ⇒ 编译期看不见它；法则测试默认开启。
+# F8 附着演练（attachments-v0.md v0.5 的行形）；内核未开启，法则测试默认开启。
 attach = []
 
 [dependencies]
+num-bigint = "0.4"
+num-rational = "0.4"

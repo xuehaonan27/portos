@@ -75,8 +75,8 @@ pub fn workspace() -> Entry {
     class(&mut l, "vcpu", AlgebraTag::Counted, None, RevertGrade::Inverse);
     class(&mut l, "mem-mib", AlgebraTag::Counted, None, RevertGrade::Inverse);
     class(&mut l, "image", AlgebraTag::Set, None, RevertGrade::Inverse); // 只读镜像：可复制共享
-    l.set_capacity("vcpu", "host", Frag::Count(Count(16)));
-    l.set_capacity("mem-mib", "host", Frag::Count(Count(32768)));
+    l.set_capacity("vcpu", "host", Frag::Count(Count::Value(16)));
+    l.set_capacity("mem-mib", "host", Frag::Count(Count::Value(32768)));
     l.set_capacity("image", "ubuntu-24.04", Frag::Set(GSet::of(&["ro"])));
     for (c, i) in [("enclosure", "ws-1"), ("vm", "vm-1"), ("tap", "tap0"), ("rootfs-overlay", "ov-1"),
                    ("snapshot", "snap-0"), ("mount", "m-1"), ("proc", "shell")] {
@@ -161,7 +161,7 @@ pub fn rdma() -> Entry {
     l.set_capacity("qp", "qp-1", Frag::Ex(Ex::Token));
     l.set_capacity("mr", "buf-A", Frag::Range(Ranges::of(&[(0, 8192)]))); // 8 KiB 缓冲区
     l.set_capacity("mr-read", "buf-A", Frag::Frac(Frac::one()));
-    l.set_capacity("memlock-kib", "proc", Frag::Count(Count(65536)));
+    l.set_capacity("memlock-kib", "proc", Frag::Count(Count::Value(65536)));
 
     let mut t = VerbTable::new();
     for c in ["device", "pd", "cq", "qp", "mr", "mr-read"] {

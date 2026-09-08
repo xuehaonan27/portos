@@ -222,14 +222,14 @@ fn check(m: &Monitor, archs: &[Arch], mode: Mode, ending: Ending, w: &mut Witnes
     }
 
     // 【预算守恒＝发放方闸门】真实发射的合计费用 == 账本中花费行折叠（行为真相，
-    // 无减法）；账本全局不变量成立。替身与被压制件零花费。
+    // 按计费政策留存）；账本全局不变量成立。替身与被压制件零花费。
     let spent: u64 = m
         .orch
         .ledger
         .live()
         .filter(|h| h.class_id == "budget")
         .map(|h| match &h.frag {
-            portos_rm::ledger::Frag::Count(portos_rm::ra::Count(n)) => *n,
+            portos_rm::ledger::Frag::Count(portos_rm::ra::Count::Value(n)) => *n,
             _ => 0,
         })
         .sum();

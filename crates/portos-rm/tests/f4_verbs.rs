@@ -71,7 +71,7 @@ fn browser_verb_table() -> VerbTable {
 ///     共享可变源读 commutes=false；v2 的"可重复⟹交换"把 §8.1b 对不可变源的断言推广到全部
 ///     可重复读，强于来源，且让 §8.1b 第二等通道无处安放）；
 ///   · 界内变换：不加旗标约束（chmod 幂等、append 不幂等）——4 格都收；类级约束在 register；
-///   · 消耗 ⟹ ¬幂等（§8.3 线性）——每种世界档 4 格收 2；
+///   · 消耗：允许声明同一请求的幂等重试——每种世界档 4 格都收；
 ///   · 发射：不加旗标约束（带幂等键的 PUT 是幂等发射）——每格都收。
 /// 曾经的运行时校验"发射∧有逆"、"发射∧Held"、"可重复带世界档"在 v2 由类型排除，
 /// 已不在格点内（不可表示 ＞ 被拒）。
@@ -92,7 +92,7 @@ fn coherence_lattice_exhaustive_over_kind_and_flags() {
         match kind {
             Kind::Repeatable => idem,
             Kind::Transforming => true,
-            Kind::Consuming { .. } => !idem,
+            Kind::Consuming { .. } => true,
             Kind::Emitting { .. } => true,
         }
     };
@@ -109,7 +109,7 @@ fn coherence_lattice_exhaustive_over_kind_and_flags() {
         }
     }
     assert_eq!(cells, 36, "格点被收缩");
-    assert_eq!(accepted, 2 + 4 + 3 * 2 + 4 * 4, "接受集大小＝2（可重复）＋4（界内变换）＋6（消耗）＋16（发射）");
+    assert_eq!(accepted, 2 + 4 + 3 * 4 + 4 * 4, "接受集大小＝2（可重复）＋4（界内变换）＋12（消耗）＋16（发射）");
 
     // B11 的存在证据：endstate §8.1b 四等通道里的第二等（共享可变源读）现在可表达——
     // 不进预算、盲重放安全，但不可交换；第一等（不可变源读）仍是 commutes=true。

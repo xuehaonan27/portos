@@ -29,6 +29,24 @@ fn manual(id: &str, budget: &[(&str, u64)], n_max: u64) -> Declaration {
     decl(id, Trigger::Manual, budget, n_max)
 }
 
+#[test]
+fn total_budget_overflow_refuses_attachment_before_creating_pools() {
+    let mut s = Scheduler::new(true);
+    let initial_holdings = s.ledger.live_count();
+    assert_eq!(
+        s.attach(manual("overflow", &[(NAV, u64::MAX)], 2), 0),
+        Err(AttachError::BudgetOverflow)
+    );
+    assert!(s.attachments.is_empty());
+    assert_eq!(s.ledger.live_count(), initial_holdings);
+    assert!(s.cached_outstanding.is_empty());
+    assert!(s.audit.is_empty());
+    assert!(s.invariants().is_ok());
+    // Refusal must also leave the declaration ID reusable.
+    s.attach(manual("overflow", &[(NAV, 1)], 2), 0).unwrap();
+    assert!(s.invariants().is_ok());
+}
+
 /// [Q12] 回归 a：零预算（全 Repeatable）计划的 n_max 仍经 `attach::fire` 分量封顶；
 /// 有预算的计划由 fire 分量与类分量同时封顶。
 #[test]

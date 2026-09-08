@@ -47,7 +47,7 @@ CREATE INDEX journal_open ON teardown_journal(subject) WHERE state IN ('pending'
 
 -- F3 同意四元组（WYSIWYS）。预算池不在此表：同意即铸造 ——
 -- authoritative 落一行 (class_id='budget', instance=nonce, capacity=Count(B))，
--- 花费即 holding 行（一行一笔，无减法）；本表只承载四元组与生命周期。
+-- 花费即 holding 行（一行一笔，按生命周期契约结算）；本表只承载四元组与生命周期。
 CREATE TABLE consent (
   nonce               TEXT PRIMARY KEY,   -- 一次性；重放 = 主键冲突（StaleNonce 的落库形态）
   plan_hash           TEXT NOT NULL,      -- 计划字节的 CAS id（WYSIWYS：展示=执行）

@@ -20,9 +20,9 @@
 //!   - **Built-in resource classes** (档 0, handler = the kernel itself):
 //!       `kernel/cap-count`   capability counting budgets — one capacity row
 //!                            per (cap, verb) pool, one spend row per
-//!                            exercise; the balance is only ever recomputed
-//!                            (F1 consequence 1: no subtraction) and the gate
-//!                            is the issuer gate `can_mint` (consequence 2).
+//!                            exercise; the balance is recomputed from the rows
+//!                            as a lifecycle accounting policy. Grants check the
+//!                            complete composition against the pool's capacity.
 //!                            Replaces the in-place decrement (roadmap H.2-1).
 //!       `kernel/plugin`      one exclusive holding per spawned plugin
 //!                            instance, generation = the spawn token; released
@@ -323,7 +323,7 @@ impl LedgerStore {
         self.inner.lock().unwrap().set_capacity(
             CLASS_CAP_COUNT,
             &pool_instance(cap_id, verb),
-            Frag::Count(Count(capacity)),
+            Frag::Count(Count::Value(capacity)),
         );
     }
 
@@ -341,7 +341,7 @@ impl LedgerStore {
 
     /// Mint several spend rows atomically (WP-06 plan runs, WP-08 firings:
     /// the rows of one compound action commit together or not at all). One
-    /// row per entry, carrying `Count(n)`; zero-count entries spend nothing
+    /// row per entry, carrying `Count::Value(n)`; zero-count entries spend nothing
     /// and mint no row. Returns the minted row ids in entry order. A refusal
     /// by the issuer gate on any entry rolls the whole batch back.
     pub fn spend_many(
@@ -362,7 +362,7 @@ impl LedgerStore {
                         &spender,
                         CLASS_CAP_COUNT,
                         &pool_instance(cap_id, verb),
-                        Frag::Count(Count(*n)),
+                        Frag::Count(Count::Value(*n)),
                         SPEND_GENERATION,
                         None,
                         now,
@@ -378,7 +378,7 @@ impl LedgerStore {
     }
 
     /// The spent total of a pool: a fold over its live spend rows — never a
-    /// cached counter (F1 consequence 1).
+    /// cached counter (the ledger's representation policy).
     pub fn spent(&self, cap_id: &str, verb: &str) -> u64 {
         let instance = pool_instance(cap_id, verb);
         self.inner
@@ -387,7 +387,7 @@ impl LedgerStore {
             .live()
             .filter(|h| h.class_id == CLASS_CAP_COUNT && h.instance == instance)
             .map(|h| match &h.frag {
-                Frag::Count(Count(n)) => *n,
+                Frag::Count(Count::Value(n)) => *n,
                 _ => 0,
             })
             .sum()
@@ -936,16 +936,24 @@ fn state_str(s: JState) -> &'static str {
     }
 }
 
-/// Fragment serialization for the rows table. The RA library of the law
-/// crate is dependency-free, so the wire form lives here.
+/// Fragment serialization for the rows table. Keep small fraction parts as JSON
+/// numbers for compatibility; larger exact parts use decimal strings.
 pub fn frag_to_json(f: &Frag) -> String {
     let v = match f {
         Frag::Ex(Ex::Token) => json!({"ex": "token"}),
         Frag::Ex(Ex::Bot) => json!({"ex": "bot"}),
-        Frag::Count(Count(n)) => json!({"count": n}),
+        Frag::Count(Count::Value(n)) => json!({"count": n}),
+        Frag::Count(Count::Invalid) => json!({"count": "invalid"}),
         Frag::Set(GSet(s)) => json!({"set": s.iter().collect::<Vec<_>>()}),
         Frag::Range(r) => json!({"range": r.spans, "bot": r.bot}),
-        Frag::Frac(q) => json!({"frac": [q.num, q.den]}),
+        Frag::Frac(q) => {
+            let (num, den) = q.parts();
+            let part = |s: String| match s.parse::<u64>() {
+                Ok(n) => json!(n),
+                Err(_) => json!(s),
+            };
+            json!({"frac": [part(num), part(den)]})
+        }
     };
     v.to_string()
 }
@@ -957,7 +965,10 @@ pub fn frag_from_json(s: &str) -> Result<Frag, KernelError> {
         return Ok(Frag::Ex(if ex == "token" { Ex::Token } else { Ex::Bot }));
     }
     if let Some(n) = v.get("count").and_then(|x| x.as_u64()) {
-        return Ok(Frag::Count(Count(n)));
+        return Ok(Frag::Count(Count::Value(n)));
+    }
+    if v.get("count").and_then(|x| x.as_str()) == Some("invalid") {
+        return Ok(Frag::Count(Count::Invalid));
     }
     if let Some(items) = v.get("set").and_then(|x| x.as_array()) {
         return Ok(Frag::Set(GSet(
@@ -975,9 +986,18 @@ pub fn frag_from_json(s: &str) -> Result<Frag, KernelError> {
         }));
     }
     if let Some(q) = v.get("frac").and_then(|x| x.as_array()) {
-        let num = q.first().and_then(|n| n.as_u64()).unwrap_or(0);
-        let den = q.get(1).and_then(|d| d.as_u64()).unwrap_or(1);
-        return Ok(Frag::Frac(Frac::new(num, den.max(1))));
+        let part = |v: &Value| {
+            v.as_u64().map(|n| n.to_string())
+                .or_else(|| v.as_str().map(str::to_owned))
+        };
+        let parsed = (|| {
+            if q.len() != 2 {
+                return None;
+            }
+            Frac::from_parts(&part(&q[0])?, &part(&q[1])?)
+        })();
+        return parsed.map(Frag::Frac)
+            .ok_or_else(|| KernelError::Corrupt(format!("holding fraction: {s}")));
     }
     Err(KernelError::Corrupt(format!("unknown holding fragment: {s}")))
 }
@@ -985,6 +1005,7 @@ pub fn frag_from_json(s: &str) -> Result<Frag, KernelError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use portos_rm::ra::Ra;
 
     fn store(tag: &str) -> (Arc<Mutex<Connection>>, std::path::PathBuf) {
         let root = std::env::temp_dir().join(format!("portos-ledger-{}-{}", tag, std::process::id()));
@@ -998,18 +1019,25 @@ mod tests {
     fn fragments_round_trip_through_json() {
         let all = [
             Frag::Ex(Ex::Token),
-            Frag::Count(Count(7)),
+            Frag::Count(Count::Value(7)),
+            Frag::Count(Count::Value(u64::MAX)),
+            Frag::Count(Count::Invalid),
             Frag::Set(GSet::of(&["a", "b"])),
             Frag::Range(Ranges::of(&[(0, 8), (16, 32)])),
             Frag::Frac(Frac::new(2, 6)),
+            Frag::Frac(Frac::invalid()),
+            Frag::Frac(Frac::new(1, 2).op(&Frac::new(1, u64::MAX))),
         ];
         for f in all {
             assert_eq!(frag_from_json(&frag_to_json(&f)).unwrap(), f);
         }
+        assert_eq!(frag_from_json(r#"{"frac":[2,6]}"#).unwrap(), Frag::Frac(Frac::new(1, 3)));
+        assert!(frag_from_json(r#"{"frac":[1,0]}"#).is_err());
+        assert!(frag_from_json(r#"{"frac":[1]}"#).is_err());
     }
 
     /// Spend rows are the truth and survive a reopen: the pool continues where
-    /// it was, and the gate refuses at capacity (no subtraction anywhere).
+    /// it was, and the gate refuses at capacity.
     #[test]
     fn spend_rows_persist_and_gate_refuses_at_capacity() {
         let (db, root) = store("spend");
@@ -1029,6 +1057,34 @@ mod tests {
         assert!(matches!(e, KernelError::Denied(_)), "third spend refused by the issuer gate");
         assert_eq!(l.spent("cap_x", "emit"), 2);
         assert_eq!(l.counts(CLASS_CAP_COUNT), (2, 0));
+        l.invariant().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn count_overflow_refuses_atomically_and_survives_reopen() {
+        let (db, root) = store("count-overflow");
+        {
+            let (l, _) = LedgerStore::open(db.clone()).unwrap();
+            l.set_pool("cap_max", "use", u64::MAX);
+            let err = l.spend_many("user", &[("cap_max", "use", u64::MAX), ("cap_max", "use", 1)], 1).unwrap_err();
+            assert!(matches!(err, KernelError::Denied(_)));
+            assert_eq!(l.spent("cap_max", "use"), 0);
+            assert_eq!(l.counts(CLASS_CAP_COUNT), (0, 0));
+        }
+        {
+            let (l, _) = LedgerStore::open(db.clone()).unwrap();
+            l.set_pool("cap_max", "use", u64::MAX);
+            assert_eq!(l.spent("cap_max", "use"), 0);
+            l.spend_many("user", &[("cap_max", "use", u64::MAX)], 2).unwrap();
+            assert!(l.spend("user", "cap_max", "use", 3).is_err());
+            assert_eq!(l.spent("cap_max", "use"), u64::MAX);
+            l.invariant().unwrap();
+        }
+        let (l, _) = LedgerStore::open(db).unwrap();
+        l.set_pool("cap_max", "use", u64::MAX);
+        assert_eq!(l.spent("cap_max", "use"), u64::MAX);
+        assert!(l.spend("user", "cap_max", "use", 4).is_err());
         l.invariant().unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1123,7 +1179,7 @@ mod tests {
                         "plugin:x",
                         CLASS_CAP_COUNT,
                         &pool_instance("cap_x", "emit"),
-                        Frag::Count(Count(1)),
+                        Frag::Count(Count::Value(1)),
                         "g",
                         None,
                         1,

@@ -1,5 +1,4 @@
-//! Resource algebra (RA) — adopted from the Iris Technical Reference (appendix-4.5,
-//! read 2026-08-30; see design/theory-spec-v0.md §2.2 for the frozen source).
+//! Resource algebra (RA), following Iris 4.5 §2.3 and `.dev/design/spec.md` §2.2.
 //!
 //! Adopted laws (the ones the tests in `tests/f1_ledger.rs` enforce):
 //!   assoc      : (a·b)·c = a·(b·c)
@@ -7,15 +6,21 @@
 //!   valid-op-l : ✓(a·b) ⇒ ✓a
 //!   core-id    : |a|·a = a            (where pcore is defined)
 //!   core-idem  : ||a|| = |a|
-//!   core-mono  : a ≼ b ⇒ |a| ≼ |b|
-//!   incl       : a ≼ b ⟺ ∃c. b = a·c  (per-algebra realization; documented where no unit exists)
+//!   core-mono  : |a| defined ∧ a ≼ b ⇒ |b| defined ∧ |a| ≼ |b|
+//!   incl       : a ≼ b ⟺ ∃c ∈ M. b = a·c
 //!
-//! Deliberate representation choices (declared deviations, see freeze record):
+//! Representation choices:
 //!   * `op` is TOTAL and invalid compositions are explicit elements (Iris style),
 //!     rather than a partial PCM `Option<Self>`. Validity does the exclusion work.
-//!   * Cancellativity is NOT assumed anywhere (Iris drops it). Consequence for the
-//!     ledger: fragments must be stored per-row (release = drop a row), because
-//!     algebraic subtraction does not exist in general. See ledger.rs.
+//!   * Cancellativity is not required; particular instances may support subtraction.
+//!     Keeping each holding is the ledger's choice for ownership and lifecycle tracking.
+//!   * `Option<A>` adds the empty unit used by the ledger's capacity predicate.
+//!     Base Ex/Frac keep their non-reflexive inclusion relation on valid elements.
+//!   * Count is bounded by u64::MAX; overflow is an invalid absorbing element.
+//!     Frac uses exact rational arithmetic and one invalid absorbing element.
+
+use num_bigint::BigInt;
+use num_rational::BigRational;
 
 /// The RA contract. Kept object-safe-free and simple for the drill; the Phase D
 /// implementation may generalize to serialized dynamic algebras behind the same laws.
@@ -26,14 +31,38 @@ pub trait Ra: Sized + Clone + PartialEq + std::fmt::Debug {
     fn valid(&self) -> bool;
     /// |a| — partial core. `None` where the algebra has no core (e.g. Ex).
     fn pcore(&self) -> Option<Self>;
-    /// a ≼ b. For algebras with a unit this coincides with ∃c. b = a·c.
-    /// For Ex (no unit) we take the reflexive closure — declared in the freeze record.
+    /// a ≼ b iff ∃c ∈ Self. b = a·c. Without a unit this need not be reflexive.
     fn included_in(&self, b: &Self) -> bool;
+}
+
+/// Iris §4.3: lift an RA by adding an empty, valid unit.
+impl<A: Ra> Ra for Option<A> {
+    fn op(&self, other: &Self) -> Self {
+        match (self, other) {
+            (None, b) => b.clone(),
+            (a, None) => a.clone(),
+            (Some(a), Some(b)) => Some(a.op(b)),
+        }
+    }
+    fn valid(&self) -> bool {
+        self.as_ref().is_none_or(Ra::valid)
+    }
+    fn pcore(&self) -> Option<Self> {
+        // The outer Some means the lifted core is defined, even when it is empty.
+        Some(self.as_ref().and_then(Ra::pcore))
+    }
+    fn included_in(&self, b: &Self) -> bool {
+        match (self, b) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(a), Some(b)) => a == b || a.included_in(b),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Ex — exclusive token (named exclusive resources: a port, a process slot).
-// ex·ex is invalid; no core; inclusion is reflexive (no unit exists).
+// ex·ex is invalid; a valid token has no core and is not included in itself.
 // ---------------------------------------------------------------------------
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Ex {
@@ -50,33 +79,62 @@ impl Ra for Ex {
         matches!(self, Ex::Token)
     }
     fn pcore(&self) -> Option<Self> {
-        None
+        match self {
+            Ex::Token => None,
+            Ex::Bot => Some(Ex::Bot),
+        }
     }
     fn included_in(&self, b: &Self) -> bool {
-        self == b
+        matches!(b, Ex::Bot)
     }
 }
 
 // ---------------------------------------------------------------------------
-// Count — ℕ with addition (fungible quantities: quota units, budget counts).
-// Unit 0 is the core. Fragments are always valid; the CAP lives in the
-// authoritative element (auth.rs), not in fragment validity.
+// Count — bounded nonnegative counts with exact addition or an invalid overflow.
+// Unit 0 is the core. Each pool's capacity is a separate ledger constraint.
 // ---------------------------------------------------------------------------
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub struct Count(pub u64);
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Count {
+    Value(u64),
+    Invalid,
+}
+
+impl Default for Count {
+    fn default() -> Self {
+        Count::Value(0)
+    }
+}
+
+impl Count {
+    pub fn value(self) -> Option<u64> {
+        match self {
+            Count::Value(n) => Some(n),
+            Count::Invalid => None,
+        }
+    }
+}
 
 impl Ra for Count {
     fn op(&self, other: &Self) -> Self {
-        Count(self.0.saturating_add(other.0))
+        match (self, other) {
+            (Count::Value(a), Count::Value(b)) => {
+                a.checked_add(*b).map(Count::Value).unwrap_or(Count::Invalid)
+            }
+            _ => Count::Invalid,
+        }
     }
     fn valid(&self) -> bool {
-        true
+        matches!(self, Count::Value(_))
     }
     fn pcore(&self) -> Option<Self> {
-        Some(Count(0))
+        Some(Count::Value(0))
     }
     fn included_in(&self, b: &Self) -> bool {
-        self.0 <= b.0
+        match (self, b) {
+            (_, Count::Invalid) => true,
+            (Count::Invalid, _) => false,
+            (Count::Value(a), Count::Value(b)) => a <= b,
+        }
     }
 }
 
@@ -197,65 +255,69 @@ impl Ra for Ranges {
 // ---------------------------------------------------------------------------
 // Frac — F6（RDMA 走查）：分数持有（Boyland fractional permissions；Iris frac RA）。
 // 读共享＝各持一份正分数，合成回 1 才是独占；endstate §8.2 库清单所列。
-//   op    : 相加（有理数，gcd 规范化）；和 > 1 ⇒ 非法（显式，不另设 ⊥）
+//   op    : 精确有理数相加；和 > 1 ⇒ 唯一的吸收非法元
 //   valid : 0 < q ≤ 1
-//   pcore : None —— 无核（与 Iris frac 一致；也无单位）
-//   ≼     : q₁ ≤ q₂（自反闭包——与 F1 对 Ex 的申报同款：Iris 原为严格 <，
-//           我们取自反以使 ✓(●1·◯1) 成立；偏离申报见 F6 记录）
+//   pcore : 合法正分数无核，非法元自核；没有单位元
+//   ≼     : 合法分数上为严格 <；Option<Frac> 的包含关系自然扩为 ≤
 // ---------------------------------------------------------------------------
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Frac {
-    pub num: u64,
-    pub den: u64,
-}
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Frac(Option<BigRational>);
 
 impl Frac {
     pub fn new(num: u64, den: u64) -> Self {
         assert!(den > 0, "denominator must be positive");
-        let g = gcd(num, den);
-        Frac { num: num / g, den: den / g }
+        Self::from_ratio(BigRational::new(num.into(), den.into()))
     }
     pub fn one() -> Self {
-        Frac { num: 1, den: 1 }
+        Frac::new(1, 1)
     }
-    fn cmp_key(&self) -> (u128, u128) {
-        // 比较 num/den：交叉相乘（u128 防溢出）
-        (self.num as u128, self.den as u128)
+    pub fn invalid() -> Self {
+        Frac(None)
     }
-    fn leq(&self, o: &Frac) -> bool {
-        let (a, b) = self.cmp_key();
-        let (c, d) = o.cmp_key();
-        a * d <= c * b
+    fn from_ratio(q: BigRational) -> Self {
+        if q.numer() > &BigInt::from(0) && q.numer() <= q.denom() {
+            Frac(Some(q))
+        } else {
+            Frac::invalid()
+        }
     }
-}
-
-fn gcd(mut a: u64, mut b: u64) -> u64 {
-    if a == 0 {
-        return b.max(1);
+    /// Exact decimal parts for persistence. Invalid is represented by 0/1.
+    pub fn parts(&self) -> (String, String) {
+        match &self.0 {
+            Some(q) => (q.numer().to_string(), q.denom().to_string()),
+            None => ("0".into(), "1".into()),
+        }
     }
-    while b != 0 {
-        let t = a % b;
-        a = b;
-        b = t;
+    /// Restore exact parts without rounding or a fixed integer width.
+    pub fn from_parts(num: &str, den: &str) -> Option<Self> {
+        let num: BigInt = num.parse().ok()?;
+        let den: BigInt = den.parse().ok()?;
+        if den <= BigInt::from(0) {
+            return None;
+        }
+        Some(Self::from_ratio(BigRational::new(num, den)))
     }
-    a
 }
 
 impl Ra for Frac {
     fn op(&self, other: &Self) -> Self {
-        // a/b + c/d = (ad + cb)/(bd)，饱和防溢出（演练分母极小）
-        let num = (self.num as u128 * other.den as u128 + other.num as u128 * self.den as u128).min(u64::MAX as u128) as u64;
-        let den = (self.den as u128 * other.den as u128).min(u64::MAX as u128) as u64;
-        Frac::new(num, den)
+        match (&self.0, &other.0) {
+            (Some(a), Some(b)) => Self::from_ratio(a + b),
+            _ => Frac::invalid(),
+        }
     }
     fn valid(&self) -> bool {
-        self.num > 0 && self.num <= self.den
+        self.0.is_some()
     }
     fn pcore(&self) -> Option<Self> {
-        None
+        if self.valid() { None } else { Some(Frac::invalid()) }
     }
     fn included_in(&self, b: &Self) -> bool {
-        self.leq(b)
+        match (&self.0, &b.0) {
+            (_, None) => true,
+            (None, Some(_)) => false,
+            (Some(a), Some(b)) => a < b,
+        }
     }
 }
 
@@ -295,8 +357,9 @@ pub fn law_core_mono<A: Ra>(a: &A, b: &A) -> bool {
 }
 
 /// Frame-preserving update, checked empirically against a frame sample:
-///   a ⤳ b  ⟺  ∀f. ✓(a·f) ⇒ ✓(b·f)
-/// (Iris Technical Reference, adopted verbatim; sampled rather than quantified.)
+///   a ⤳ b  ⟺  ∀f ∈ M?. ✓(a·f) ⇒ ✓(b·f)
+/// Always checks the empty frame as well. Passing a finite sample is not a proof.
 pub fn fpu_holds<A: Ra>(a: &A, b: &A, frames: &[A]) -> bool {
-    frames.iter().all(|f| !a.op(f).valid() || b.op(f).valid())
+    (!a.valid() || b.valid())
+        && frames.iter().all(|f| !a.op(f).valid() || b.op(f).valid())
 }

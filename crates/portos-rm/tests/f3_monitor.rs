@@ -364,7 +364,7 @@ fn budget_is_rows_not_decrement_gate_is_issuer_gate() {
     let err = m
         .orch
         .ledger
-        .grant("fib:spent", "budget", "n1", Frag::Count(portos_rm::ra::Count(1)), "c", None, NOW)
+        .grant("fib:spent", "budget", "n1", Frag::Count(portos_rm::ra::Count::Value(1)), "c", None, NOW)
         .unwrap_err();
     assert_eq!(err, LedgerError::Conflict);
 }

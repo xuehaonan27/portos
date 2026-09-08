@@ -91,7 +91,7 @@ impl CapStore {
                 l.set_capacity(
                     CLASS_CAP_COUNT,
                     &pool_instance(&cap.cap_id, verb),
-                    Frag::Count(Count(*n)),
+                    Frag::Count(Count::Value(*n)),
                 );
             }
             if l.capacity(CLASS_CAP, &cap.cap_id).is_none() {
@@ -337,7 +337,7 @@ impl CapStore {
                     l.set_capacity(
                         CLASS_CAP_COUNT,
                         &pool_instance(&cap.cap_id, verb),
-                        Frag::Count(Count(0)),
+                        Frag::Count(Count::Value(0)),
                     );
                 }
                 Ok(())

@@ -43,16 +43,17 @@
 //!   [DOWN]  theory-spec §3.2【推导】：同意对象＝↓B（向量的逐分量下集），WYSIWYS 签的是一个
 //!           逐类上界；同意单调性引理（effect-plan §5.4）【设计】：B′ ≤ B ⇒ ↓B′ ⊆ ↓B——
 //!           预序传递性的直接后果。
-//!   [TWO]   theory-spec §3.2【推导】：预算的 (ℕ,+,≤) 与 F1 `Count` RA 的 (op, ≼) 是同一交换
-//!           幺半群的两读（流侧计量／存侧持有）。可执行形态：counting 的 ⊕ 逐点＝`Count::op`，
-//!           "demand ∈ ↓B" 逐点＝F1 的 `auth_valid(● Count(B), ◯ Count(demand))`——
-//!           F3 的花费闸门与本模块的准入闸门是**同一个谓词**。
+//!   [TWO]   theory-spec §3.2【推导】：数学预算与自然数持有共享 (ℕ,+,≤)。机器 Count 带超界非法元；
+//!           在 Count 可表示的范围内，counting 的 ⊕＝`Count::op`，
+//!           "demand ∈ ↓B" 逐点＝F1 的 `auth_valid(● Count::Value(B), ◯ Count::Value(demand))`——
+//!           F3 的花费闸门与本模块的准入闸门在可表示数值范围内使用相同的上界谓词。
 //!   [F4]    动词是否进预算由真理表决定（F4 `bears_budget`）【推导】：uses ＝ 1 或 0。
 //!           于是 `snapshot` 循环一千次预算为零、`click` 循环一千次预算一千——"先读后谋"
 //!           （effect-plan §6.2）的类型层依据。
-//!   [SAT]   偏离：ℕ 以 u64 饱和运算实现（S_max 远小于 2^64；饱和只是防溢出，不是语义）。
+//!   [EXACT] 静态用量按精确自然数计算；超出 u64 池容量的需求必须被拒，不能饱和成达标。
 
 use crate::verbs::{VerbError, VerbTable};
+use num_bigint::BigUint;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
 
@@ -98,32 +99,45 @@ pub trait Join: Scalar {
 // ---------------------------------------------------------------------------
 // [INST] 实例一：bounded reuse (ℕ, ×, +, 1, 0, ≤) —— counting／预算。
 // ---------------------------------------------------------------------------
-#[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord, Default)]
-pub struct Counting(pub u64);
+#[derive(Clone, PartialEq, Eq, Debug, PartialOrd, Ord, Default)]
+pub struct Counting(pub BigUint);
+
+impl Counting {
+    pub fn new(n: u64) -> Self {
+        Counting(n.into())
+    }
+    /// Convert to a machine pool amount only when it is representable.
+    pub fn value(&self) -> Option<u64> {
+        u64::try_from(&self.0).ok()
+    }
+}
 
 impl Scalar for Counting {
     /// ~ ＝ ×：函数把参数用 s 次、参数计算又用上下文 t 次 ⇒ s×t 次。
     fn seq(&self, o: &Self) -> Self {
-        Counting(self.0.saturating_mul(o.0)) // [SAT]
+        Counting(&self.0 * &o.0)
     }
     /// ⊕ ＝ ＋：两段计算先后各用 r、s 次 ⇒ r+s 次。
     fn merge(&self, o: &Self) -> Self {
-        Counting(self.0.saturating_add(o.0)) // [SAT]
+        Counting(&self.0 + &o.0)
     }
     fn use_() -> Self {
-        Counting(1)
+        Counting::new(1)
     }
     fn ign() -> Self {
-        Counting(0)
+        Counting::new(0)
     }
     fn leq(&self, o: &Self) -> bool {
         self.0 <= o.0
+    }
+    fn numeral(n: u64) -> Self {
+        Counting::new(n)
     }
 }
 impl Join for Counting {
     /// max：两条分支各用 r、s 次，任一条执行时的上界。
     fn join(&self, o: &Self) -> Self {
-        Counting(self.0.max(o.0))
+        Counting(self.0.clone().max(o.0.clone()))
     }
 }
 
@@ -195,20 +209,20 @@ impl Budget {
     }
     /// 单位向量：某效应类用一次（逐分量 use，但只在这一类上）。
     pub fn unit(class: &str) -> Self {
-        Budget([(class.to_string(), Counting(1))].into_iter().collect())
+        Budget([(class.to_string(), Counting::new(1))].into_iter().collect())
     }
     /// 加权单位：某效应类记 n 个单位（按量计价：fuel 秒、字节数——F6 走查项）。
     pub fn unit_n(class: &str, n: u64) -> Self {
         Self::of(&[(class, n)])
     }
     pub fn of(entries: &[(&str, u64)]) -> Self {
-        Budget(entries.iter().filter(|(_, n)| *n > 0).map(|(k, n)| (k.to_string(), Counting(*n))).collect())
+        Budget(entries.iter().filter(|(_, n)| *n > 0).map(|(k, n)| (k.to_string(), Counting::new(*n))).collect())
     }
     pub fn get(&self, class: &str) -> Counting {
-        self.0.get(class).copied().unwrap_or(Counting::ign())
+        self.0.get(class).cloned().unwrap_or(Counting::ign())
     }
     fn normalized(mut m: BTreeMap<String, Counting>) -> Self {
-        m.retain(|_, v| v.0 > 0);
+        m.retain(|_, v| v.0.bits() > 0);
         Budget(m)
     }
     /// ⊕ 逐分量：两段计划各自的逐类用量相加。
@@ -238,12 +252,12 @@ impl Budget {
         Self::normalized(m)
     }
     /// 各类之和——只用于展示；**准入不看总量**（B9 的教训）。
-    pub fn total(&self) -> u64 {
-        self.0.values().map(|c| c.0).sum()
+    pub fn total(&self) -> BigUint {
+        self.0.values().map(|c| &c.0).sum()
     }
     /// 首个越界的效应类（报错点名用）。
-    pub fn first_exceeding(&self, bound: &Budget) -> Option<(String, u64, u64)> {
-        self.0.iter().find(|(k, v)| !v.leq(&bound.get(k))).map(|(k, v)| (k.clone(), v.0, bound.get(k).0))
+    pub fn first_exceeding(&self, bound: &Budget) -> Option<(String, BigUint, BigUint)> {
+        self.0.iter().find(|(k, v)| !v.leq(&bound.get(k))).map(|(k, v)| (k.clone(), v.0.clone(), bound.get(k).0))
     }
 }
 
@@ -284,7 +298,7 @@ impl Requires {
         Self::from_table_weighted(table, class, verb, caps, deps, 1)
     }
 
-    /// [F4]+[SAT] 按量计价（F6 走查项，endstate 开放问题 7 的既定路径）：静态准入用**声明上界**
+    /// [F4]+[EXACT] 按量计价（F6 走查项，endstate 开放问题 7 的既定路径）：静态准入用**声明上界**
     /// `weight`（每次调用最多耗多少单位：fuel 秒、字节），运行期 F3 按实际 cost 扣——二者由同一
     /// 闸门（[TWO]：can_mint ＝ ↓B）衔接：实际 ≤ 声明 ⇒ 静态过则运行期必过。可重复动词恒 0。
     pub fn from_table_weighted(
@@ -387,9 +401,9 @@ pub fn demand_paths(plan: &Plan, lookup: &Lookup) -> Requires {
 }
 
 // ---------------------------------------------------------------------------
-// WP-05：宿主计划 AST 的本地镜像与投影。零依赖纪律：法则 crate 不依赖
-// portos-proto；内核（feature `plans`，G1 前默认关）负责 proto AST → `AstNode`
-// 的转换，本侧只定义形状与投影。D31 未解禁前这条链对内核默认不可见。
+// WP-05：宿主计划 AST 的本地镜像与投影。依赖方向：资源 crate 不依赖
+// portos-proto；内核负责 proto AST → `AstNode` 的转换，本侧只定义形状与投影。
+// D41 已解除 D31 隔离；内核显式开启 `plan-shapes` 接入此 API。
 // ---------------------------------------------------------------------------
 /// 决定计量的计划节点镜像（effect-plan §3 的四形状＋"不计量"一档）。
 /// 守卫、变量、纯计算不进预算（读经真理表免费，法则
@@ -461,7 +475,7 @@ pub enum AdmitError {
     /// 运行期：计划总需求依赖的服务不在提供面内。
     UnmetDependency { missing: Flat },
     /// [DOWN] 运行期：某效应类的用量不在 ↓B 内（点名类——同意面逐类渲染，报错也逐类）。
-    OverBudget { class: String, demand: u64, budget: u64 },
+    OverBudget { class: String, demand: BigUint, budget: BigUint },
 }
 
 /// [ROW] 装载期准入（roadmap Phase C"廉价版"原样）：∀ 动词，requires.caps ⊆ offers 且 deps ⊆ provides。

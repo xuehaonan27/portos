@@ -1,6 +1,8 @@
 # 理论 ↔ 实现 ↔ 测试 对照总表（portos-rm）
 
 用法：拿着 `design/spec.md` 的节号找模块与测试；或拿着一个失败的测试名反查它执行的是哪条理论。
+本表是实现导航；文档与用户裁定优先于测试（D45）。当前开发范围遵循 D49；历史安全／授权测试不构成继续扩展这些机制的要求。
+
 等级：〔文献✓〕被引原文核实／〔推导〕我方映射／〔设计〕自家文档决定。roadmap Phase 0-③ 所要的 `docs/correspondence.md` 即本文件。
 
 ## F1 账本 schema／世代化句柄 — spec §2.2、§6.1 — `src/ra.rs` `src/auth.rs` `src/ledger.rs` `schema.sql`
@@ -8,22 +10,22 @@
 | 理论（等级） | 实现 | 测试（`tests/f1_ledger.rs`） |
 |---|---|---|
 | RA 四组公理〔文献✓〕 | `Ra` trait；`Ex`/`Count`/`GSet` | `ra_laws_all_algebras` |
-| Auth 合法性 ✓(●a·◯b) ⟺ b≼a ∧ ✓a〔文献✓〕 | `auth::auth_valid` | `auth_validity_iff` |
+| Auth(Option<A>) 的容量有效性，Option 补空持有单位元〔文献✓＋映射〕 | `auth::auth_valid` | `auth_validity_iff` |
 | 独占不可双授／计数不可透支〔推导〕 | `Ledger::grant` → `can_mint` | `exclusive_double_grant_refused` `counting_no_overdraft` |
 | 稳定指称 ⇒ 世代化句柄〔推导〕 | `Holding.generation`；`StaleGeneration` | `stale_generation_rejected` |
 | release 幂等＋租约≡release；子先于父；crash-only 单路径；基底对账〔设计〕 | `release`/`sweep`/`teardown`/`reconcile` | `release_idempotent_and_sweep_equiv` `teardown_children_before_parents` `crash_only_single_path` `reconcile_detects_decay_and_untracked` |
 | 全局不变量 ✓(●cap·◯fold)〔推导〕 | `Ledger::invariant` | `invariant_under_random_ops` |
-| release 是 FPU；裸 mint 非 FPU ⇒ 发放方闸门（定理后果二）〔文献✓→推导〕 | `ra::fpu_holds`；`auth::can_mint` | `release_is_frame_preserving`（B13：Auth 复合元素、全帧）`mint_not_fpu_in_open_world_hence_issuer` |
-| 无消去性 ⇒ 行为真相（定理后果一）〔推导〕 | `holding` 表一行一笔；`authoritative.cached_outstanding` 可空缓存 | （schema 形状；由上列各测试共同前提） |
+| 释放碎片的 FPU 与中央 grant 容量检查分别验证〔按定义推导〕 | `ra::fpu_holds`；`auth::can_mint` | `release_is_frame_preserving`（B13：Auth 复合元素、含空帧与纯碎片帧的有限样本）`capacity_check_does_not_imply_fpu` |
+| 每笔持有保留生命周期记录，聚合值可重算〔设计〕 | `holding` 表一行一笔；`authoritative.cached_outstanding` 可空缓存 | （schema 形状；由上列各测试共同前提） |
 | 租约 None＝随 parent 生命期：sweep 闭包级联、子先于父〔设计〕（B14） | `Ledger::sweep` 到期集闭包 | `sweep_cascades_to_parent_bound_children` |
 | 跨主体 parent 只沿实例化关系〔设计，决策 2〕 | `Ledger::declare_instantiation`；`grant` 的 `ParentAuthority` 检查 | `cross_subject_parent_requires_instantiation_authority` |
-| 转授＝持有转移，FPU 平凡成立〔文献✓＋推导〕 | `Ledger::transfer` | `transfer_changes_holder_only_and_is_trivially_frame_preserving` |
+| 转授保持聚合值；parent 存在依赖保持〔设计＋推导〕 | `Ledger::transfer` | `transfer_preserves_aggregate_and_holder_checks` |
 
 ## F2 teardown 算法 — spec §6.2 — `src/teardown.rs`
 
 | 理论（等级） | 实现 | 测试（`tests/f2_teardown.rs`） |
 |---|---|---|
-| 任意序撤销定理（Cordis 43）〔文献✓〕 | 波内种子洗牌 `[T43]` | `t43_any_order_same_final_state` |
+| 任意序撤销定理（Cordis 43），要求动作、逆与结果两两独立〔文献✓〕 | 波内种子洗牌 `[T43]`；MockWorld 满足该前提 | `t43_any_order_same_final_state` |
 | 排序约束只在 ownership 边〔推导＋设计；B10：ownership 边＝持有的存在依赖，T70 的资源侧读法，非 Cordis 实例化树 π〕 | `plan_waves` 深度分层＋执行器 `[TREE]` 守卫 | `ownership_edges_never_violated` |
 | ownership 边可跨主体，teardown 按闭包级联〔设计；plugin-system 裁定 6-7〕（B15） | `Ledger::live_closure`；规划器与守卫按闭包 | `teardown_cascades_across_subjects_along_ownership` |
 | saga＋WAL〔文献✓〕 | `Journal` write-ahead；三崩点 | `crash_at_every_point_resumes_to_same_state` |
@@ -57,7 +59,7 @@
 
 | 理论（等级） | 实现 | 测试（`tests/f4_verbs.rs`） |
 |---|---|---|
-| 效应＝操作＋等式〔文献✓〕；性格分类＋一致性方向〔设计＋推导〕；交换性按动词声明〔推导〕（B11） | `Kind`；`check_coherent`（可重复⟹幂等）；`repeatable()`/`repeatable_shared()` | `coherence_lattice_exhaustive_over_kind_and_flags`（36 格，接受集 28） |
+| 效应＝操作＋等式〔文献✓〕；性格分类＋一致性方向〔设计＋推导〕；交换性按动词声明〔推导〕（B11） | `Kind`；`check_coherent`（可重复⟹幂等）；`repeatable()`/`repeatable_shared()` | `coherence_lattice_exhaustive_over_kind_and_flags`（36 格，接受集 34） |
 | 持有 ρ 是类属性／动作世界档是动词属性〔文献✓＋推导／设计〕 | `declare_class(ρ)`；`ConsumeGrade`/`EmitGrade` 内嵌于 `Kind` | `holding_rho_is_per_class_action_grade_is_per_verb`（B5） |
 | D1 位置判据〔文献✓〕 | 键 (class, verb)；`derive_handler_policy(class)` | `d1_same_verb_two_handlers_projections_differ`（B6） |
 | 消耗性读进预算〔设计＋推导〕 | `bears_budget` | `consuming_read_bears_budget_refines_read_write_binary` |
@@ -77,7 +79,7 @@
 | effect row 位置∩主体〔设计〕 | `ceiling`；`admit_plan` | `effect_row_is_position_ceiling_meet_subject_ceiling` |
 | ↓B 与单调性〔推导／设计〕 | `covered_by_budget` | `consent_monotonicity_downset` |
 | F4 决定是否计数〔推导〕 | `Requires::from_table` | `repeatable_verbs_cost_zero_via_truth_table` |
-| 预算半环与 Count RA 两读〔推导〕 | （无专用代码） | `budget_merge_is_count_ra_op_and_downset_is_auth_valid` |
+| 自然数预算与 Count 在可表示范围内共享加法及上界检查〔推导〕 | （无专用代码） | `budget_merge_is_count_ra_op_and_downset_is_auth_valid` |
 | 装载期准入＝集合包含〔设计〕 | `admit_mount` | `manifest_admission_is_set_inclusion` |
 
 ## F6 走查修复 — spec §5.2、§6.6 — `src/protocol.rs` `src/bestiary.rs` ＋ 各模块扩充
@@ -100,8 +102,8 @@
 | 触发次数为独立分量 `attach::fire`（Q12）〔推导，锚 F1 每实例容量〕 | `FIRE_CLASS`；`attach` 铸池①含 fire＝n_max；`begin_with` 先过 fire 闸门 | `n_max_is_enforced_through_the_fire_component_even_for_zero_budget_plans`（回归 a） |
 | seq 从行读、nonce＝H(h_attach‖seq) 可预测无妨（Q5/Q10）〔推导〕 | `next_seq`（fire 行数＋1，generation 记 seq）；`derive_nonce` | `seq_is_read_from_rows_and_nonces_are_unique_and_stable_across_restart` |
 | ②③同事务；恢复规则"有②无③＝空跑"（Q14）〔设计〕 | `Scheduler::transactional`；`Crash::BetweenRows`；`recover` | `fragment_without_pool_after_crash_is_a_fired_but_empty_run`（回归 b） |
-| 合计只可重算（F1 后果一）；Auth 不变式在任意序列后成立〔推导〕 | `cached_outstanding` vs `recompute_outstanding`；`invariants` | `outstanding_recomputed_from_live_fragments_equals_cache_after_any_sequence`（回归 c；2×9⁴ 序列） |
-| 结账一条路径：段 teardown、③容量置 0（平凡 FPU）、②留存（Q13）〔推导〕 | `settle`；`firing_pool_closed`/`firing_pool_refuses` | `settlement_is_one_path_for_every_terminal_state`（六种终态） |
+| 聚合缓存与逐笔行一致；所测序列保持容量不变量〔设计＋验证〕 | `cached_outstanding` vs `recompute_outstanding`；`invariants` | `outstanding_recomputed_from_live_fragments_equals_cache_after_any_sequence`（回归 c；2×9⁴ 序列） |
+| 结账一条路径：段 teardown、③结清后容量置 0（完整账本不变量）、②留存（Q13）〔推导〕 | `settle`；`firing_pool_closed`/`firing_pool_refuses` | `settlement_is_one_path_for_every_terminal_state`（六种终态） |
 | 未用余额不退；被拒触发不铸、不算失败（规则 3）〔设计〕 | ②按 B_firing 满额；`Reject::Precondition` 不铸行 | `unused_balance_is_never_refunded_and_rejected_firings_mint_nothing` |
 | 触发内 `inbox::emit` 事务性：撤回只及本次触发自己投递的未消费事件（用户裁定）〔设计，锚裁定四〕 | `emit`／`consume`／`withdraw` | `withdrawal_is_bounded_to_this_firings_unconsumed_events`；`pump_failed_always_arrives_normal_path_emits_survive_later_failures` |
 | 有界队列、溢出按声明、绝不静默；停机追赶一次记 missed（A4）〔设计〕 | `enqueue`；`recover` 的 Timer 追赶 | `queue_overflow_never_drops_silently_and_timer_catches_up_once_with_missed` |
@@ -115,10 +117,10 @@
 
 | 法则 | 内核对象（`crates/portos-kernel`） | 测试 |
 |---|---|---|
-| F1 行式记账、发放方闸门、无减法（§6.1） | `ledger::LedgerStore::spend/spent`（写穿 `holdings` 表）；`caps::CapStore::exercise/counts_left`（`counts` 为池容量） | `caps::counting_exercise_never_overdraws`；`ledger::spend_rows_persist_and_gate_refuses_at_capacity`；echo `counting_budget_is_ledger_rows_and_survives_kernel_reopen` |
+| F1 行式生命周期记账与中央容量闸门（§6.1） | `ledger::LedgerStore::spend/spent`（写穿 `holdings` 表）；`caps::CapStore::exercise/counts_left`（`counts` 为池容量） | `caps::counting_exercise_never_overdraws`；`ledger::spend_rows_persist_and_gate_refuses_at_capacity`；echo `counting_budget_is_ledger_rows_and_survives_kernel_reopen` |
 | F1 世代化句柄、重启对账 | `kernel/plugin` 持有（世代＝spawn token）；`LedgerStore::reconcile_stale_process_rows` | `ledger::stale_plugin_rows_are_reconciled_on_open` |
 | F2 crash-only、子先于父、ownership 闭包、`World` | `host::reclaim`＋`host::HostWorld`（`teardown_with`） | echo `plugin_death_is_reclaimed_crash_only_children_first` |
-| ②③同事务、恢复规则（attachments §4.3 规则 5／§13.3 Q14；F1 后果一的实装形态） | `LedgerStore::transaction`（单 SQLite 事务＋内存快照回滚）；`spend_many`；`hold_exclusive`/`release`/`teardown`/对账全部经其路由 | `ledger::compound_ledger_write_is_atomic_under_injected_failure` |
+| ②③同事务、恢复规则（attachments §4.3 规则 5／§13.3 Q14；F1 行式记账契约的实装形态） | `LedgerStore::transaction`（单 SQLite 事务＋内存快照回滚）；`spend_many`；`hold_exclusive`/`release`/`teardown`/对账全部经其路由 | `ledger::compound_ledger_write_is_atomic_under_injected_failure` |
 | F2 saga-log 持久化（§6.2 [SAGA]/[E-IDEM]：write-ahead、盲重放） | `journal` 表（`holding_id` 主键）；teardown 与墓碑同事务写穿；非 done 条目由该主体下一次 teardown 载入回放（Failed→Pending）；`open` 报告 `journal_pending`；对账落墓碑即解为 done（行即真相） | `ledger::journal_entries_survive_reopen_and_replay_once` |
 | 本地订阅＝`kernel/subscription` 持有，可显式退订 | `host::Host::subscribe_local`/`unsubscribe_local`（先查 subs 锁、账本释放、再移除） | `host::unsubscribe_local_releases_the_subscription_holding` |
 | 跨主体 parent 只沿实例化关系（§6.1 [AUTH-EDGE]，决策 2）；闭包级联、子先于父（§6.2） | `spawn_child` client op（`kernel:spawn` 能力门）；`LedgerStore::hold_exclusive_child`（实例化登记＋grant 同事务）；对账子先于父不动点 | echo `spawn_child_is_capability_gated_and_parent_death_reclaims_children_first`；`ledger::stale_plugin_rows_are_reconciled_on_open`（父子行） |
@@ -130,3 +132,18 @@
 | F3 monitor（sink／扣发／同意／三态／段事务） | **已成（2026-09-07，D43/WP-06）**：`plans::PlanService`；同意＝按族铸纤维能力（行式预算）；`suppression_buffer`＋跨进程 `approve`；三模式＋进程内 escalate；段＝`transfer_all`/teardown | `plans::` 十条内核集成测试（镜像法则名）＋ chat `plan_run_navigate_type_submit_withheld_then_approved` |
 | 能力＝持有（spec §6.1；WP-03/D48，2026-09-08） | `kernel/cap` 类；`CapStore::mint/attenuate` 同事务铸持有（租约＝`expires_at`）；`exercise`/`find_and_exercise`/`list_live` 以持行为活性真相；`revoke`＝CDT 级联＋逐能力 `LedgerStore::teardown_subtree`（释放花费行＋池归零同事务）；`Host::revoke_capability` | `caps::revoking_a_grant_releases_its_holding_and_children_first`；`caps::expired_capability_is_refused_by_the_gate_after_sweep`；`caps::caps_and_holdings_agree_after_reopen`；echo `attenuated_child_capability_dies_with_its_parent_grant` |
 | F2 子树清理域（撤销级联的参照语义） | `Ledger::live_subtree`＋`teardown_subtree_with`（与 `teardown_with` 共享执行器内核 `run`；[SAGA]/[TREE]/[KEY] 纪律同一） | `f2_teardown::subtree_teardown_is_children_first_and_spares_off_tree_holdings` |
+
+## 2026-09-08 理论修订的反例与边界
+
+| 契约 | 验证 |
+|---|---|
+| FPU 必须检查空帧；Option 添加单位元 | `theory_regressions::exclusive_update_must_preserve_validity_with_no_frame`；`option_supplies_units_without_changing_base_inclusion` |
+| Count 溢出非法且保持 RA 法则 | `capacity_gate_rejects_count_overflow`；`count_overflow_is_absorbing_and_obeys_ra_laws` |
+| Frac 结合律、有效性下行不被整数截断破坏 | `fraction_composition_is_exact_at_large_denominators`；`invalid_fraction_cannot_become_valid_by_composition` |
+| 静态预算精确计量，附着乘法溢出在建池前拒绝 | `static_budget_overflow_is_not_covered_by_a_maximum_pool`；`f8_attach::total_budget_overflow_refuses_attachment_before_creating_pools` |
+| 内核先检查步数上限，避免拒绝超大计划前预算先溢出 | 内核 `plancheck::tests::oversized_nested_budget_is_refused_without_arithmetic_overflow` |
+| 消费允许同一请求的幂等重试声明 | `consuming_request_can_declare_idempotent_retries`；F4 一致性表 |
+| FPU 测试的 Auth 载体包含权威互斥与纯碎片帧 | `f1_ledger::auth_fixture_has_exclusive_authority_and_satisfies_ra_laws` |
+| 超额拒绝的事务与重启一致；精确分数持久化 | 内核 `ledger::tests::count_overflow_refuses_atomically_and_survives_reopen`；`fragments_round_trip_through_json` |
+
+这些测试检查具体反例与有限载体，不证明任意资源的生命周期交接或观察恢复；此类义务见 spec §2.5–§2.7、plugin-system §6.11。
