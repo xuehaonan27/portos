@@ -263,13 +263,13 @@ fn settlement_is_one_path_for_every_terminal_state() {
         let f = &s.attachments["a"].firings[0];
         assert_eq!(f.end, Some(expect), "{name}");
         assert!(s.inflight_seq("a").is_none(), "{name}");
-        assert!(!s.ledger.live().any(|h| h.subject.as_str() == "attach/a:seg#1"), "{name}: segment rows gone");
+        assert!(!s.ledger.active().any(|h| h.subject.as_str() == "attach/a:seg#1"), "{name}: segment rows gone");
         assert!(s.firing_pool_closed("a", 1, NAV), "{name}: firing pool capacity is 0");
         assert!(s.firing_pool_refuses("a", 1, NAV), "{name}: closed pool refuses minting");
         if s.status("a").is_terminal() {
             // 整体退役（规则 4）：②随①落墓碑——行仍在，只是不再存活。
             assert!(
-                s.ledger.holdings().iter().any(|h| h.subject.as_str() == "attach/a:spent" && h.generation.as_str() == "seq:1" && h.released_at.is_some()),
+                s.ledger.holdings().iter().any(|h| h.subject.as_str() == "attach/a:spent" && h.generation.as_str() == "seq:1" && h.released_at().is_some()),
                 "{name}: the spend row is retained as a tombstone"
             );
         } else {
@@ -414,7 +414,7 @@ fn detach_expiry_and_revocation_end_in_the_same_ledger_shape() {
     t.tick(100);
     assert_eq!(t.status("x"), Status::Expired);
     for (sch, id) in [(&s, "d"), (&s, "e"), (&s, "r"), (&t, "x")] {
-        assert!(!sch.ledger.live().any(|h| h.subject.as_str().starts_with(&format!("attach/{id}"))), "{id}: no live rows");
+        assert!(!sch.ledger.active().any(|h| h.subject.as_str().starts_with(&format!("attach/{id}"))), "{id}: no live rows");
         assert!(sch.invariants().is_ok(), "{id}: {:?}", sch.invariants());
         assert_eq!(sch.inbox.iter().filter(|e| e.attach == id).count(), 1, "{id}: delivered event stays");
     }
@@ -432,7 +432,7 @@ fn firing_segments_carry_no_lease_so_expiry_never_waits_on_a_run_in_flight() {
     s.attach(d, 0).unwrap();
     let seq = s.begin("a", 9).unwrap();
     assert_eq!(s.quad("a").unwrap().ttl_expires_at, 10, "ttl_i = min(now + run_cap, lease end)");
-    let seg = s.ledger.live().find(|h| h.subject.as_str() == "attach/a:seg#1").unwrap();
+    let seg = s.ledger.active().find(|h| h.subject.as_str() == "attach/a:seg#1").unwrap();
     assert!(seg.lease.expires_at().map(|t| t.get()).is_none(), "segment rows carry no lease of their own");
     s.emit("a").unwrap();
     s.tick(10);

@@ -1,7 +1,8 @@
 //! Resource storage: validated startup, staged transactions, durable pools.
-//! Legacy physical cleanup remains synchronous until milestone M2.
+//! Cleanup intent and outcomes are durable; world actions run outside transactions.
 use crate::KernelError;
 use portos_proto::Capability;
+use portos_rm::cleanup::*;
 use portos_rm::identity::{
     AccountId, ClassId, EffectClass, Generation, HoldingHandle, HoldingId, InstanceId, ResourceKey,
     SpendRequest, SubjectId,
@@ -14,15 +15,19 @@ use portos_rm::ra::{Count, Ex};
 use portos_rm::registry::{
     Capacity, Claim, ClassBinding, PoolRef, RegisteredClass, RuntimeAlgebra,
 };
-use portos_rm::teardown::{RunOutcome, World};
 use portos_rm::time::{Lease, LeaseRequest, Timestamp};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
+mod cleanup;
+mod cleanup_codec;
 mod codec;
-mod legacy_cleanup;
+mod substrate;
+pub use cleanup::CleanupReport;
 mod recovery;
 use codec::{corrupt, persist};
+#[cfg(test)]
+mod m2_tests;
 #[cfg(test)]
 mod tests;
 
@@ -45,9 +50,9 @@ pub struct OpenReport {
     /// Live `kernel/plugin`/`kernel/subscription` rows of a previous kernel
     /// process, tombstoned children-first during reconcile.
     pub stale_rows: usize,
-    /// Journal entries still owed a world action (a failed teardown step
-    /// persisted). Replayed by the next teardown of their subject.
-    pub journal_pending: usize,
+    /// Durable cleanup obligations still waiting for children, an executor, or
+    /// a confirmed outcome. Retried on startup, sweep, and explicit retry.
+    pub cleanup_pending: usize,
     /// Substrate reconciliation of the WP-02 built-in classes.
     pub substrate: SubstrateReconcile,
 }
@@ -62,13 +67,12 @@ pub struct SubstrateReconcile {
     pub process_tombstoned: usize,
     /// `kernel/port` rows tombstoned.
     pub ports_tombstoned: usize,
-    /// …of which the bind probe still finds the port occupied (an orphan the
-    /// ledger never tracked holds it — reported, not hidden).
+    /// Port obligations whose absence could not be confirmed; still occupying.
     pub ports_still_bound: usize,
     /// `kernel/file-lock` rows whose lock file was removed (owner dead).
     pub locks_removed: usize,
-    /// `kernel/file-lock` rows whose owner pid is still alive (orphan): the
-    /// file stays, the row is tombstoned, the count is audited.
+    /// Lock obligations still pending, including live owners and changed paths.
+    /// They remain occupying and retain their exact target.
     pub locks_kept: usize,
 }
 
@@ -77,6 +81,7 @@ impl SubstrateReconcile {
         self.process_killed == 0
             && self.process_tombstoned == 0
             && self.ports_tombstoned == 0
+            && self.ports_still_bound == 0
             && self.locks_removed == 0
             && self.locks_kept == 0
     }
@@ -87,9 +92,9 @@ impl SubstrateReconcile {
 pub struct SweepReport {
     /// (id, class, instance) per released row, world action executed.
     pub released: Vec<(u64, String, String)>,
-    /// Rows whose world action failed (still tombstoned — a lease is a ledger
-    /// fact); reported so the caller can audit them (never silent).
-    pub failed: Vec<u64>,
+    /// Unfinished obligations, including waits for children. Their holdings
+    /// remain Retiring and still occupy their pools.
+    pub pending: Vec<CleanupRecord>,
 }
 
 struct StoreState {
@@ -144,30 +149,8 @@ impl LedgerStore {
             }),
             db,
         };
-        // All classes, pools and rows are validated before this limited bootstrap
-        // coordinator runs. No operational store escapes until reconciliation ends.
-        let substrate = store.reconcile_substrate()?;
-        let stale_rows = store.reconcile_stale_process_rows()?;
-        let journal_pending = {
-            let conn = store
-                .db
-                .lock()
-                .map_err(|_| corrupt("database lock poisoned"))?;
-            let n: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM journal WHERE state != 'done'",
-                [],
-                |r| r.get(0),
-            )?;
-            usize::try_from(n).map_err(|_| corrupt("journal count out of range"))?
-        };
-        Ok((
-            store,
-            OpenReport {
-                substrate,
-                stale_rows,
-                journal_pending,
-            },
-        ))
+        let report = store.reconcile_on_open()?;
+        Ok((store, report))
     }
 
     /// SQL is committed before the staged aggregate is published. Unwind or a
@@ -340,7 +323,30 @@ impl LedgerStore {
         substrate: &Value,
         now: Timestamp,
     ) -> Result<HoldingHandle, KernelError> {
-        self.transaction(|tx| tx.hold_substrate(request, substrate, now))
+        let target = substrate::capture(&request.resource, substrate)?;
+        if let CleanupTarget::Process(w) = &target {
+            if request.generation.as_str() != format!("{}:{}", w.pid(), w.start_ticks()) {
+                return Err(KernelError::Denied(
+                    "process generation differs from captured witness".into(),
+                ));
+            }
+        }
+        self.hold_managed(request, target, None, now)
+    }
+    pub fn hold_managed(
+        &self,
+        request: ExclusiveRequest,
+        target: CleanupTarget,
+        parent_subject: Option<SubjectId>,
+        now: Timestamp,
+    ) -> Result<HoldingHandle, KernelError> {
+        self.transaction(|tx| {
+            if let Some(parent) = parent_subject {
+                tx.ledger
+                    .declare_instantiation(request.owner.clone(), parent);
+            }
+            tx.hold_with_target(request, target, now)
+        })
     }
     pub fn release(&self, handle: &HoldingHandle, now: Timestamp) -> Result<(), KernelError> {
         self.transaction(|tx| tx.release(handle, now))
@@ -378,7 +384,7 @@ impl LedgerStore {
     }
     pub fn cap_holding(&self, account: &AccountId) -> Result<Option<Holding>, KernelError> {
         self.with_read(|l, _| {
-            Ok(l.live()
+            Ok(l.active()
                 .find(|h| {
                     h.class_id.as_str() == CLASS_CAP && h.instance.as_str() == account.as_str()
                 })
@@ -390,9 +396,13 @@ impl LedgerStore {
     }
     pub fn counts(&self, class: &ClassId) -> Result<(usize, usize), KernelError> {
         self.with_read(|l, _| {
-            let live = l.live().filter(|h| &h.class_id == class).count();
-            let total = l.holdings().iter().filter(|h| &h.class_id == class).count();
-            Ok((live, total - live))
+            let live = l.active().filter(|h| &h.class_id == class).count();
+            let retired = l
+                .holdings()
+                .iter()
+                .filter(|h| &h.class_id == class && h.released_at().is_some())
+                .count();
+            Ok((live, retired))
         })
     }
 }
@@ -522,45 +532,34 @@ impl LedgerTxn<'_> {
         request: ExclusiveRequest,
         now: Timestamp,
     ) -> Result<HoldingHandle, KernelError> {
+        self.hold_with_target(request, CleanupTarget::AccountingOnly, now)
+    }
+    fn hold_with_target(
+        &mut self,
+        request: ExclusiveRequest,
+        target: CleanupTarget,
+        now: Timestamp,
+    ) -> Result<HoldingHandle, KernelError> {
         let class = self.registered_class::<Ex>(request.resource.class())?;
         let pool = self.create_pool(
             &class,
             request.resource.instance().clone(),
             Capacity::new(Ex::Token).map_err(map_err)?,
         )?;
-        self.grant(
-            &pool,
-            GrantRequest {
-                owner: request.owner,
-                claim: Claim::new(Ex::Token).map_err(map_err)?,
-                generation: request.generation,
-                parent: request.parent,
-                lease: request.lease,
-                now,
-            },
-        )
-    }
-    fn hold_substrate(
-        &mut self,
-        request: ExclusiveRequest,
-        substrate: &Value,
-        now: Timestamp,
-    ) -> Result<HoldingHandle, KernelError> {
-        let class = request.resource.class().as_str().to_string();
-        if !HOLDABLE_CLASSES.contains(&class.as_str()) {
-            return Err(KernelError::Denied(format!("class not holdable: {class}")));
-        }
-        legacy_cleanup::validate_substrate(&class, substrate)?;
-        let handle = self.hold_exclusive(request, now)?;
-        self.sql.execute(
-            "INSERT INTO substrate(holding_id,kind,detail) VALUES(?1,?2,?3)",
-            params![
-                handle.id().to_sql(),
-                class.strip_prefix("kernel/").unwrap(),
-                substrate.to_string()
-            ],
-        )?;
-        Ok(handle)
+        self.ledger
+            .grant_with_cleanup(
+                &pool,
+                GrantRequest {
+                    owner: request.owner,
+                    claim: Claim::new(Ex::Token).map_err(map_err)?,
+                    generation: request.generation,
+                    parent: request.parent,
+                    lease: request.lease,
+                    now,
+                },
+                target,
+            )
+            .map_err(map_err)
     }
     /// Capability table bookkeeping and resource registration have one owner.
     pub(crate) fn register_capability(
@@ -608,7 +607,7 @@ fn account_key(
 }
 fn spent_in(ledger: &Ledger, key: &ResourceKey) -> u64 {
     ledger
-        .live()
+        .occupying()
         .filter(|h| h.key() == *key)
         .map(|h| match h.frag {
             Frag::Count(Count::Value(n)) => n,
@@ -623,7 +622,7 @@ fn store_capability(conn: &Connection, cap: &Capability) -> Result<(), KernelErr
 pub(crate) fn map_err(e: LedgerError) -> KernelError {
     KernelError::Denied(format!("ledger: {e:?}"))
 }
-pub(crate) use legacy_cleanup::{kill_pid, proc_alive, proc_start_time};
+pub(crate) use substrate::{capture_process, cleanup_process, execute_target, proc_start_time};
 
 /// ```compile_fail
 /// use portos_kernel::ledger::LedgerStore;
@@ -641,6 +640,16 @@ pub(crate) use legacy_cleanup::{kill_pid, proc_alive, proc_start_time};
 /// ```
 const _: () = ();
 
+/// Physical completion is accepted only through the claimed executor boundary.
+/// ```compile_fail
+/// use portos_kernel::ledger::LedgerTxn;
+/// use portos_rm::{cleanup::{CleanupWork, CleanupOutcome}, time::Timestamp};
+/// fn fake_receipt(tx: &mut LedgerTxn<'_>, work: &CleanupWork) {
+///     tx.finish_cleanup(work, CleanupOutcome::Confirmed, Timestamp::ZERO);
+/// }
+/// ```
+const _: () = ();
+
 /// Bootstrap connections are not part of the operational kernel interface.
 /// ```compile_fail
 /// use portos_kernel::Kernel;
@@ -651,3 +660,6 @@ const _: () = ();
 /// let bootstrap = LedgerStore::open;
 /// ```
 const _: () = ();
+
+#[cfg(test)]
+use substrate::proc_alive;

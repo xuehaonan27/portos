@@ -231,6 +231,7 @@ fn withhold_approve_emits_exactly_once_in_order() {
 fn ttl_bounds_feigning_acceptance_expiry_compensates() {
     let mut l = Ledger::new();
     l.register_class(ClassDecl {
+        cleanup: portos_rm::cleanup::CleanupPolicy::AccountingOnly,
         class_id: "reservation".into(),
         algebra: AlgebraTag::Exclusive,
         release_idempotent: true,
@@ -304,6 +305,7 @@ fn ttl_bounds_feigning_acceptance_expiry_compensates() {
 fn paused_segment_is_bounded_by_original_ttl() {
     let mut l = Ledger::new();
     l.register_class(ClassDecl {
+        cleanup: portos_rm::cleanup::CleanupPolicy::AccountingOnly,
         class_id: "reservation".into(),
         algebra: AlgebraTag::Exclusive,
         release_idempotent: true,
@@ -567,7 +569,7 @@ fn budget_is_rows_not_decrement_gate_is_issuer_gate() {
     assert_eq!(
         m.orch
             .ledger
-            .live()
+            .active()
             .filter(|h| h.class_id.as_str() == "budget")
             .count(),
         3,
@@ -607,6 +609,7 @@ fn budget_is_rows_not_decrement_gate_is_issuer_gate() {
 fn strict_failstop_delivers_prefix_and_rolls_back_segment_holdings() {
     let mut l = Ledger::new();
     l.register_class(ClassDecl {
+        cleanup: portos_rm::cleanup::CleanupPolicy::AccountingOnly,
         class_id: "scratch".into(),
         algebra: AlgebraTag::Exclusive,
         release_idempotent: true,
@@ -696,6 +699,7 @@ fn segment_is_a_transaction_commit_promotes_abort_rolls_back() {
     let scratch = || {
         let mut l = Ledger::new();
         l.register_class(ClassDecl {
+            cleanup: portos_rm::cleanup::CleanupPolicy::AccountingOnly,
             class_id: "scratch".into(),
             algebra: AlgebraTag::Exclusive,
             release_idempotent: true,

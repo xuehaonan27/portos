@@ -5,7 +5,7 @@ use portos_rm::ra::{Frac, GSet, Ranges};
 use portos_rm::time::LeaseDuration;
 use serde_json::json;
 
-fn store(tag: &str) -> (Arc<Mutex<Connection>>, std::path::PathBuf) {
+pub(super) fn store(tag: &str) -> (Arc<Mutex<Connection>>, std::path::PathBuf) {
     let root = std::env::temp_dir().join(format!("portos-ledger-{}-{}", tag, std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
@@ -282,7 +282,7 @@ fn compound_ledger_write_is_atomic_under_injected_failure() {
         // An injected failure after a successful row write.
         let r: Result<(), KernelError> = l.transaction(|led| {
             led.create_pool(
-                &led.registered_class::<Ex>(&ClassId::new(CLASS_PLUGIN))
+                &led.registered_class::<Ex>(&ClassId::new(CLASS_CAP))
                     .unwrap(),
                 InstanceId::new("b"),
                 Capacity::new(Ex::Token).unwrap(),
@@ -291,7 +291,7 @@ fn compound_ledger_write_is_atomic_under_injected_failure() {
             let _id = led
                 .grant(
                     &led.pool::<Ex>(&ResourceKey::new(
-                        ClassId::new(CLASS_PLUGIN),
+                        ClassId::new(CLASS_CAP),
                         InstanceId::new("b"),
                     ))
                     .unwrap(),
@@ -347,244 +347,11 @@ fn compound_ledger_write_is_atomic_under_injected_failure() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// A failing world action is journaled ([SAGA]) and the record survives a
-/// reopen; the next teardown of the same subject replays it exactly once
-/// (resume = blind replay, [E-IDEM]).
-#[test]
-fn journal_entries_survive_reopen_and_replay_once() {
-    use std::collections::BTreeMap;
-
-    /// Fails the first world action on one holding; counts actions.
-    struct FlakyWorld {
-        fail_once: Option<HoldingId>,
-        actions: BTreeMap<HoldingId, u32>,
-    }
-    impl World for FlakyWorld {
-        fn release(&mut self, item: &LiveItem) -> Result<(), ()> {
-            *self.actions.entry(item.id).or_insert(0) += 1;
-            if self.fail_once == Some(item.id) {
-                self.fail_once = None;
-                return Err(());
-            }
-            Ok(())
-        }
-        fn compensate(&mut self, _item: &LiveItem, _key: &str) -> Result<bool, ()> {
-            Ok(true)
-        }
-    }
-
-    let (db, root) = store("journal");
-    let journal_states = |db: &Arc<Mutex<Connection>>| -> Vec<(i64, String)> {
-        let conn = db.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT holding_id, state FROM journal ORDER BY holding_id")
-            .unwrap();
-        stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap()
-    };
-
-    let (l, report) = LedgerStore::open(db.clone()).unwrap();
-    assert_eq!(report.journal_pending, 0);
-    // A holding of a class reconcile does not tombstone (a pool row), so
-    // its failed entry survives the reopen below for the replay to show.
-    l.transaction(|tx| {
-        tx.create_count_pool(
-            &AccountId::new("cap_x"),
-            &EffectClass::new("emit"),
-            &SubjectId::new("fixture"),
-            Capacity::new(Count::Value(5)).unwrap(),
-        )
-        .map(|_| ())
-    })
-    .unwrap();
-    let c = l
-        .transaction(|led| {
-            let id = led
-                .grant(
-                    &led.pool::<Count>(&ResourceKey::new(
-                        ClassId::new(CLASS_CAP_COUNT),
-                        InstanceId::new("cap_x/emit"),
-                    ))
-                    .unwrap(),
-                    GrantRequest {
-                        owner: SubjectId::new("plugin:x"),
-                        claim: Claim::new(Count::Value(1)).unwrap(),
-                        generation: Generation::new("g"),
-                        parent: None,
-                        lease: LeaseRequest::UseClassDefault,
-                        now: Timestamp::try_from(1u64).unwrap(),
-                    },
-                )
-                .map(|h| h.id())?;
-            Ok(id)
-        })
-        .unwrap();
-
-    let (outcome, released) = {
-        let mut w = FlakyWorld {
-            fail_once: Some(c),
-            actions: BTreeMap::new(),
-        };
-        let r = l
-            .teardown(
-                &SubjectId::new("plugin:x"),
-                &mut w,
-                Timestamp::try_from(2u64).unwrap(),
-            )
-            .unwrap();
-        assert_eq!(w.actions[&c], 1, "one failed attempt");
-        r
-    };
-    assert!(matches!(outcome, RunOutcome::Completed { ref failed } if failed.as_slice() == [c]));
-    assert_eq!(released, 0, "nothing released: the only action failed");
-    assert_eq!(
-        journal_states(&db),
-        vec![(c.to_sql(), "failed".to_string())]
-    );
-    assert!(
-        l.holding(c).unwrap().unwrap().released_at.is_none(),
-        "row still live"
-    );
-
-    // Reopen: the pending entry is reported, the row is still live.
-    drop(l);
-    let (l, report) = LedgerStore::open(db.clone()).unwrap();
-    assert_eq!(
-        report.journal_pending, 1,
-        "failed entry survived the reopen"
-    );
-    assert!(l.holding(c).unwrap().unwrap().released_at.is_none());
-
-    // The next teardown of the subject replays the entry exactly once.
-    let mut w = FlakyWorld {
-        fail_once: None,
-        actions: BTreeMap::new(),
-    };
-    let (outcome, released) = l
-        .teardown(
-            &SubjectId::new("plugin:x"),
-            &mut w,
-            Timestamp::try_from(2u64).unwrap(),
-        )
-        .unwrap();
-    assert!(matches!(outcome, RunOutcome::Completed { ref failed } if failed.is_empty()));
-    assert_eq!(released, 1);
-    assert_eq!(w.actions[&c], 1, "replayed exactly once on this teardown");
-    assert_eq!(journal_states(&db), vec![(c.to_sql(), "done".to_string())]);
-
-    let (l, report) = LedgerStore::open(db.clone()).unwrap();
-    assert_eq!(report.journal_pending, 0);
-    l.invariant().unwrap();
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// Plugin and subscription rows from a previous kernel process are decayed
-/// holdings: reopening tombstones them children first, and the instance
-/// becomes available again.
-#[test]
-fn stale_plugin_rows_are_reconciled_on_open() {
-    let (db, root) = store("stale");
-    {
-        let (l, _) = LedgerStore::open(db.clone()).unwrap();
-        let p = l
-            .hold_exclusive(
-                ExclusiveRequest {
-                    owner: SubjectId::new("plugin:x"),
-                    resource: ResourceKey::new(ClassId::new(CLASS_PLUGIN), InstanceId::new("x")),
-                    generation: Generation::new("tok1"),
-                    parent: None,
-                    lease: LeaseRequest::UseClassDefault,
-                },
-                Timestamp::try_from(1u64).unwrap(),
-            )
-            .map(|h| h.id())
-            .unwrap();
-        l.hold_exclusive(
-            ExclusiveRequest {
-                owner: SubjectId::new("plugin:x"),
-                resource: ResourceKey::new(ClassId::new(CLASS_SUBSCRIPTION), InstanceId::new("7")),
-                generation: Generation::new("sub"),
-                parent: Some(p).map(|id| l.holding(id).unwrap().unwrap().handle()),
-                lease: LeaseRequest::UseClassDefault,
-            },
-            Timestamp::try_from(1u64).unwrap(),
-        )
-        .map(|h| h.id())
-        .unwrap();
-        assert!(
-            l.hold_exclusive(
-                ExclusiveRequest {
-                    owner: SubjectId::new("plugin:x"),
-                    resource: ResourceKey::new(ClassId::new(CLASS_PLUGIN), InstanceId::new("x")),
-                    generation: Generation::new("tok2"),
-                    parent: None,
-                    lease: LeaseRequest::UseClassDefault
-                },
-                Timestamp::try_from(1u64).unwrap()
-            )
-            .map(|h| h.id())
-            .is_err(),
-            "name taken while live"
-        );
-        // A child plugin of x (parent/child instantiation, WP-04): the
-        // parent row's release is blocked while the child lives, so
-        // reconcile must reach a children-first fixpoint.
-        let c = l
-            .hold_exclusive_child(
-                ExclusiveRequest {
-                    owner: SubjectId::new("plugin:y"),
-                    resource: ResourceKey::new(ClassId::new(CLASS_PLUGIN), InstanceId::new("y")),
-                    generation: Generation::new("tokc"),
-                    parent: Some(p).map(|id| l.holding(id).unwrap().unwrap().handle()),
-                    lease: LeaseRequest::UseClassDefault,
-                },
-                SubjectId::new("plugin:x"),
-                Timestamp::try_from(1u64).unwrap(),
-            )
-            .map(|h| h.id())
-            .unwrap();
-        assert_eq!(l.holding(c).unwrap().unwrap().parent, Some(p));
-    }
-    let (l, report) = LedgerStore::open(db.clone()).unwrap();
-    assert_eq!(report.stale_rows, 3);
-    assert_eq!(l.counts(&ClassId::new(CLASS_PLUGIN)).unwrap(), (0, 2));
-    assert_eq!(l.counts(&ClassId::new(CLASS_SUBSCRIPTION)).unwrap(), (0, 1));
-    l.hold_exclusive(
-        ExclusiveRequest {
-            owner: SubjectId::new("plugin:x"),
-            resource: ResourceKey::new(ClassId::new(CLASS_PLUGIN), InstanceId::new("x")),
-            generation: Generation::new("tok2"),
-            parent: None,
-            lease: LeaseRequest::UseClassDefault,
-        },
-        Timestamp::try_from(2u64).unwrap(),
-    )
-    .map(|h| h.id())
-    .unwrap();
-    l.invariant().unwrap();
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-#[derive(Default)]
-struct RecordingWorld {
-    released: Vec<HoldingId>,
-}
-impl World for RecordingWorld {
-    fn release(&mut self, item: &LiveItem) -> Result<(), ()> {
-        self.released.push(item.id);
-        Ok(())
-    }
-    fn compensate(&mut self, _item: &LiveItem, _key: &str) -> Result<bool, ()> {
-        Ok(true)
-    }
-}
-
-fn register_test_class(l: &LedgerStore, class: &str, lease_secs: Option<u64>) {
+pub(super) fn register_test_class(l: &LedgerStore, class: &str, lease_secs: Option<u64>) {
     l.transaction(|tx| {
         tx.register_class(ClassDecl {
-            class_id: ClassId::new(class),
+            cleanup: CleanupPolicy::Managed(CleanupKind::Provider),
+            class_id: class.into(),
             algebra: AlgebraTag::Exclusive,
             release_idempotent: true,
             lease_duration: lease_secs.map(|n| LeaseDuration::try_from(n).unwrap()),
@@ -594,122 +361,225 @@ fn register_test_class(l: &LedgerStore, class: &str, lease_secs: Option<u64>) {
     })
     .unwrap();
 }
+pub(super) fn provider_hold(
+    l: &LedgerStore,
+    class: &str,
+    instance: &str,
+    owner: &str,
+    parent: Option<HoldingHandle>,
+    now: Timestamp,
+) -> HoldingHandle {
+    l.hold_managed(
+        ExclusiveRequest {
+            owner: owner.into(),
+            resource: ResourceKey::new(class.into(), instance.into()),
+            generation: Generation::new("fixture"),
+            parent,
+            lease: LeaseRequest::UseClassDefault,
+        },
+        CleanupTarget::Provider,
+        None,
+        now,
+    )
+    .unwrap()
+}
+#[derive(Default)]
+struct RecordingWorld {
+    released: Vec<HoldingId>,
+}
+impl CleanupExecutor for RecordingWorld {
+    fn execute(&mut self, work: &CleanupWork) -> CleanupOutcome {
+        self.released.push(work.task().holding.id());
+        CleanupOutcome::Confirmed
+    }
+}
 
-/// Conservative sweep (ruling 3, mirror of the law): an expired parent
-/// waits while a child holds its own unexpired lease; lease-None
-/// descendants go with the parent, children first, world actions included.
+/// Durable tasks retain failed cleanup across restart; accounting rows do not
+/// pretend to have physical world actions.
+#[test]
+fn journal_entries_survive_reopen_and_replay_once() {
+    struct FlakyWorld {
+        fail: bool,
+        actions: usize,
+    }
+    impl CleanupExecutor for FlakyWorld {
+        fn execute(&mut self, _: &CleanupWork) -> CleanupOutcome {
+            self.actions += 1;
+            if self.fail {
+                CleanupOutcome::Retryable("offline".into())
+            } else {
+                CleanupOutcome::Confirmed
+            }
+        }
+    }
+    let (db, root) = store("journal");
+    let (l, _) = LedgerStore::open(db.clone()).unwrap();
+    register_test_class(&l, "test/physical", None);
+    let h = provider_hold(&l, "test/physical", "x", "plugin:x", None, Timestamp::ZERO);
+    let mut world = FlakyWorld {
+        fail: true,
+        actions: 0,
+    };
+    let report = l
+        .release_with_world(&h, &mut world, Timestamp::ZERO)
+        .unwrap();
+    assert_eq!(world.actions, 1);
+    assert_eq!(report.pending.len(), 1);
+    assert!(report.completed.is_empty());
+    let key = report.pending[0].key.clone();
+    assert!(matches!(
+        l.holding(h.id()).unwrap().unwrap().state,
+        HoldingState::Retiring(_)
+    ));
+    assert!(
+        l.live_snapshot(&SubjectId::new("plugin:x"))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        l.occupying_snapshot(&SubjectId::new("plugin:x"))
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(l);
+    let (l, report) = LedgerStore::open(db.clone()).unwrap();
+    assert_eq!(report.cleanup_pending, 1);
+    assert_eq!(l.cleanup_tasks().unwrap()[0].key, key);
+    let mut world = FlakyWorld {
+        fail: false,
+        actions: 0,
+    };
+    let report = l.retry_cleanup(&mut world, Timestamp::ZERO).unwrap();
+    assert_eq!(world.actions, 1);
+    assert_eq!(report.completed, vec![h.clone()]);
+    l.retry_cleanup(&mut world, Timestamp::ZERO).unwrap();
+    assert_eq!(world.actions, 1);
+    drop(l);
+    let (l, report) = LedgerStore::open(db).unwrap();
+    assert_eq!(report.cleanup_pending, 0);
+    assert!(l.holding(h.id()).unwrap().unwrap().released_at().is_some());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn stale_plugin_rows_are_reconciled_on_open() {
+    let (db, root) = store("stale");
+    let (l, _) = LedgerStore::open(db.clone()).unwrap();
+    // A previous boot is unambiguously absent, even when the numeric PID exists.
+    let process = ProcessWitness::new(std::process::id(), 1, "previous-boot".into()).unwrap();
+    let host = HostWitness::new(process.clone(), "old-host".into()).unwrap();
+    let parent = l
+        .hold_managed(
+            ExclusiveRequest {
+                owner: "plugin:x".into(),
+                resource: ResourceKey::new(CLASS_PLUGIN.into(), "x".into()),
+                generation: "tok1".into(),
+                parent: None,
+                lease: LeaseRequest::Unbounded,
+            },
+            CleanupTarget::Plugin {
+                host: host.clone(),
+                process: process.clone(),
+            },
+            None,
+            Timestamp::ZERO,
+        )
+        .unwrap();
+    l.hold_managed(
+        ExclusiveRequest {
+            owner: "plugin:x".into(),
+            resource: ResourceKey::new(CLASS_SUBSCRIPTION.into(), "7".into()),
+            generation: "sub".into(),
+            parent: Some(parent.clone()),
+            lease: LeaseRequest::ParentBound,
+        },
+        CleanupTarget::Subscription {
+            host: host.clone(),
+            subscription: 7,
+        },
+        None,
+        Timestamp::ZERO,
+    )
+    .unwrap();
+    // Distinct child incarnation, still from the absent boot.
+    let child_process = ProcessWitness::new(std::process::id(), 2, "previous-boot".into()).unwrap();
+    l.hold_managed(
+        ExclusiveRequest {
+            owner: "plugin:y".into(),
+            resource: ResourceKey::new(CLASS_PLUGIN.into(), "y".into()),
+            generation: "child".into(),
+            parent: Some(parent),
+            lease: LeaseRequest::ParentBound,
+        },
+        CleanupTarget::Plugin {
+            host,
+            process: child_process,
+        },
+        Some("plugin:x".into()),
+        Timestamp::ZERO,
+    )
+    .unwrap();
+    drop(l);
+    let (l, report) = LedgerStore::open(db).unwrap();
+    assert_eq!(report.stale_rows, 3);
+    assert_eq!(l.counts(&CLASS_PLUGIN.into()).unwrap(), (0, 2));
+    assert_eq!(l.counts(&CLASS_SUBSCRIPTION.into()).unwrap(), (0, 1));
+    assert!(l.cleanup_tasks().unwrap().iter().all(|t| t.state.is_done()));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn expired_parent_waits_for_child_with_its_own_lease() {
     let (db, root) = store("sweep");
-    let (l, _report) = LedgerStore::open(db.clone()).unwrap();
+    let (l, _) = LedgerStore::open(db.clone()).unwrap();
     register_test_class(&l, "test/leased", Some(1));
-    register_test_class(&l, "test/leased-long", Some(3600));
+    register_test_class(&l, "test/long", Some(3600));
     register_test_class(&l, "test/unleased", None);
-    let (p, c, g) = l
-        .transaction(|led| {
-            for (class, instance) in [
-                ("test/leased", "p"),
-                ("test/leased-long", "c"),
-                ("test/unleased", "g"),
-            ] {
-                led.create_pool(
-                    &led.registered_class::<Ex>(&ClassId::new(class)).unwrap(),
-                    InstanceId::new(instance),
-                    Capacity::new(Ex::Token).unwrap(),
-                )
-                .unwrap();
-            }
-            let p = led
-                .grant(
-                    &led.pool::<Ex>(&ResourceKey::new(
-                        ClassId::new("test/leased"),
-                        InstanceId::new("p"),
-                    ))
-                    .unwrap(),
-                    GrantRequest {
-                        owner: SubjectId::new("test"),
-                        claim: Claim::new(Ex::Token).unwrap(),
-                        generation: Generation::new("gp"),
-                        parent: None,
-                        lease: LeaseRequest::UseClassDefault,
-                        now: Timestamp::try_from(0u64).unwrap(),
-                    },
-                )
-                .map(|h| h.id())?;
-            let c = led
-                .grant(
-                    &led.pool::<Ex>(&ResourceKey::new(
-                        ClassId::new("test/leased-long"),
-                        InstanceId::new("c"),
-                    ))
-                    .unwrap(),
-                    GrantRequest {
-                        owner: SubjectId::new("test"),
-                        claim: Claim::new(Ex::Token).unwrap(),
-                        generation: Generation::new("gc"),
-                        parent: Some(p).map(|id| led.holding(id).unwrap().handle()),
-                        lease: LeaseRequest::UseClassDefault,
-                        now: Timestamp::try_from(0u64).unwrap(),
-                    },
-                )
-                .map(|h| h.id())?;
-            let g = led
-                .grant(
-                    &led.pool::<Ex>(&ResourceKey::new(
-                        ClassId::new("test/unleased"),
-                        InstanceId::new("g"),
-                    ))
-                    .unwrap(),
-                    GrantRequest {
-                        owner: SubjectId::new("test"),
-                        claim: Claim::new(Ex::Token).unwrap(),
-                        generation: Generation::new("gg"),
-                        parent: Some(c).map(|id| led.holding(id).unwrap().handle()),
-                        lease: LeaseRequest::UseClassDefault,
-                        now: Timestamp::try_from(0u64).unwrap(),
-                    },
-                )
-                .map(|h| h.id())?;
-            for _id in [p, c, g] {}
-            Ok((p, c, g))
-        })
-        .unwrap();
-
+    let p = provider_hold(&l, "test/leased", "p", "test", None, Timestamp::ZERO);
+    let c = provider_hold(
+        &l,
+        "test/long",
+        "c",
+        "test",
+        Some(p.clone()),
+        Timestamp::ZERO,
+    );
+    let g = provider_hold(
+        &l,
+        "test/unleased",
+        "g",
+        "test",
+        Some(c.clone()),
+        Timestamp::ZERO,
+    );
     let mut world = RecordingWorld::default();
-    let r = l
+    let report = l
         .sweep_with_world(&mut world, Timestamp::try_from(2u64).unwrap())
         .unwrap();
+    assert!(report.released.is_empty());
+    assert!(world.released.is_empty());
+    assert!(matches!(
+        l.holding(p.id()).unwrap().unwrap().state,
+        HoldingState::Retiring(_)
+    ));
+    assert!(l.holding(c.id()).unwrap().unwrap().state.is_active());
+    assert_eq!(l.occupying_snapshot(&"test".into()).unwrap().len(), 3);
     assert!(
-        r.released.is_empty(),
-        "the expired parent waits on the child's own lease"
+        l.renew(&p, LeaseRequest::Unbounded, Timestamp::ZERO)
+            .is_err()
     );
-    assert_eq!(l.inner.lock().unwrap().ledger.live_count(), 3);
-    assert!(world.released.is_empty(), "no world action while waiting");
-
-    let r = l
+    l.renew(&c, LeaseRequest::UseClassDefault, Timestamp::ZERO)
+        .unwrap();
+    let report = l
         .sweep_with_world(&mut world, Timestamp::try_from(3601u64).unwrap())
         .unwrap();
-    assert_eq!(
-        r.released.len(),
-        3,
-        "once the child is due, the whole chain goes"
-    );
-    assert_eq!(
-        world.released,
-        vec![g, c, p],
-        "children first, world actions too"
-    );
-    l.invariant().unwrap();
-
-    // Tombstones are durable.
+    assert_eq!(report.released.len(), 3);
+    assert_eq!(world.released, vec![g.id(), c.id(), p.id()]);
     drop(l);
-    let (l, _report) = LedgerStore::open(db.clone()).unwrap();
-    assert_eq!(
-        l.inner.lock().unwrap().ledger.live_count(),
-        0,
-        "all rows stayed tombstoned"
-    );
-    let _ = std::fs::remove_dir_all(&root);
+    let (l, _) = LedgerStore::open(db).unwrap();
+    assert_eq!(l.inner.lock().unwrap().ledger.live_count(), 0);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 /// Substrate reconcile (WP-02): a live `kernel/process` row of a previous
@@ -1035,7 +905,7 @@ fn legacy_migration_imports_capacity_once_and_retains_history() {
         conn.query_row("SELECT version FROM resource_schema", [], |r| r
             .get::<_, i64>(0))
             .unwrap(),
-        1
+        2
     );
     assert_eq!(
         conn.query_row("SELECT COUNT(*) FROM resource_accounts", [], |r| r
@@ -1123,6 +993,7 @@ fn all_five_algebras_round_trip_as_registered_pools_and_claims() {
     ) -> Result<(), KernelError> {
         let c = tx
             .register_class(ClassDecl {
+                cleanup: portos_rm::cleanup::CleanupPolicy::AccountingOnly,
                 class_id: ClassId::new(name),
                 algebra: A::TAG,
                 release_idempotent: true,

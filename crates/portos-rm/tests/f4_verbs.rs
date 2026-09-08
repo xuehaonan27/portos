@@ -451,6 +451,7 @@ fn truth_table_is_shared_source_for_f2_teardown_and_f3_monitor() {
     let mut l = Ledger::new();
     for class in ["enclosure", "reservation"] {
         l.register_class(ClassDecl {
+            cleanup: portos_rm::cleanup::CleanupPolicy::AccountingOnly,
             class_id: class.into(),
             algebra: AlgebraTag::Exclusive,
             release_idempotent: true,

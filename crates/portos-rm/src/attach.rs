@@ -436,6 +436,7 @@ impl Scheduler {
         ] {
             ledger
                 .register_class(ClassDecl {
+                    cleanup: crate::cleanup::CleanupPolicy::AccountingOnly,
                     class_id: cid.into(),
                     algebra,
                     release_idempotent: true,
@@ -518,7 +519,7 @@ impl Scheduler {
 
     fn user_root(&self) -> HoldingId {
         self.ledger
-            .live()
+            .active()
             .find(|h| h.class_id.as_str() == CLASS_USER_ROOT)
             .map(|h| h.id)
             .expect("user root")
@@ -558,6 +559,7 @@ impl Scheduler {
         // 根持有：类＝声明含 T（租约＝ttl）。
         self.ledger
             .register_class(ClassDecl {
+                cleanup: crate::cleanup::CleanupPolicy::AccountingOnly,
                 class_id: root_class(&id).into(),
                 algebra: AlgebraTag::Exclusive,
                 release_idempotent: true,
@@ -875,7 +877,7 @@ impl Scheduler {
     pub fn fired_count(&self, id: &str) -> u64 {
         let inst = pool_instance(id, FIRE_CLASS);
         self.ledger
-            .live()
+            .active()
             .filter(|h| h.class_id.as_str() == CLASS_POOL && h.instance.as_str() == inst)
             .count() as u64
     }
@@ -1332,7 +1334,7 @@ impl Scheduler {
         let seqs: Vec<u64> = self.attachments[id].firings.iter().map(|r| r.seq).collect();
         for seq in seqs {
             let seg = seg_subject(id, seq);
-            if self.ledger.live().any(|h| h.subject.as_str() == seg) {
+            if self.ledger.active().any(|h| h.subject.as_str() == seg) {
                 self.settle(id, seq, inflight_end, now);
             }
         }
@@ -1489,7 +1491,7 @@ impl Scheduler {
             let fire_inst = pool_instance(&id, FIRE_CLASS);
             let seqs: Vec<u64> = self
                 .ledger
-                .live()
+                .active()
                 .filter(|h| h.class_id.as_str() == CLASS_POOL && h.instance.as_str() == fire_inst)
                 .filter_map(|h| {
                     h.generation
@@ -1528,7 +1530,7 @@ impl Scheduler {
                             });
                         }
                     }
-                    Some(row) if row.released_at.is_none() => {
+                    Some(row) if row.released_at().is_none() => {
                         // 在途触发：③已写、未结账 ⇒ Crashed 结账（撤回、拆段、容量置 0）。
                         if !self.attachments[&id].status.is_terminal() {
                             self.settle(&id, seq, End::Crashed, now);
@@ -1586,7 +1588,7 @@ impl Scheduler {
         }
         for h in self
             .ledger
-            .live()
+            .active()
             .filter(|h| h.class_id.as_str() == CLASS_POOL)
         {
             if let Frag::Count(Count::Value(n)) = h.frag {
@@ -1638,7 +1640,7 @@ impl Scheduler {
         };
         let live: Vec<Count> = self
             .ledger
-            .live()
+            .active()
             .filter(|h| h.class_id.as_str() == CLASS_POOL && h.instance.as_str() == inst)
             .filter_map(|h| match h.frag {
                 Frag::Count(c) => Some(c),
@@ -1725,7 +1727,7 @@ impl Scheduler {
             if a.status.is_terminal() {
                 let subj = attach_subject(id);
                 let spent = spent_subject(id);
-                if self.ledger.live().any(|h| {
+                if self.ledger.active().any(|h| {
                     h.subject.as_str() == subj
                         || h.subject.as_str() == spent
                         || h.subject.as_str().starts_with(&format!("{subj}:seg#"))

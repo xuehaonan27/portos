@@ -33,10 +33,9 @@ pub trait World {
 }
 
 // ---------------------------------------------------------------------------
-// 反向日志（saga-log）。演练中为进程内结构；实装落 SQLite —— 内核
-// `crates/portos-kernel/src/ledger.rs` 的 `journal` 表，与墓碑同事务写穿，
-// 重启后由该主体的下一次 teardown 回放。"耐久性"由崩溃模拟约定表达：崩溃丢
-// Executor、保 Ledger+Journal —— 正是"账本与日志活过内核崩溃"的模拟。
+// 反向日志（saga-log）。这是 F2 的进程内演练结构，其崩溃模拟保留 Ledger+Journal。
+// 生产内核使用 cleanup 模块的持久任务与独立提交，不以这里的进程内步骤证明
+// 持久意图先于世界动作；本模块的模拟入口隔离仍属于 M3。
 // ---------------------------------------------------------------------------
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum JState {
@@ -59,7 +58,7 @@ pub struct JournalEntry {
 pub struct Journal(pub Vec<JournalEntry>);
 
 impl Journal {
-    /// 实装回灌：从持久层载入的条目重建日志（内核 `journal` 表 → 内存日志）。
+    /// 演练回灌：从保留的原始条目重建进程内日志。
     pub fn from_entries(entries: Vec<JournalEntry>) -> Journal {
         Journal(entries)
     }
@@ -423,5 +422,16 @@ fn run<W: World>(
         if !progressed {
             return RunOutcome::Completed { failed };
         }
+    }
+}
+
+// The drill world can also exercise the durable kernel coordinator. Its effects
+// are idempotent by exact identity, and compensation deduplicates the stable key.
+impl crate::cleanup::CleanupExecutor for MockWorld {
+    fn execute(&mut self, work: &crate::cleanup::CleanupWork) -> crate::cleanup::CleanupOutcome {
+        use crate::cleanup::CleanupOutcome;
+        let item=LiveItem { id:work.task().holding.id(),parent:None,class_id:work.resource().class().clone(),instance:work.resource().instance().clone(),generation:work.task().holding.generation().clone(),grade:work.grade() };
+        let result=if work.grade()==RevertGrade::Compensable { self.compensate(&item,work.task().key.as_str()).map(|_|()) } else { self.release(&item) };
+        match result { Ok(())=>CleanupOutcome::Confirmed,Err(())=>CleanupOutcome::Retryable("injected drill failure".into()) }
     }
 }

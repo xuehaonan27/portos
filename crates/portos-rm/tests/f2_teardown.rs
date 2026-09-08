@@ -20,6 +20,7 @@ fn browser_ledger() -> (Ledger, HoldingId) {
         ("reservation", Some(300), RevertGrade::Compensable),
     ] {
         l.register_class(ClassDecl {
+            cleanup: portos_rm::cleanup::CleanupPolicy::AccountingOnly,
             class_id: cid.into(),
             algebra: AlgebraTag::Exclusive,
             release_idempotent: true,
@@ -336,6 +337,7 @@ fn teardown_cascades_across_subjects_along_ownership() {
         ("tcp-port", Some(30)),
     ] {
         l.register_class(ClassDecl {
+            cleanup: portos_rm::cleanup::CleanupPolicy::AccountingOnly,
             class_id: cid.into(),
             algebra: AlgebraTag::Exclusive,
             release_idempotent: true,
@@ -504,6 +506,7 @@ fn subtree_teardown_is_children_first_and_spares_off_tree_holdings() {
         let mut l = Ledger::new();
         for cid in ["cap", "pool", "route"] {
             l.register_class(ClassDecl {
+                cleanup: portos_rm::cleanup::CleanupPolicy::AccountingOnly,
                 class_id: cid.into(),
                 algebra: AlgebraTag::Exclusive,
                 release_idempotent: true,
@@ -622,10 +625,10 @@ fn subtree_teardown_is_children_first_and_spares_off_tree_holdings() {
             "子先于父，根最后"
         );
         assert!(
-            l.holding(other).unwrap().released_at.is_none(),
+            l.holding(other).unwrap().released_at().is_none(),
             "子树外的持有不动"
         );
-        assert!(l.holding(cap).unwrap().released_at.is_some(), "根本人落碑");
+        assert!(l.holding(cap).unwrap().released_at().is_some(), "根本人落碑");
         l.invariant().unwrap();
     }
 }

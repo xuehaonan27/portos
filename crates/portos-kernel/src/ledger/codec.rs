@@ -132,7 +132,7 @@ pub(super) fn grade(s: &str) -> Result<RevertGrade, KernelError> {
 }
 pub(super) fn persist(conn: &Connection, snapshot: &LedgerSnapshot) -> Result<(), KernelError> {
     for d in &snapshot.classes {
-        conn.execute("INSERT INTO resource_classes(class_id,algebra,release_idempotent,lease_secs,revert_grade) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(class_id) DO NOTHING", params![d.class_id.as_str(), algebra_name(d.algebra), i64::from(d.release_idempotent), d.lease_duration.map(|d| i64::try_from(d.get()).expect("duration validated")), grade_name(d.revert_grade)])?;
+        conn.execute("INSERT INTO resource_classes(class_id,algebra,release_idempotent,lease_secs,revert_grade,cleanup) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(class_id) DO NOTHING", params![d.class_id.as_str(), algebra_name(d.algebra), i64::from(d.release_idempotent), d.lease_duration.map(|d| i64::try_from(d.get()).expect("duration validated")), grade_name(d.revert_grade),cleanup_codec::policy_name(d.cleanup)])?;
     }
     for p in &snapshot.pools {
         conn.execute("INSERT INTO resource_pools(class_id,instance,capacity) VALUES(?1,?2,?3) ON CONFLICT(class_id,instance) DO UPDATE SET capacity=excluded.capacity", params![p.key.class().as_str(), p.key.instance().as_str(), frag_to_json(&p.capacity)])?;
@@ -146,14 +146,21 @@ pub(super) fn persist(conn: &Connection, snapshot: &LedgerSnapshot) -> Result<()
             Lease::ParentBound => "parent",
             Lease::Unbounded => "unbounded",
         };
-        conn.execute("INSERT INTO holdings(id,subject,class_id,instance,frag,generation,parent,lease_expires_at,acquired_at,released_at,lease_kind) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(id) DO UPDATE SET subject=excluded.subject,lease_expires_at=excluded.lease_expires_at,released_at=excluded.released_at,lease_kind=excluded.lease_kind", params![h.id.to_sql(),h.subject.as_str(),h.class_id.as_str(),h.instance.as_str(),frag_to_json(&h.frag),h.generation.as_str(),h.parent.map(HoldingId::to_sql),h.lease.expires_at().map(Timestamp::to_sql),h.acquired_at.to_sql(),h.released_at.map(Timestamp::to_sql),kind])?;
+        conn.execute("INSERT INTO holdings(id,subject,class_id,instance,frag,generation,parent,lease_expires_at,acquired_at,released_at,lease_kind,state,target) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13) ON CONFLICT(id) DO UPDATE SET subject=excluded.subject,lease_expires_at=excluded.lease_expires_at,released_at=excluded.released_at,lease_kind=excluded.lease_kind,state=excluded.state,target=excluded.target", params![h.id.to_sql(),h.subject.as_str(),h.class_id.as_str(),h.instance.as_str(),frag_to_json(&h.frag),h.generation.as_str(),h.parent.map(HoldingId::to_sql),h.lease.expires_at().map(Timestamp::to_sql),h.acquired_at.to_sql(),h.released_at().map(Timestamp::to_sql),kind,match h.state {HoldingState::Active=>"active",HoldingState::Retiring(_)=>"retiring",HoldingState::Retired(_)=>"retired"},cleanup_codec::target_json(&h.target)?])?;
+    }
+    for task in &snapshot.cleanups {
+        conn.execute("INSERT INTO resource_cleanup(holding_id,record) VALUES(?1,?2) ON CONFLICT(holding_id) DO UPDATE SET record=excluded.record", params![task.holding.id().to_sql(),cleanup_codec::task_json(task)?])?;
     }
     Ok(())
 }
 
-pub(super) fn decode(conn: &Connection, legacy: bool) -> Result<LedgerSnapshot, KernelError> {
+pub(super) fn decode(
+    conn: &Connection,
+    legacy: bool,
+    migrate: bool,
+) -> Result<LedgerSnapshot, KernelError> {
     let mut snapshot = LedgerSnapshot::default();
-    let mut stmt = conn.prepare("SELECT class_id,algebra,release_idempotent,lease_secs,revert_grade FROM resource_classes ORDER BY class_id")?;
+    let mut stmt = conn.prepare("SELECT class_id,algebra,release_idempotent,lease_secs,revert_grade,cleanup FROM resource_classes ORDER BY class_id")?;
     let rows = stmt.query_map([], |r| {
         Ok((
             r.get::<_, String>(0)?,
@@ -161,10 +168,16 @@ pub(super) fn decode(conn: &Connection, legacy: bool) -> Result<LedgerSnapshot, 
             r.get::<_, i64>(2)?,
             r.get::<_, Option<i64>>(3)?,
             r.get::<_, String>(4)?,
+            r.get::<_, Option<String>>(5)?,
         ))
     })?;
     for row in rows {
-        let (id, a, idem, lease, g) = row?;
+        let (id, a, idem, lease, g, cleanup) = row?;
+        let cleanup = match cleanup {
+            Some(p) => cleanup_codec::policy(&p)?,
+            None if migrate => recovery::builtin_policy(&id),
+            None => return Err(corrupt("missing cleanup policy")),
+        };
         if idem != 0 && idem != 1 {
             return Err(corrupt("invalid release declaration"));
         }
@@ -178,6 +191,7 @@ pub(super) fn decode(conn: &Connection, legacy: bool) -> Result<LedgerSnapshot, 
             })
             .transpose()?;
         snapshot.classes.push(ClassDecl {
+            cleanup,
             class_id: id.into(),
             algebra: algebra(&a)?,
             release_idempotent: idem == 1,
@@ -207,7 +221,7 @@ pub(super) fn decode(conn: &Connection, legacy: bool) -> Result<LedgerSnapshot, 
         let (c, p) = row?;
         snapshot.instantiations.push((c.into(), p.into()));
     }
-    let mut stmt = conn.prepare("SELECT id,subject,class_id,instance,frag,generation,parent,lease_expires_at,acquired_at,released_at,lease_kind FROM holdings ORDER BY id")?;
+    let mut stmt = conn.prepare("SELECT id,subject,class_id,instance,frag,generation,parent,lease_expires_at,acquired_at,released_at,lease_kind,state,target FROM holdings ORDER BY id")?;
     let rows = stmt.query_map([], |r| {
         Ok((
             r.get::<_, i64>(0)?,
@@ -221,11 +235,13 @@ pub(super) fn decode(conn: &Connection, legacy: bool) -> Result<LedgerSnapshot, 
             r.get::<_, i64>(8)?,
             r.get::<_, Option<i64>>(9)?,
             r.get::<_, Option<String>>(10)?,
+            r.get::<_, Option<String>>(11)?,
+            r.get::<_, Option<String>>(12)?,
         ))
     })?;
     let boundary = |e| corrupt(format!("holding identity/time: {e:?}"));
     for row in rows {
-        let (id, subject, c, i, f, g, p, exp, acq, rel, kind) = row?;
+        let (id, subject, c, i, f, g, p, exp, acq, rel, kind, state, target) = row?;
         let id = HoldingId::try_from(id).map_err(boundary)?;
         let parent = p.map(HoldingId::try_from).transpose().map_err(boundary)?;
         let expires = exp.map(Timestamp::try_from).transpose().map_err(boundary)?;
@@ -252,8 +268,40 @@ pub(super) fn decode(conn: &Connection, legacy: bool) -> Result<LedgerSnapshot, 
             parent,
             lease,
             acquired_at: Timestamp::try_from(acq).map_err(boundary)?,
-            released_at: rel.map(Timestamp::try_from).transpose().map_err(boundary)?,
+            state: match (
+                state.as_deref(),
+                rel.map(Timestamp::try_from).transpose().map_err(boundary)?,
+            ) {
+                (Some("active"), None) => HoldingState::Active,
+                (Some("retiring"), None) => {
+                    HoldingState::Retiring(CleanupId::try_from(id.to_sql()).map_err(boundary)?)
+                }
+                (Some("retired"), Some(t)) => HoldingState::Retired(t),
+                (None, None) if migrate => HoldingState::Active,
+                (None, Some(t)) if migrate => HoldingState::Retired(t),
+                _ => {
+                    return Err(corrupt(format!(
+                        "holding {id}: inconsistent retirement state"
+                    )));
+                }
+            },
+            target: match target {
+                Some(t) => cleanup_codec::target(&t)?,
+                None if migrate => CleanupTarget::AccountingOnly,
+                None => return Err(corrupt(format!("holding {id}: missing target"))),
+            },
         });
+    }
+    for row in conn
+        .prepare("SELECT holding_id,record FROM resource_cleanup ORDER BY holding_id")?
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+    {
+        let (id, json) = row?;
+        let task = cleanup_codec::task(&json)?;
+        if task.holding.id().to_sql() != id {
+            return Err(corrupt("cleanup row identity differs"));
+        }
+        snapshot.cleanups.push(task);
     }
     Ok(snapshot)
 }

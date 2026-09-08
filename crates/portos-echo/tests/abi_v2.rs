@@ -454,7 +454,7 @@ fn plugin_death_is_reclaimed_crash_only_children_first() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while !kernel
         .ledger
-        .live_snapshot(&SubjectId::new(subject))
+        .occupying_snapshot(&SubjectId::new(subject))
         .unwrap()
         .is_empty()
     {
@@ -858,7 +858,8 @@ fn spawn_child_is_capability_gated_and_parent_death_reclaims_children_first() {
         .status()
         .unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while kernel.ledger.counts(&ClassId::new(CLASS_PLUGIN)).unwrap().0 > 0 {
+    while kernel.ledger.counts(&ClassId::new(CLASS_PLUGIN)).unwrap() != (0,2)
+        || kernel.ledger.cleanup_tasks().unwrap().iter().any(|t|!t.state.is_done()) {
         assert!(
             std::time::Instant::now() < deadline,
             "parent death never reclaimed the child"
@@ -895,12 +896,8 @@ fn spawn_child_is_capability_gated_and_parent_death_reclaims_children_first() {
             && e["parent"] == "portos-echop"),
         "the spawn names its parent"
     );
-    assert!(
-        events.iter().any(|e| e["event"] == "plugin.reclaimed"
-            && e["plugin"] == "portos-echop"
-            && e["released"] == 3),
-        "one teardown released the child, the parent's spawn cap and the parent"
-    );
+    assert_eq!(kernel.ledger.cleanup_tasks().unwrap().iter().filter(|t|t.state.is_done()).count(),3,
+        "the child, the parent's grant and the parent have durable confirmations");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -946,12 +943,8 @@ fn plugin_registers_a_child_process_holding_and_kill_minus_nine_reaps_it() {
         .status()
         .unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while kernel
-        .ledger
-        .counts(&ClassId::new(CLASS_PROCESS))
-        .unwrap()
-        .0
-        > 0
+    while kernel.ledger.counts(&ClassId::new(CLASS_PROCESS)).unwrap().1 != 1
+        || kernel.ledger.counts(&ClassId::new(CLASS_PLUGIN)).unwrap().1 != 1
     {
         assert!(
             std::time::Instant::now() < deadline,
@@ -1040,7 +1033,7 @@ fn attenuated_child_capability_dies_with_its_parent_grant() {
     // will hang exactly here).
     let dep = kernel
         .ledger
-        .hold_exclusive(
+        .hold_managed(
             ExclusiveRequest {
                 owner: SubjectId::new(&subject),
                 resource: ResourceKey::new(
@@ -1052,6 +1045,9 @@ fn attenuated_child_capability_dies_with_its_parent_grant() {
                     .map(|id| kernel.ledger.holding(id).unwrap().unwrap().handle()),
                 lease: LeaseRequest::UseClassDefault,
             },
+            portos_rm::cleanup::CleanupTarget::Subscription {
+                host:portos_rm::cleanup::HostWitness::new(portos_rm::cleanup::ProcessWitness::new(1,1,"old-test-boot".into()).unwrap(),"old-test-host".into()).unwrap(), subscription:1,
+            }, None,
             Timestamp::try_from(1u64).unwrap(),
         )
         .map(|h| h.id())
@@ -1066,7 +1062,7 @@ fn attenuated_child_capability_dies_with_its_parent_grant() {
                 .holding(id)
                 .unwrap()
                 .unwrap()
-                .released_at
+                .released_at()
                 .is_some(),
             "holding {id} tombstoned by the cascade"
         );

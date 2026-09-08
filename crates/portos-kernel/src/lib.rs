@@ -77,13 +77,13 @@ impl Kernel {
                     "locks_removed": report.substrate.locks_removed,
                     "locks_kept": report.substrate.locks_kept,
                 },
-                "note": "previous kernel process reconciled: plugin/subscription rows tombstoned, substrate classes checked against the world",
+                "note": "durable cleanup resumed; only confirmed or absent targets discharged",
             }));
         }
-        if report.journal_pending > 0 {
+        if report.cleanup_pending > 0 {
             let _ = audit.lock().unwrap().append(serde_json::json!({
-                "event": "ledger.journal_pending", "pending": report.journal_pending,
-                "note": "failed teardown actions replayed by the next teardown of their subject",
+                "event": "ledger.cleanup_pending", "pending": report.cleanup_pending,
+                "note": "cleanup obligations retained; startup, explicit retries and sweep ticks resume them",
             }));
         }
         let consent_key = consent::ConsentKey::load_or_create(root)?;

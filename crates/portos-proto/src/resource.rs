@@ -44,8 +44,70 @@ pub enum ResourceRequest {
     Renew(RenewRequest),
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReleaseResponse {
-    pub released: bool,
+#[serde(into = "ReleaseWire", try_from = "ReleaseWire")]
+pub enum ReleaseResponse {
+    Released,
+    Pending { cleanup_id: u64 },
+    Retryable { cleanup_id: u64, reason: String },
+    Unknown { cleanup_id: u64, reason: String },
+    Blocked { cleanup_id: u64, reason: String },
+}
+impl ReleaseResponse {
+    pub fn is_released(&self) -> bool {
+        matches!(self, Self::Released)
+    }
+}
+#[derive(Serialize, Deserialize)]
+struct ReleaseWire {
+    released: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cleanup_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+impl From<ReleaseResponse> for ReleaseWire {
+    fn from(r: ReleaseResponse) -> Self {
+        let (state, cleanup_id, reason) = match r {
+            ReleaseResponse::Released => ("retired", None, None),
+            ReleaseResponse::Pending { cleanup_id } => ("pending", Some(cleanup_id), None),
+            ReleaseResponse::Retryable { cleanup_id, reason } => {
+                ("retryable", Some(cleanup_id), Some(reason))
+            }
+            ReleaseResponse::Unknown { cleanup_id, reason } => {
+                ("unknown", Some(cleanup_id), Some(reason))
+            }
+            ReleaseResponse::Blocked { cleanup_id, reason } => {
+                ("blocked", Some(cleanup_id), Some(reason))
+            }
+        };
+        Self {
+            released: state == "retired",
+            state: Some(state.into()),
+            cleanup_id,
+            reason,
+        }
+    }
+}
+impl TryFrom<ReleaseWire> for ReleaseResponse {
+    type Error = &'static str;
+    fn try_from(w: ReleaseWire) -> Result<Self, Self::Error> {
+        match (w.released, w.state.as_deref(), w.cleanup_id, w.reason) {
+            (true, None | Some("retired"), None, None) => Ok(Self::Released),
+            (false, Some("pending"), Some(cleanup_id), None) => Ok(Self::Pending { cleanup_id }),
+            (false, Some("retryable"), Some(cleanup_id), Some(reason)) => {
+                Ok(Self::Retryable { cleanup_id, reason })
+            }
+            (false, Some("unknown"), Some(cleanup_id), Some(reason)) => {
+                Ok(Self::Unknown { cleanup_id, reason })
+            }
+            (false, Some("blocked"), Some(cleanup_id), Some(reason)) => {
+                Ok(Self::Blocked { cleanup_id, reason })
+            }
+            _ => Err("inconsistent release result"),
+        }
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RenewResponse {
@@ -93,5 +155,43 @@ mod tests {
                 .lease_expires_at,
             None
         );
+    }
+    #[test]
+    fn pending_cleanup_cannot_decode_as_a_successful_release() {
+        let results = [
+            ReleaseResponse::Released,
+            ReleaseResponse::Pending { cleanup_id: 0 },
+            ReleaseResponse::Retryable {
+                cleanup_id: 1,
+                reason: "busy".into(),
+            },
+            ReleaseResponse::Unknown {
+                cleanup_id: 2,
+                reason: "lost response".into(),
+            },
+            ReleaseResponse::Blocked {
+                cleanup_id: 3,
+                reason: "provider unavailable".into(),
+            },
+        ];
+        for result in results {
+            let wire = serde_json::to_value(&result).unwrap();
+            assert_eq!(wire["released"], result.is_released());
+            assert_eq!(
+                serde_json::from_value::<ReleaseResponse>(wire).unwrap(),
+                result
+            );
+        }
+        assert_eq!(
+            serde_json::from_value::<ReleaseResponse>(json!({"released":true})).unwrap(),
+            ReleaseResponse::Released
+        );
+        for bad in [
+            json!({"released":true,"state":"pending","cleanup_id":0}),
+            json!({"released":false}),
+            json!({"released":false,"state":"blocked","cleanup_id":1}),
+        ] {
+            assert!(serde_json::from_value::<ReleaseResponse>(bad).is_err());
+        }
     }
 }

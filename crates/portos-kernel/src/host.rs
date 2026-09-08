@@ -45,10 +45,10 @@
 //!     `kernel/plugin` (generation = spawn token); each of its subscriptions
 //!     is a `kernel/subscription` holding under it. Reclamation is
 //!     crash-only: plugin death, event-queue overflow and graceful shutdown
-//!     all run the same F2 teardown of the plugin's ownership closure,
-//!     children first, through a `World` that drops subscriptions, routes and
-//!     the process. Graceful shutdown only adds a polite `shutdown` frame in
-//!     front of it.
+//!     all submit durable retirement of the plugin's ownership closure.
+//!     Children are confirmed before parents; cleanup runs outside storage
+//!     transactions. A polite shutdown frame is sent only when the plugin's
+//!     own cleanup attempt is ready.
 //!   - **Verb character (F4).** A hello's `tools[verb]` may declare `kind`
 //!     (`repeatable` | `repeatable_shared` | `transforming` | `consuming` |
 //!     `emitting`, with `world`, `compensate_with`, `amortizable`,
@@ -64,27 +64,28 @@
 //!     automaton over its verbs; the kernel enforces it precisely by refusing
 //!     the offending call (truncation tier), state advancing only on success.
 //!
-//! Lock order: ledger → plugins/routes/subs. Teardown holds the ledger while
-//! its `World` takes host locks; no host path takes a host lock and then the
-//! ledger.
+//! Storage transactions lock the ledger then SQLite and never call the host.
+//! Cleanup takes host locks only after its claim commits. Registration can
+//! hold its host registry lock across admission to serialize publication with
+//! cleanup. Nested plugin/route access takes the plugin registry first.
 
 use crate::ledger::ExclusiveRequest;
 use crate::ledger::{
-    CLASS_FILE_LOCK, CLASS_PLUGIN, CLASS_PORT, CLASS_PROCESS, CLASS_SUBSCRIPTION, kill_pid,
-    proc_alive, proc_start_time,
+    CLASS_FILE_LOCK, CLASS_PLUGIN, CLASS_PROCESS, CLASS_SUBSCRIPTION, capture_process,
+    cleanup_process, execute_target, proc_start_time,
 };
 use crate::{Kernel, KernelError};
 use portos_proto::resource::{
     HoldRequest, HoldingRef, ReleaseRequest, ReleaseResponse, RenewRequest, RenewResponse,
 };
 use portos_proto::{Label, chunk, frame};
+use portos_rm::cleanup::*;
 use portos_rm::coeffect::{Flat, Manifest, Mount, Requires, admit_mount};
 use portos_rm::identity::{
     AccountId, ClassId, Generation, HoldingHandle, HoldingId, InstanceId, ResourceKey, SubjectId,
 };
-use portos_rm::ledger::{LiveItem, RevertGrade};
+use portos_rm::ledger::RevertGrade;
 use portos_rm::protocol::Protocol;
-use portos_rm::teardown::{RunOutcome, World};
 use portos_rm::time::{LeaseDuration, LeaseRequest, Timestamp};
 use portos_rm::verbs::{ConsumeGrade, EmitGrade, Kind, VerbEntry, VerbTable};
 use serde_json::{Value, json};
@@ -114,7 +115,6 @@ struct PluginHandle {
     /// The plugin's `kernel/plugin` holding (F1) and its generation (the
     /// spawn token): the stable denotation of this incarnation.
     holding: HoldingHandle,
-    generation: String,
     pid: u32,
     /// Position ceiling (F5 effect row) when spawned into a slot: the verbs
     /// this plugin may invoke, before any capability is consulted.
@@ -176,12 +176,39 @@ pub(crate) struct HostInner {
     routes: Mutex<BTreeMap<String, RouteEntry>>, // verb -> route
     subs: Mutex<Vec<Sub>>,
     next_sub: AtomicU64,
+    witness: HostWitness,
     next_spawn: AtomicU64,
     sock_dir: PathBuf,
     meter: Mutex<crate::metrics::ContextMeter>,
     /// Lease sweeper (WP-02): stop flag and thread handle; stopped on drop.
     sweeper_stop: Arc<AtomicBool>,
     sweeper_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+// Weak registration lets recovery find an existing host by its exact session,
+// including during retry from another Host in the same kernel process.
+static HOSTS: std::sync::OnceLock<Mutex<BTreeMap<String, std::sync::Weak<HostInner>>>> =
+    std::sync::OnceLock::new();
+fn host_registry() -> &'static Mutex<BTreeMap<String, std::sync::Weak<HostInner>>> {
+    HOSTS.get_or_init(Mutex::default)
+}
+fn known_host(w: &HostWitness) -> Option<Arc<HostInner>> {
+    host_registry()
+        .lock()
+        .unwrap()
+        .get(w.session().as_str())
+        .and_then(std::sync::Weak::upgrade)
+        .filter(|h| &h.witness == w)
+}
+pub(crate) fn local_host_gone(w: &HostWitness) -> bool {
+    capture_process(std::process::id()).is_ok_and(|p| &p == w.process()) && known_host(w).is_none()
+}
+pub(crate) fn cleanup_known_host(work: &CleanupWork) -> Option<CleanupOutcome> {
+    let host = match work.target() {
+        CleanupTarget::Subscription { host, .. } | CleanupTarget::Plugin { host, .. } => host,
+        _ => return None,
+    };
+    known_host(host).map(|inner| HostWorld { inner }.execute(work))
 }
 
 /// The plugin host: spawn, route, event bus, artifact channel.
@@ -200,12 +227,21 @@ impl Host {
             routes: Mutex::new(BTreeMap::new()),
             subs: Mutex::new(Vec::new()),
             next_sub: AtomicU64::new(1),
+            witness: HostWitness::new(
+                capture_process(std::process::id())?,
+                Generation::new(rand_token()),
+            )
+            .map_err(crate::ledger::map_err)?,
             next_spawn: AtomicU64::new(1),
             sock_dir: sock_dir.to_path_buf(),
             meter: Mutex::new(crate::metrics::ContextMeter::default()),
             sweeper_stop: Arc::new(AtomicBool::new(false)),
             sweeper_handle: Mutex::new(None),
         });
+        host_registry()
+            .lock()
+            .unwrap()
+            .insert(inner.witness.session().to_string(), Arc::downgrade(&inner));
         let plans = crate::plans::PlanService::new(kernel.clone(), inner.clone());
         Ok(Host {
             kernel,
@@ -397,58 +433,59 @@ fn spawn_plugin(
     }
     let offers: Option<Flat> = slot.map(|s| Flat(s.offers.iter().cloned().collect()));
 
-    // ---- F1: the instance is a holding. Ledger first, host locks after.
+    // Serialize publication with cleanup of this host registry. The transaction
+    // performs no world actions, so holding the host lock cannot form a cycle.
     let now = crate::db::now_unix();
     let subject = format!("plugin:{name}");
-    let holding = match &parent {
-        Some((parent_name, parent_holding)) => kernel
-            .ledger
-            .hold_exclusive_child(
-                ExclusiveRequest {
-                    owner: SubjectId::new(&subject),
-                    resource: ResourceKey::new(ClassId::new(CLASS_PLUGIN), InstanceId::new(&name)),
-                    generation: Generation::new(&token),
-                    parent: Some(parent_holding.clone()),
-                    lease: LeaseRequest::UseClassDefault,
-                },
-                SubjectId::new(&format!("plugin:{parent_name}")),
-                Timestamp::try_from(now).map_err(crate::ledger::map_err)?,
-            )
-            .map_err(|e| {
-                let _ = child.kill();
-                KernelError::Denied(format!("plugin {name}: spawn under parent refused: {e}"))
-            })?,
-        None => match kernel.ledger.hold_exclusive(
+    let process = capture_process(child.id()).map_err(|e| {
+        let _ = child.kill();
+        e
+    })?;
+    let mut plugins = inner.plugins.lock().unwrap();
+    let holding = kernel
+        .ledger
+        .hold_managed(
             ExclusiveRequest {
                 owner: SubjectId::new(&subject),
                 resource: ResourceKey::new(ClassId::new(CLASS_PLUGIN), InstanceId::new(&name)),
                 generation: Generation::new(&token),
-                parent: None,
+                parent: parent.as_ref().map(|(_, h)| h.clone()),
                 lease: LeaseRequest::UseClassDefault,
             },
+            CleanupTarget::Plugin {
+                host: inner.witness.clone(),
+                process,
+            },
+            parent
+                .as_ref()
+                .map(|(name, _)| SubjectId::new(format!("plugin:{name}"))),
             Timestamp::try_from(now).map_err(crate::ledger::map_err)?,
-        ) {
-            Ok(id) => id,
-            Err(_) => {
-                let _ = child.kill();
-                return Err(KernelError::Denied(format!("plugin name taken: {name}")));
-            }
-        },
-    };
+        )
+        .map_err(|e| {
+            let _ = child.kill();
+            e
+        })?;
     let pid = child.id();
 
     // Register verbs; a route conflict aborts the spawn (and releases the
     // holding again — nothing in the ledger outlives a failed spawn).
     {
-        let mut plugins = inner.plugins.lock().unwrap();
         let mut routes = inner.routes.lock().unwrap();
         if let Some(v) = verbs.iter().find(|v| routes.contains_key(*v)) {
-            let _ = child.kill();
-            let _ = kernel.ledger.release(
+            let conflict = v.clone();
+            drop(routes);
+            drop(plugins);
+            let _ = kernel.ledger.release_with_world(
                 &holding,
+                &mut HostWorld {
+                    inner: inner.clone(),
+                },
                 Timestamp::try_from(now).expect("system timestamp in range"),
             );
-            return Err(KernelError::Denied(format!("verb already routed: {v}")));
+            let _ = child.try_wait();
+            return Err(KernelError::Denied(format!(
+                "verb already routed: {conflict}"
+            )));
         }
         let (events_tx, events_rx) = sync_channel::<Value>(EVENT_QUEUE);
         let handle = Arc::new(PluginHandle {
@@ -458,7 +495,6 @@ fn spawn_plugin(
             events_tx,
             sock_path: sock_path.clone(),
             holding: holding.clone(),
-            generation: token.clone(),
             pid,
             offers,
             protocol,
@@ -499,6 +535,7 @@ fn spawn_plugin(
             inner.clone(),
             plans.clone(),
             name.clone(),
+            holding.clone(),
             client_stream,
         );
     }
@@ -577,6 +614,14 @@ impl Host {
             .get(plugin)
             .cloned()
             .ok_or_else(|| KernelError::NotFound(format!("plugin: {plugin}")))?;
+        if !self
+            .kernel
+            .ledger
+            .holding(handle.holding.id())?
+            .is_some_and(|h| h.state.is_active() && h.handle() == handle.holding)
+        {
+            return Err(KernelError::Denied("plugin is retiring".into()));
+        }
         call_on(&handle, verb, args)
     }
 
@@ -612,7 +657,7 @@ impl Host {
 
     /// Drop one of the kernel's own local subscriptions. Mirror of the client
     /// `unsubscribe` op: find under the subs lock, release its holding in the
-    /// ledger without it (lock order: ledger → host), then remove.
+    /// ledger without it, then let the cleanup executor remove the subscription.
     pub fn unsubscribe_local(&self, sub_id: u64) -> bool {
         let holding = {
             let subs = self.inner.subs.lock().unwrap();
@@ -622,12 +667,14 @@ impl Host {
         };
         match holding {
             Some(h) => {
-                let _ = self.kernel.ledger.release(
+                let result = self.kernel.ledger.release_with_world(
                     &h,
+                    &mut HostWorld {
+                        inner: self.inner.clone(),
+                    },
                     Timestamp::try_from(crate::db::now_unix()).expect("system timestamp in range"),
                 );
-                self.inner.subs.lock().unwrap().retain(|s| s.id != sub_id);
-                true
+                result.is_ok_and(|report| report.pending.is_empty())
             }
             None => false,
         }
@@ -664,24 +711,14 @@ impl Host {
         (m.context_bytes, m.data_bytes)
     }
 
-    /// Graceful shutdown = the crash-only path triggered early (endstate
-    /// §5.3): a polite `shutdown` frame and a moment to exit, then the same
-    /// reclamation any death gets.
+    /// Request the same durable, children-first path used on process exit.
+    /// The executor may send a polite frame once all children are confirmed.
     pub fn shutdown(&self, plugin: &str) {
-        let handle = { self.inner.plugins.lock().unwrap().get(plugin).cloned() };
+        let handle = self.inner.plugins.lock().unwrap().get(plugin).cloned();
         if let Some(h) = handle {
             h.shutting_down.store(true, Ordering::SeqCst);
-            if let Ok(mut s) = h.serve.lock() {
-                let _ = frame::write_frame(&mut *s, &json!({"op": "shutdown"}));
-            }
-            for _ in 0..20 {
-                if matches!(h.child.lock().unwrap().try_wait(), Ok(Some(_))) {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
+            reclaim_holding(&self.kernel, &self.inner, plugin, &h.holding, "shutdown");
         }
-        reclaim(&self.kernel, &self.inner, plugin, "shutdown");
     }
 
     pub fn shutdown_all(&self) {
@@ -719,7 +756,7 @@ impl Host {
                     &mut world,
                     Timestamp::try_from(now).expect("system timestamp in range"),
                 ) {
-                    Ok(report) if !report.released.is_empty() || !report.failed.is_empty() => {
+                    Ok(report) if !report.released.is_empty() || !report.pending.is_empty() => {
                         let mut classes: BTreeMap<String, usize> = BTreeMap::new();
                         for (_, class, _) in &report.released {
                             *classes.entry(class.clone()).or_insert(0) += 1;
@@ -728,7 +765,7 @@ impl Host {
                             "event": "ledger.swept",
                             "released": report.released.len(),
                             "classes": classes,
-                            "failed": report.failed,
+                            "pending": report.pending.iter().map(|t|json!({"cleanup_id":t.id.get(),"holding":t.holding.id().get(),"state":format!("{:?}",t.state)})).collect::<Vec<_>>(),
                         }));
                     }
                     Ok(_) => {}
@@ -754,6 +791,24 @@ impl Drop for Host {
         }
         self.plans.shutdown();
         self.shutdown_all();
+        let subscriptions = self
+            .inner
+            .subs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.holding.clone())
+            .collect::<Vec<_>>();
+        let now = Timestamp::try_from(crate::db::now_unix()).expect("system timestamp in range");
+        for holding in subscriptions {
+            let _ = self.kernel.ledger.release_with_world(
+                &holding,
+                &mut HostWorld {
+                    inner: self.inner.clone(),
+                },
+                now,
+            );
+        }
     }
 }
 
@@ -960,84 +1015,99 @@ fn manifest_from_meta(name: &str, verbs: &[String], tools_meta: &Value) -> Manif
 }
 
 /// The host as the F2 `World`: the physical inverses of the kernel's
-/// built-in holdings. Called with the ledger lock held; takes host locks only.
+/// built-in holdings. Called after a durable claim, without storage locks.
 pub(crate) struct HostWorld {
     pub(crate) inner: Arc<HostInner>,
 }
 
-impl World for HostWorld {
-    fn release(&mut self, item: &LiveItem) -> Result<(), ()> {
-        match item.class_id.as_str() {
-            CLASS_SUBSCRIPTION => {
-                let id: u64 = item.instance.as_str().parse().unwrap_or(0);
-                self.inner.subs.lock().unwrap().retain(|s| s.id != id);
-                Ok(())
+impl CleanupExecutor for HostWorld {
+    fn execute(&mut self, work: &CleanupWork) -> CleanupOutcome {
+        match work.target() {
+            CleanupTarget::Subscription { host, subscription } if host == &self.inner.witness => {
+                let mut subs = self.inner.subs.lock().unwrap();
+                let before = subs.len();
+                subs.retain(|s| !(s.id == *subscription && s.holding == work.task().holding));
+                if subs.len() != before {
+                    CleanupOutcome::Confirmed
+                } else {
+                    CleanupOutcome::AlreadyAbsent
+                }
             }
-            CLASS_PLUGIN => {
-                // Only this incarnation (generation = spawn token): a row of an
-                // older incarnation must never take down a newer plugin of the
-                // same name.
-                let handle = {
-                    let mut plugins = self.inner.plugins.lock().unwrap();
-                    let same = plugins
-                        .get(item.instance.as_str())
-                        .map(|h| h.generation == item.generation.as_str())
-                        .unwrap_or(false);
-                    if same {
-                        plugins.remove(item.instance.as_str())
-                    } else {
-                        None
+            CleanupTarget::Plugin { host, process } if host == &self.inner.witness => {
+                let name = work.resource().instance().as_str();
+                let mut plugins = self.inner.plugins.lock().unwrap();
+                let handle = plugins
+                    .get(name)
+                    .filter(|h| h.holding == work.task().holding)
+                    .cloned();
+                if let Some(h) = &handle {
+                    if h.shutting_down.load(Ordering::SeqCst) {
+                        if let Ok(mut stream) = h.serve.try_lock() {
+                            let previous = stream.write_timeout().ok().flatten();
+                            if stream
+                                .set_write_timeout(Some(std::time::Duration::from_millis(50)))
+                                .is_ok()
+                            {
+                                let _ = frame::write_frame(&mut *stream, &json!({"op":"shutdown"}));
+                                let _ = stream.set_write_timeout(previous);
+                            }
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(50));
                     }
-                };
-                if let Some(h) = handle {
-                    kill_and_reap(&h);
-                    cleanup_plugin(&self.inner, item.instance.as_str());
                 }
-                Ok(())
-            }
-            CLASS_PROCESS => {
-                // Kill only the exact witnessed incarnation — generation is
-                // "<pid>:<start time>", so a recycled pid is never hit.
-                let mut parts = item.generation.as_str().split(':');
-                let pid: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
-                let start: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-                if proc_alive(pid, start) {
-                    kill_pid(pid);
+                let result = cleanup_process(process);
+                if matches!(
+                    result,
+                    CleanupOutcome::Confirmed | CleanupOutcome::AlreadyAbsent
+                ) {
+                    if let Some(h) = handle {
+                        if let Err(e) = h.child.lock().unwrap().try_wait() {
+                            return CleanupOutcome::Retryable(e.to_string());
+                        }
+                        if let Err(e) = std::fs::remove_file(&h.sock_path) {
+                            if e.kind() != std::io::ErrorKind::NotFound {
+                                return CleanupOutcome::Retryable(e.to_string());
+                            }
+                        }
+                        // Keep the name locked until its old routes are removed.
+                        cleanup_plugin(&self.inner, name);
+                        plugins.remove(name);
+                    }
                 }
-                Ok(())
+                result
             }
-            CLASS_PORT => Ok(()), // nothing physical to release; reconcile bind-probes
-            CLASS_FILE_LOCK => match std::fs::remove_file(item.instance.as_str()) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(_) => Err(()),
-            },
-            _ => Ok(()), // nothing physical behind other rows
+            _ => execute_target(work),
         }
     }
-    fn compensate(&mut self, _item: &LiveItem, _key: &str) -> Result<bool, ()> {
-        Ok(true) // no compensable built-in class
-    }
-}
-
-fn kill_and_reap(h: &PluginHandle) {
-    let mut child = h.child.lock().unwrap();
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = std::fs::remove_file(&h.sock_path);
 }
 
 /// The one teardown path (crash-only): release the plugin's ownership
 /// closure children first through `HostWorld`, then audit. Idempotent — a
 /// second call for the same plugin finds nothing to release.
 fn reclaim(kernel: &Arc<Kernel>, inner: &Arc<HostInner>, name: &str, reason: &str) -> usize {
-    let subject = format!("plugin:{name}");
+    let holding = inner
+        .plugins
+        .lock()
+        .unwrap()
+        .get(name)
+        .map(|h| h.holding.clone());
+    holding
+        .map(|h| reclaim_holding(kernel, inner, name, &h, reason))
+        .unwrap_or(0)
+}
+fn reclaim_holding(
+    kernel: &Arc<Kernel>,
+    inner: &Arc<HostInner>,
+    name: &str,
+    holding: &HoldingHandle,
+    reason: &str,
+) -> usize {
     let now = crate::db::now_unix();
     let mut world = HostWorld {
         inner: inner.clone(),
     };
-    let (outcome, released) = match kernel.ledger.teardown(
-        &SubjectId::new(&subject),
+    let report = match kernel.ledger.teardown_owner_incarnation(
+        holding,
         &mut world,
         Timestamp::try_from(now).expect("system timestamp in range"),
     ) {
@@ -1047,23 +1117,19 @@ fn reclaim(kernel: &Arc<Kernel>, inner: &Arc<HostInner>, name: &str, reason: &st
                 "event": "plugin.reclaim_error", "plugin": name, "reason": reason,
                 "error": e.to_string(),
             }));
-            (RunOutcome::Completed { failed: Vec::new() }, 0)
+            crate::ledger::CleanupReport::default()
         }
     };
-    // Defensive: a handle the ledger did not know about still gets cleaned.
-    let stray = inner.plugins.lock().unwrap().remove(name);
-    if let Some(h) = stray {
-        kill_and_reap(&h);
-        cleanup_plugin(inner, name);
-    }
-    let failed = match &outcome {
-        RunOutcome::Completed { failed } => failed.clone(),
-        RunOutcome::Crashed => Vec::new(),
-    };
-    if released > 0 || !failed.is_empty() {
+    let released = report.completed.len();
+    let pending = report
+        .pending
+        .iter()
+        .map(|t| t.holding.id().get())
+        .collect::<Vec<_>>();
+    if released > 0 || !pending.is_empty() {
         let _ = kernel.audit.lock().unwrap().append(json!({
             "event": "plugin.reclaimed", "plugin": name, "reason": reason,
-            "released": released, "failed": failed.iter().map(|id| id.get()).collect::<Vec<_>>(),
+            "released": released, "pending": pending,
         }));
     }
     released
@@ -1108,8 +1174,10 @@ pub(crate) fn invoke_as(
         return Err(e);
     }
     let handle = {
-        let routes = inner.routes.lock().unwrap();
-        let target = routes
+        let target = inner
+            .routes
+            .lock()
+            .unwrap()
             .get(verb)
             .map(|e| e.plugin.clone())
             .ok_or_else(|| KernelError::NotFound(format!("no route for verb: {verb}")))?;
@@ -1121,6 +1189,13 @@ pub(crate) fn invoke_as(
             .cloned()
             .ok_or_else(|| KernelError::NotFound(format!("plugin gone: {target}")))?
     };
+    if !kernel
+        .ledger
+        .holding(handle.holding.id())?
+        .is_some_and(|h| h.state.is_active() && h.handle() == handle.holding)
+    {
+        return Err(KernelError::Denied("plugin is retiring".into()));
+    }
     call_on(&handle, verb, args)
 }
 
@@ -1193,21 +1268,30 @@ pub(crate) fn subscribe_with_subject(
     topic: &str,
 ) -> Result<(u64, Receiver<Value>), KernelError> {
     let (tx, rx) = sync_channel::<Value>(EVENT_QUEUE);
-    let id = inner.next_sub.fetch_add(1, Ordering::SeqCst);
-    let holding = kernel.ledger.hold_exclusive(
+    let id = inner
+        .next_sub
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_add(1))
+        .map_err(|_| KernelError::Denied("subscription IDs exhausted".into()))?;
+    let mut subs = inner.subs.lock().unwrap();
+    let holding = kernel.ledger.hold_managed(
         ExclusiveRequest {
             owner: SubjectId::new(subject),
             resource: ResourceKey::new(
                 ClassId::new(CLASS_SUBSCRIPTION),
-                InstanceId::new(&id.to_string()),
+                InstanceId::new(format!("{}/{}", inner.witness.session(), id)),
             ),
-            generation: Generation::new("sub"),
+            generation: inner.witness.session().clone(),
             parent: None,
             lease: LeaseRequest::UseClassDefault,
         },
+        CleanupTarget::Subscription {
+            host: inner.witness.clone(),
+            subscription: id,
+        },
+        None,
         Timestamp::try_from(crate::db::now_unix()).map_err(crate::ledger::map_err)?,
     )?;
-    inner.subs.lock().unwrap().push(Sub {
+    subs.push(Sub {
         id,
         topic: topic.to_string(),
         target: SubTarget::Local(tx),
@@ -1243,6 +1327,18 @@ pub(crate) fn dispatch_event(
     let mut drop_subs: Vec<(u64, HoldingHandle)> = Vec::new();
     let mut kill_plugins: Vec<String> = Vec::new();
     for t in targets {
+        let holding = match &t {
+            Target::Local(_, h, _) | Target::Plugin(_, h, _) => h,
+        };
+        let Some(current) = kernel
+            .ledger
+            .holding(holding.id())
+            .ok()
+            .flatten()
+            .filter(|h| h.state.is_active() && h.handle() == *holding)
+        else {
+            continue;
+        };
         match t {
             Target::Local(id, holding, tx) => {
                 let ev = json!({"topic": topic, "data": data, "sub": id});
@@ -1263,6 +1359,7 @@ pub(crate) fn dispatch_event(
                     .lock()
                     .unwrap()
                     .get(&name)
+                    .filter(|h| Some(h.holding.id()) == current.parent)
                     .map(|h| h.events_tx.clone());
                 let Some(tx) = tx else {
                     drop_subs.push((id, holding));
@@ -1286,12 +1383,13 @@ pub(crate) fn dispatch_event(
         }
     }
     if !drop_subs.is_empty() {
-        let ids: Vec<u64> = drop_subs.iter().map(|(id, _)| *id).collect();
-        inner.subs.lock().unwrap().retain(|s| !ids.contains(&s.id));
         let now = crate::db::now_unix();
         for (_, holding) in drop_subs {
-            let _ = kernel.ledger.release(
+            let _ = kernel.ledger.release_with_world(
                 &holding,
+                &mut HostWorld {
+                    inner: inner.clone(),
+                },
                 Timestamp::try_from(now).expect("system timestamp in range"),
             );
         }
@@ -1308,10 +1406,6 @@ fn cleanup_plugin(inner: &Arc<HostInner>, name: &str) {
         .lock()
         .unwrap()
         .retain(|_, entry| entry.plugin != name);
-    inner.subs.lock().unwrap().retain(|s| match &s.target {
-        SubTarget::Plugin(n) => n != name,
-        _ => true,
-    });
 }
 
 /// Topic patterns: a trailing `*` matches any topic with that prefix
@@ -1329,6 +1423,7 @@ fn spawn_client_loop(
     inner: Arc<HostInner>,
     plans: Arc<crate::plans::PlanService>,
     name: String,
+    holding: HoldingHandle,
     mut stream: UnixStream,
 ) {
     std::thread::spawn(move || {
@@ -1352,7 +1447,7 @@ fn spawn_client_loop(
                             }
                         })
                         .unwrap_or("exited");
-                    reclaim(&kernel, &inner, &name, reason);
+                    reclaim_holding(&kernel, &inner, &name, &holding, reason);
                     return;
                 }
             };
@@ -1468,7 +1563,6 @@ fn domain_handle(reference: &HoldingRef) -> Result<HoldingHandle, KernelError> {
     ))
 }
 
-// M2 will replace the synchronous world call with a committed cleanup obligation.
 fn op_release(
     kernel: &Arc<Kernel>,
     inner: &Arc<HostInner>,
@@ -1481,39 +1575,45 @@ fn op_release(
     let handle = domain_handle(&request.holding)?;
     let now = Timestamp::try_from(now).map_err(crate::ledger::map_err)?;
     let subject = SubjectId::new(format!("plugin:{name}"));
-    let h = kernel
-        .ledger
-        .holding(handle.id())?
-        .ok_or_else(|| KernelError::Denied("release: unknown holding".into()))?;
-    if h.subject != subject || h.released_at.is_some() {
-        return Err(KernelError::Denied("release: not your holding".into()));
-    }
-    if &h.generation != handle.generation() {
-        return Err(KernelError::Denied("release: stale generation".into()));
-    }
-    let mut world = HostWorld {
-        inner: inner.clone(),
-    };
-    let item = LiveItem {
-        id: h.id,
-        parent: h.parent,
-        class_id: h.class_id.clone(),
-        instance: h.instance.clone(),
-        generation: h.generation.clone(),
-        grade: RevertGrade::Inverse,
-    };
-    let _ = world.release(&item);
     kernel.ledger.transaction(|tx| {
-        let current = tx
+        let h = tx
             .holding(handle.id())
             .ok_or_else(|| KernelError::Denied("release: unknown holding".into()))?;
-        if current.subject != subject {
-            return Err(KernelError::Denied("release: owner changed".into()));
+        if h.subject != subject {
+            return Err(KernelError::Denied("release: not your holding".into()));
         }
-        tx.release(&handle, now)
+        tx.request_retirement(&handle, now)
     })?;
-    let _ = kernel.audit.lock().unwrap().append(json!({"event":"substrate.released","plugin":name,"holding":handle.id().get(),"class":h.class_id.as_str(),"instance":h.instance.as_str()}));
-    Ok(json!({"ok":ReleaseResponse { released:true }}))
+    let report = kernel.ledger.release_with_world(
+        &handle,
+        &mut HostWorld {
+            inner: inner.clone(),
+        },
+        now,
+    )?;
+    let response = match report.pending.first() {
+        None => ReleaseResponse::Released,
+        Some(t) => {
+            let id = t.id.get();
+            match &t.state {
+                CleanupState::Retryable(reason) => ReleaseResponse::Retryable {
+                    cleanup_id: id,
+                    reason: reason.clone(),
+                },
+                CleanupState::Unknown(reason) => ReleaseResponse::Unknown {
+                    cleanup_id: id,
+                    reason: reason.clone(),
+                },
+                CleanupState::Blocked(reason) => ReleaseResponse::Blocked {
+                    cleanup_id: id,
+                    reason: reason.clone(),
+                },
+                _ => ReleaseResponse::Pending { cleanup_id: id },
+            }
+        }
+    };
+    let _=kernel.audit.lock().unwrap().append(json!({"event":"substrate.release","plugin":name,"holding":handle.id().get(),"result":response}));
+    Ok(json!({"ok":response}))
 }
 
 fn op_renew(kernel: &Arc<Kernel>, name: &str, req: &Value, now: u64) -> Result<Value, KernelError> {
@@ -1554,6 +1654,22 @@ fn handle_client_op(
     stream: &mut UnixStream,
 ) -> Result<Value, KernelError> {
     let now = crate::db::now_unix();
+    let caller = inner
+        .plugins
+        .lock()
+        .unwrap()
+        .get(name)
+        .map(|p| p.holding.clone());
+    if let Some(caller) = caller {
+        if !matches!(req["op"].as_str(), Some("release" | "unsubscribe"))
+            && !kernel
+                .ledger
+                .holding(caller.id())?
+                .is_some_and(|h| h.state.is_active() && h.handle() == caller)
+        {
+            return Err(KernelError::Denied("plugin is retiring".into()));
+        }
+    }
     match req["op"].as_str() {
         // ---- invoke: the capability-gated plugin→plugin path ----
         Some("invoke") => {
@@ -1604,8 +1720,10 @@ fn handle_client_op(
                 "event": "invoke.allowed", "from": name, "verb": verb, "cap": cap,
             }));
             let handle = {
-                let routes = inner.routes.lock().unwrap();
-                let target = routes
+                let target = inner
+                    .routes
+                    .lock()
+                    .unwrap()
                     .get(verb)
                     .map(|e| e.plugin.clone())
                     .ok_or_else(|| KernelError::NotFound(format!("no route for verb: {verb}")))?;
@@ -1617,6 +1735,13 @@ fn handle_client_op(
                     .cloned()
                     .ok_or_else(|| KernelError::NotFound(format!("plugin gone: {target}")))?
             };
+            if !kernel
+                .ledger
+                .holding(handle.holding.id())?
+                .is_some_and(|h| h.state.is_active() && h.handle() == handle.holding)
+            {
+                return Err(KernelError::Denied("target plugin is retiring".into()));
+            }
             let out = call_on(&handle, verb, args)?;
             Ok(json!({"ok": out}))
         }
@@ -1719,7 +1844,10 @@ fn handle_client_op(
         }
         Some("subscribe") => {
             let topic = req["topic"].as_str().unwrap_or("").to_string();
-            let id = inner.next_sub.fetch_add(1, Ordering::SeqCst);
+            let id = inner
+                .next_sub
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_add(1))
+                .map_err(|_| KernelError::Denied("subscription IDs exhausted".into()))?;
             // A standing inbound channel is a holding, child of the plugin's
             // own holding: teardown unsubscribes before it kills.
             let parent = inner
@@ -1729,20 +1857,26 @@ fn handle_client_op(
                 .get(name)
                 .map(|h| h.holding.clone());
             let subject = format!("plugin:{name}");
-            let holding = kernel.ledger.hold_exclusive(
+            let mut subs = inner.subs.lock().unwrap();
+            let holding = kernel.ledger.hold_managed(
                 ExclusiveRequest {
                     owner: SubjectId::new(&subject),
                     resource: ResourceKey::new(
                         ClassId::new(CLASS_SUBSCRIPTION),
-                        InstanceId::new(&id.to_string()),
+                        InstanceId::new(format!("{}/{}", inner.witness.session(), id)),
                     ),
-                    generation: Generation::new("sub"),
+                    generation: inner.witness.session().clone(),
                     parent: parent,
                     lease: LeaseRequest::UseClassDefault,
                 },
+                CleanupTarget::Subscription {
+                    host: inner.witness.clone(),
+                    subscription: id,
+                },
+                None,
                 Timestamp::try_from(now).map_err(crate::ledger::map_err)?,
             )?;
-            inner.subs.lock().unwrap().push(Sub {
+            subs.push(Sub {
                 id,
                 topic: topic.clone(),
                 target: SubTarget::Plugin(name.to_string()),
@@ -1767,12 +1901,14 @@ fn handle_client_op(
             };
             let removed = match holding {
                 Some(h) => {
-                    let _ = kernel.ledger.release(
+                    let report = kernel.ledger.release_with_world(
                         &h,
+                        &mut HostWorld {
+                            inner: inner.clone(),
+                        },
                         Timestamp::try_from(now).expect("system timestamp in range"),
-                    );
-                    inner.subs.lock().unwrap().retain(|s| s.id != id);
-                    true
+                    )?;
+                    report.pending.is_empty()
                 }
                 None => false,
             };
@@ -1961,6 +2097,7 @@ fn rand_token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ledger::CLASS_PORT;
     use crate::ledger::ExclusiveRequest;
     use portos_rm::identity::{ClassId, Generation, InstanceId, ResourceKey, SubjectId};
     use portos_rm::time::{LeaseRequest, Timestamp};
@@ -2054,7 +2191,7 @@ mod tests {
                 .holding(id)
                 .unwrap()
                 .unwrap()
-                .released_at
+                .released_at()
                 .is_some(),
             "holding tombstoned by the sweep"
         );
@@ -2125,17 +2262,89 @@ mod tests {
             102,
         )
         .unwrap();
-        assert_eq!(released, json!({"ok":{"released":true}}));
+        assert_eq!(released, json!({"ok":{"released":true,"state":"retired"}}));
         assert!(
             host.kernel
                 .ledger
                 .holding(id)
                 .unwrap()
                 .unwrap()
-                .released_at
+                .released_at()
                 .is_some()
         );
         drop(host);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn release_response_stays_pending_until_port_absence_is_confirmed() {
+        let (host, root) = host("m2-port-response");
+        let listener = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let held = op_hold(
+            &host.kernel,
+            &host.inner,
+            "test",
+            &json!({"class":CLASS_PORT,"instance":format!("tcp:{port}"),"substrate":{}}),
+            100,
+        )
+        .unwrap();
+        let request = held["ok"].clone();
+        let first = op_release(&host.kernel, &host.inner, "test", &request, 101).unwrap();
+        assert_eq!(first["ok"]["released"], false);
+        assert_eq!(first["ok"]["state"], "retryable");
+        let id = first["ok"]["cleanup_id"].clone();
+        let key = host.kernel.ledger.cleanup_tasks().unwrap()[0].key.clone();
+        assert!(op_renew(&host.kernel, "test", &request, 102).is_err());
+        let repeated = op_release(&host.kernel, &host.inner, "test", &request, 103).unwrap();
+        assert_eq!(repeated["ok"]["cleanup_id"], id);
+        assert_eq!(host.kernel.ledger.cleanup_tasks().unwrap()[0].key, key);
+        drop(listener);
+        let completed = op_release(&host.kernel, &host.inner, "test", &request, 104).unwrap();
+        assert_eq!(completed["ok"]["released"], true);
+        drop(host);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cleanup_uses_the_subscription_session_not_just_its_numeric_id() {
+        let (first, root) = host("m2-subscription-session");
+        let (id, old_rx) = first.subscribe_local("topic").unwrap();
+        let old = first
+            .inner
+            .subs
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|s| s.id == id)
+            .unwrap()
+            .holding
+            .clone();
+        first
+            .kernel
+            .ledger
+            .request_retirement(&old, Timestamp::ZERO)
+            .unwrap();
+        let second = Host::new(first.kernel.clone(), &root.join("second-sockets")).unwrap();
+        let (new_id, new_rx) = second.subscribe_local("topic").unwrap();
+        assert_eq!(id, new_id);
+        let report = first
+            .kernel
+            .ledger
+            .release_with_world(
+                &old,
+                &mut HostWorld {
+                    inner: second.inner.clone(),
+                },
+                Timestamp::ZERO,
+            )
+            .unwrap();
+        assert!(report.pending.is_empty());
+        assert_eq!(second.emit("topic", json!("new")), 1);
+        assert_eq!(new_rx.recv().unwrap()["data"], "new");
+        assert!(old_rx.try_recv().is_err());
+        assert_eq!(first.emit("topic", json!("old")), 0);
+        drop(first);
+        drop(second);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -34,9 +34,9 @@ pub(crate) fn open(root: &Path) -> Result<Connection, rusqlite::Error> {
             json       TEXT NOT NULL,
             created_at INTEGER NOT NULL
         );
-        -- Holding ledger (spec F1): one row per fragment, release = tombstone,
-        -- the composed value is only ever recomputed. Mirrors
-        -- crates/portos-rm/schema.sql `holding`; write-through from ledger.rs.
+        -- Holding ledger: one row per fragment. The resource schema adapter
+        -- adds lifecycle state and target evidence. released_at is populated
+        -- only at retirement; a pending cleanup still occupies the resource.
         CREATE TABLE IF NOT EXISTS holdings (
             id               INTEGER PRIMARY KEY,
             subject          TEXT NOT NULL,
@@ -53,11 +53,9 @@ pub(crate) fn open(root: &Path) -> Result<Connection, rusqlite::Error> {
             ON holdings(class_id, instance) WHERE released_at IS NULL;
         CREATE INDEX IF NOT EXISTS holdings_subject
             ON holdings(subject) WHERE released_at IS NULL;
-        -- F2 teardown journal (saga-log, spec §6.2 [SAGA]): one row per
-        -- holding ever torn down, written in the same transaction as the
-        -- tombstones. Non-'done' rows are world actions still owed; they are
-        -- replayed by the next teardown of their subject. Reference DDL:
-        -- crates/portos-rm/schema.sql `teardown_journal`.
+        -- Historical F2 journal, retained for migration and diagnosis.
+        -- M2 writes resource_cleanup through the resource schema adapter;
+        -- cleanup claims commit before world actions and confirmation follows.
         CREATE TABLE IF NOT EXISTS journal (
             holding_id INTEGER PRIMARY KEY,
             grade      TEXT NOT NULL,   -- "inverse" | "compensable" | "external"
@@ -65,10 +63,8 @@ pub(crate) fn open(root: &Path) -> Result<Connection, rusqlite::Error> {
             state      TEXT NOT NULL,   -- "pending" | "in_flight" | "done" | "failed"
             updated_at INTEGER NOT NULL
         );
-        -- Substrate witnesses for built-in classes (WP-02): what a holding
-        -- corresponds to underneath (pid + start time, port, lock path), so a
-        -- restarted kernel can reconcile the ledger against the world.
-        -- Rows are never deleted, like the holdings they annotate.
+        -- Historical WP-02 witnesses, retained as migration input and diagnostics.
+        -- New registrations persist checked targets on the holding itself.
         CREATE TABLE IF NOT EXISTS substrate (
             holding_id INTEGER PRIMARY KEY,
             kind       TEXT NOT NULL,   -- "process" | "port" | "file-lock"

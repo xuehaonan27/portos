@@ -301,6 +301,7 @@ impl Monitor {
         //（花费行是纯记账，无世界侧动作）。
         ledger
             .register_class(ClassDecl {
+                cleanup: crate::cleanup::CleanupPolicy::AccountingOnly,
                 class_id: "budget".into(),
                 algebra: AlgebraTag::Counted,
                 release_idempotent: true,
@@ -438,7 +439,7 @@ impl Monitor {
     pub fn pool_spent(&self, nonce: &str) -> u64 {
         self.orch
             .ledger
-            .live()
+            .active()
             .filter(|h| h.class_id.as_str() == "budget" && h.instance.as_str() == nonce)
             .map(|h| match &h.frag {
                 Frag::Count(Count::Value(n)) => *n,

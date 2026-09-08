@@ -3,6 +3,8 @@
 //! Persistence and external resource cleanup belong to the kernel adapter.
 
 use crate::auth::auth_valid;
+use crate::cleanup::*;
+mod cleanup;
 use crate::ra::{Count, Ex, Frac, GSet, Ra, Ranges};
 
 // ---------------------------------------------------------------------------
@@ -116,6 +118,7 @@ pub enum RevertGrade {
 /// A declaration is input. Registration checks it and returns an immutable binding.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClassDecl {
+    pub cleanup: CleanupPolicy,
     pub class_id: ClassId,
     pub algebra: AlgebraTag,
     pub release_idempotent: bool,
@@ -135,7 +138,14 @@ pub struct HoldingRecord {
     pub parent: Option<HoldingId>,
     pub lease: Lease,
     pub acquired_at: Timestamp,
-    pub released_at: Option<Timestamp>,
+    pub state: HoldingState,
+    pub target: CleanupTarget,
+}
+
+impl HoldingRecord {
+    pub fn released_at(&self) -> Option<Timestamp> {
+        self.state.released_at()
+    }
 }
 
 /// The live aggregate never exposes mutable records, even through a cloned view.
@@ -193,6 +203,9 @@ pub enum LedgerError {
     DuplicateId,
     InvalidGraph,
     InvalidGeneration,
+    CleanupRequired,
+    InvalidCleanup,
+    StaleAttempt,
 }
 
 #[derive(Clone, Debug)]
@@ -216,6 +229,7 @@ pub struct LedgerSnapshot {
     pub pools: Vec<PoolRecord>,
     pub holdings: Vec<HoldingRecord>,
     pub instantiations: Vec<(SubjectId, SubjectId)>,
+    pub cleanups: Vec<CleanupRecord>,
 }
 
 /// Reconstruction has no operational methods. Only a checked graph becomes Ledger.
@@ -250,6 +264,15 @@ impl LedgerBuilder {
                 .max(row.id.get().checked_add(1).ok_or(LedgerError::OutOfRange)?);
             ledger.holdings.push(Holding { record: row });
         }
+        for record in self.snapshot.cleanups {
+            if ledger
+                .cleanups
+                .insert(record.id, CleanupTask { record })
+                .is_some()
+            {
+                return Err(LedgerError::InvalidCleanup);
+            }
+        }
         ledger.invariant()?;
         Ok(ledger)
     }
@@ -262,6 +285,7 @@ pub struct Ledger {
     capacities: BTreeMap<ResourceKey, Frag>,
     holdings: Vec<Holding>,
     next_id: u64,
+    cleanups: BTreeMap<CleanupId, CleanupTask>,
     instantiations: BTreeMap<SubjectId, SubjectId>,
 }
 impl Default for Ledger {
@@ -274,6 +298,7 @@ impl Default for Ledger {
             capacities: BTreeMap::new(),
             holdings: Vec::new(),
             next_id: 0,
+            cleanups: BTreeMap::new(),
             instantiations: BTreeMap::new(),
         }
     }
@@ -285,6 +310,7 @@ impl Clone for Ledger {
         copy.capacities = self.capacities.clone();
         copy.holdings = self.holdings.clone();
         copy.next_id = self.next_id;
+        copy.cleanups = self.cleanups.clone();
         copy.instantiations = self.instantiations.clone();
         copy
     }
@@ -295,6 +321,7 @@ impl Ledger {
     }
     pub fn snapshot(&self) -> LedgerSnapshot {
         LedgerSnapshot {
+            cleanups: self.cleanups.values().map(|t| t.record.clone()).collect(),
             classes: self.classes.values().cloned().collect(),
             pools: self
                 .capacities
@@ -313,6 +340,16 @@ impl Ledger {
         }
     }
     pub fn register_class(&mut self, decl: ClassDecl) -> Result<ClassBinding, LedgerError> {
+        if let CleanupPolicy::Managed(kind) = decl.cleanup {
+            if kind != CleanupKind::Provider
+                && (decl.algebra != AlgebraTag::Exclusive || !decl.release_idempotent)
+            {
+                return Err(LedgerError::InvalidCleanup);
+            }
+            if !decl.release_idempotent && decl.revert_grade != RevertGrade::Compensable {
+                return Err(LedgerError::InvalidCleanup);
+            }
+        }
         if let Some(existing) = self.classes.get(&decl.class_id) {
             if existing != &decl {
                 return Err(LedgerError::ClassConflict);
@@ -401,7 +438,7 @@ impl Ledger {
         self.check_pool(pool)?;
         let mut staged = self.clone();
         let mut rows: Vec<_> = staged
-            .live()
+            .occupying()
             .filter(|h| h.key() == *pool.id().key())
             .map(|h| (staged.depth(h.id), h.handle()))
             .collect();
@@ -429,8 +466,11 @@ impl Ledger {
     pub fn declare_instantiation(&mut self, child: SubjectId, parent: SubjectId) {
         self.instantiations.insert(child, parent);
     }
-    pub fn live(&self) -> impl Iterator<Item = &Holding> {
-        self.holdings.iter().filter(|h| h.released_at.is_none())
+    pub fn active(&self) -> impl Iterator<Item = &Holding> {
+        self.holdings.iter().filter(|h| h.state.is_active())
+    }
+    pub fn occupying(&self) -> impl Iterator<Item = &Holding> {
+        self.holdings.iter().filter(|h| h.state.occupies())
     }
     pub fn holdings(&self) -> &[Holding] {
         &self.holdings
@@ -446,7 +486,7 @@ impl Ledger {
         Ok(h)
     }
     fn live_frags(&self, key: &ResourceKey) -> Vec<Frag> {
-        self.live()
+        self.occupying()
             .filter(|h| h.key() == *key)
             .map(|h| h.frag.clone())
             .collect()
@@ -456,18 +496,32 @@ impl Ledger {
         pool: &PoolRef<A>,
         request: GrantRequest<A>,
     ) -> Result<HoldingHandle, LedgerError> {
+        self.grant_with_cleanup(pool, request, CleanupTarget::AccountingOnly)
+    }
+    pub fn grant_with_cleanup<A: RuntimeAlgebra>(
+        &mut self,
+        pool: &PoolRef<A>,
+        request: GrantRequest<A>,
+        target: CleanupTarget,
+    ) -> Result<HoldingHandle, LedgerError> {
         let cap = self.check_pool(pool)?;
         let key = pool.id().key();
         let decl = self
             .classes
             .get(key.class())
             .ok_or(LedgerError::UnknownClass)?;
+        if target.policy() != decl.cleanup || matches!(target, CleanupTarget::Unresolved { .. }) {
+            return Err(LedgerError::CleanupRequired);
+        }
         if request.generation.as_str().is_empty() {
             return Err(LedgerError::InvalidGeneration);
         }
+        if self.occupying().any(|h| target.conflicts_with(&h.target)) {
+            return Err(LedgerError::Conflict);
+        }
         if let Some(parent) = &request.parent {
             let ph = self.resolve(parent)?;
-            if ph.released_at.is_some() {
+            if !ph.state.is_active() {
                 return Err(LedgerError::ForgedHandle);
             }
             if ph.subject != request.owner
@@ -500,7 +554,8 @@ impl Ledger {
                 parent: request.parent.map(|p| p.id()),
                 lease,
                 acquired_at: request.now,
-                released_at: None,
+                state: HoldingState::Active,
+                target,
             },
         });
         self.next_id = next_id;
@@ -513,7 +568,7 @@ impl Ledger {
         to: SubjectId,
     ) -> Result<(), LedgerError> {
         let h = self.resolve(handle)?;
-        if h.released_at.is_some() || &h.subject != from {
+        if !h.state.is_active() || &h.subject != from {
             return Err(LedgerError::ForgedHandle);
         }
         self.holdings
@@ -526,7 +581,7 @@ impl Ledger {
     }
     pub fn release(&mut self, handle: &HoldingHandle, now: Timestamp) -> Result<(), LedgerError> {
         let h = self.resolve(handle)?;
-        if h.released_at.is_some() {
+        if h.released_at().is_some() {
             return if self
                 .classes
                 .get(&h.class_id)
@@ -538,7 +593,10 @@ impl Ledger {
                 Err(LedgerError::DoubleRelease)
             };
         }
-        if self.live().any(|h| h.parent == Some(handle.id())) {
+        if !h.state.is_active() || h.target.policy() != CleanupPolicy::AccountingOnly {
+            return Err(LedgerError::CleanupRequired);
+        }
+        if self.occupying().any(|h| h.parent == Some(handle.id())) {
             return Err(LedgerError::TeardownOrder);
         }
         self.holdings
@@ -546,7 +604,7 @@ impl Ledger {
             .find(|h| h.id == handle.id())
             .unwrap()
             .record
-            .released_at = Some(now);
+            .state = HoldingState::Retired(now);
         Ok(())
     }
     pub fn renew(
@@ -556,7 +614,7 @@ impl Ledger {
         now: Timestamp,
     ) -> Result<Lease, LedgerError> {
         let h = self.resolve(handle)?;
-        if h.released_at.is_some() {
+        if !h.state.is_active() {
             return Err(LedgerError::ForgedHandle);
         }
         let decl = self
@@ -568,6 +626,14 @@ impl Ledger {
         } else {
             request.resolve(decl.lease_duration, h.parent.is_some(), now)?
         };
+        if lease == Lease::ParentBound
+            && !h
+                .parent
+                .and_then(|p| self.holding(p))
+                .is_some_and(|p| p.state.is_active())
+        {
+            return Err(LedgerError::InvalidLease);
+        }
         self.holdings
             .iter_mut()
             .find(|h| h.id == handle.id())
@@ -588,13 +654,13 @@ impl Ledger {
     /// Expired parents wait for children with independent, unexpired leases.
     pub fn sweep(&mut self, now: Timestamp) -> Vec<HoldingId> {
         let mut due: BTreeSet<_> = self
-            .live()
+            .active()
             .filter(|h| matches!(h.lease, Lease::Until(t) if t <= now))
             .map(|h| h.id)
             .collect();
         loop {
             let kids: Vec<_> = self
-                .live()
+                .active()
                 .filter(|h| {
                     h.lease == Lease::ParentBound && h.parent.is_some_and(|p| due.contains(&p))
                 })
@@ -621,7 +687,7 @@ impl Ledger {
     }
     pub fn teardown(&mut self, subject: &SubjectId, now: Timestamp) -> Vec<HoldingId> {
         self.release_order(
-            self.live()
+            self.active()
                 .filter(|h| &h.subject == subject)
                 .map(|h| h.id)
                 .collect(),
@@ -651,7 +717,7 @@ impl Ledger {
             if h.lease == Lease::ParentBound && h.parent.is_none() {
                 return Err(LedgerError::InvalidLease);
             }
-            if h.released_at.is_none() && !self.capacities.contains_key(&h.key()) {
+            if h.state.occupies() && !self.capacities.contains_key(&h.key()) {
                 return Err(LedgerError::UnknownPool);
             }
             let mut ancestors = BTreeSet::from([h.id]);
@@ -661,12 +727,13 @@ impl Ledger {
                     return Err(LedgerError::InvalidGraph);
                 }
                 let ph = self.holding(id).ok_or(LedgerError::InvalidGraph)?;
-                if h.released_at.is_none() && ph.released_at.is_some() {
+                if h.state.occupies() && !ph.state.occupies() {
                     return Err(LedgerError::InvalidGraph);
                 }
                 parent = ph.parent;
             }
         }
+        self.cleanup_invariant()?;
         for (key, cap) in &self.capacities {
             let decl = self
                 .classes
@@ -690,7 +757,7 @@ impl Ledger {
         substrate: &[(InstanceId, Generation)],
     ) -> (Vec<HoldingId>, Vec<(InstanceId, Generation)>) {
         let decayed = self
-            .live()
+            .active()
             .filter(|h| {
                 &h.class_id == class
                     && !substrate
@@ -703,7 +770,7 @@ impl Ledger {
             .iter()
             .filter(|(i, g)| {
                 !self
-                    .live()
+                    .active()
                     .any(|h| &h.class_id == class && &h.instance == i && &h.generation == g)
             })
             .cloned()
@@ -721,7 +788,7 @@ impl Ledger {
         }
     }
     pub fn live_snapshot(&self, subject: &SubjectId) -> Vec<LiveItem> {
-        self.live()
+        self.active()
             .filter(|h| &h.subject == subject)
             .map(|h| self.live_item(h))
             .collect()
@@ -731,7 +798,7 @@ impl Ledger {
         while i < items.len() {
             let p = items[i].id;
             let kids: Vec<_> = self
-                .live()
+                .active()
                 .filter(|h| h.parent == Some(p) && !items.iter().any(|it| it.id == h.id))
                 .map(|h| self.live_item(h))
                 .collect();
@@ -745,17 +812,17 @@ impl Ledger {
     }
     pub fn live_subtree(&self, root: HoldingId) -> Vec<LiveItem> {
         self.closure(
-            self.live()
+            self.active()
                 .filter(|h| h.id == root)
                 .map(|h| self.live_item(h))
                 .collect(),
         )
     }
     pub fn live_count(&self) -> usize {
-        self.live().count()
+        self.active().count()
     }
     pub fn tombstone_count(&self) -> usize {
-        self.holdings.len() - self.live_count()
+        self.holdings.iter().filter(|h| !h.state.occupies()).count()
     }
 }
 

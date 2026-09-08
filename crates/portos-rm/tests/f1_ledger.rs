@@ -80,6 +80,7 @@ fn auth_validity_iff() {
 fn drill_ledger() -> Ledger {
     let mut l = Ledger::new();
     l.register_class(ClassDecl {
+        cleanup: portos_rm::cleanup::CleanupPolicy::AccountingOnly,
         class_id: "tcp-port".into(),
         algebra: AlgebraTag::Exclusive,
         release_idempotent: true,
@@ -88,6 +89,7 @@ fn drill_ledger() -> Ledger {
     })
     .unwrap();
     l.register_class(ClassDecl {
+        cleanup: portos_rm::cleanup::CleanupPolicy::AccountingOnly,
         class_id: "quota".into(),
         algebra: AlgebraTag::Counted,
         release_idempotent: true,
@@ -96,6 +98,7 @@ fn drill_ledger() -> Ledger {
     })
     .unwrap();
     l.register_class(ClassDecl {
+        cleanup: portos_rm::cleanup::CleanupPolicy::AccountingOnly,
         class_id: "proc-tree".into(),
         algebra: AlgebraTag::Exclusive,
         release_idempotent: true,
@@ -1020,7 +1023,7 @@ fn transfer_preserves_aggregate_and_holder_checks() {
         .map(|h| h.id())
         .unwrap();
     let outstanding_before: u64 = l
-        .live()
+        .active()
         .map(|h| match h.frag {
             Frag::Count(Count::Value(n)) => n,
             _ => 0,
@@ -1059,7 +1062,7 @@ fn transfer_preserves_aggregate_and_holder_checks() {
         vec![a]
     );
     let outstanding_after: u64 = l
-        .live()
+        .active()
         .map(|h| match h.frag {
             Frag::Count(Count::Value(n)) => n,
             _ => 0,

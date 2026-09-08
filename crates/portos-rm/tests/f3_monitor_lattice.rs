@@ -226,7 +226,7 @@ fn check(m: &Monitor, archs: &[Arch], mode: Mode, ending: Ending, w: &mut Witnes
     let spent: u64 = m
         .orch
         .ledger
-        .live()
+        .active()
         .filter(|h| h.class_id.as_str() == "budget")
         .map(|h| match &h.frag {
             portos_rm::ledger::Frag::Count(portos_rm::ra::Count::Value(n)) => *n,

@@ -7,6 +7,7 @@ use portos_rm::time::*;
 fn count_pool(l: &mut Ledger, name: &str, n: u64) -> PoolRef<Count> {
     let class = l
         .register_class(ClassDecl {
+            cleanup: portos_rm::cleanup::CleanupPolicy::AccountingOnly,
             class_id: ClassId::new("quota"),
             algebra: AlgebraTag::Counted,
             release_idempotent: true,
@@ -112,7 +113,7 @@ fn restore_requires_all_rows_pools_and_parent_edges_to_agree() {
         Box::new(|s| s.classes.clear()),
         Box::new(|s| s.holdings[0].parent = Some(s.holdings[1].id)),
         Box::new(|s| s.holdings[1].parent = Some(HoldingId::try_from(99u64).unwrap())),
-        Box::new(|s| s.holdings[0].released_at = Some(Timestamp::ZERO)),
+        Box::new(|s| s.holdings[0].state = portos_rm::cleanup::HoldingState::Retired(Timestamp::ZERO)),
         Box::new(|s| s.holdings[0].lease = Lease::ParentBound),
         Box::new(|s| s.holdings[0].generation = Generation::new("")),
         Box::new(|s| s.holdings[0].frag = Frag::Ex(Ex::Token)),
@@ -127,7 +128,7 @@ fn restore_requires_all_rows_pools_and_parent_edges_to_agree() {
     // Historical tombstones don't create pools that no longer exist.
     let mut history = baseline;
     for row in &mut history.holdings {
-        row.released_at = Some(Timestamp::ZERO);
+        row.state = portos_rm::cleanup::HoldingState::Retired(Timestamp::ZERO);
     }
     history.pools.clear();
     assert!(LedgerBuilder::new(history).finish().is_ok());

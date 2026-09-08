@@ -37,6 +37,7 @@ pub struct Entry {
 
 fn class(l: &mut Ledger, id: &str, algebra: AlgebraTag, lease: Option<u64>, rho: RevertGrade) {
     l.register_class(ClassDecl {
+        cleanup: crate::cleanup::CleanupPolicy::AccountingOnly,
         class_id: id.into(),
         algebra,
         release_idempotent: true,

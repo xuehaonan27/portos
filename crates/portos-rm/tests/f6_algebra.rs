@@ -118,6 +118,7 @@ fn ranges_and_frac_satisfy_ra_laws_and_inclusion_definition() {
 fn ledger_gates_subranges_and_fraction_shares() {
     let mut l = Ledger::new();
     l.register_class(ClassDecl {
+        cleanup: portos_rm::cleanup::CleanupPolicy::AccountingOnly,
         class_id: "mr".into(),
         algebra: AlgebraTag::Range,
         release_idempotent: true,
@@ -126,6 +127,7 @@ fn ledger_gates_subranges_and_fraction_shares() {
     })
     .unwrap();
     l.register_class(ClassDecl {
+        cleanup: portos_rm::cleanup::CleanupPolicy::AccountingOnly,
         class_id: "mr-read".into(),
         algebra: AlgebraTag::Frac,
         release_idempotent: true,

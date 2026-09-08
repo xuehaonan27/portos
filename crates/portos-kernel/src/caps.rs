@@ -25,7 +25,7 @@ use std::{
 
 use portos_proto::{Capability, Constraints};
 use portos_rm::identity::{AccountId, EffectClass, SpendRequest, SubjectId};
-use portos_rm::teardown::World;
+use portos_rm::cleanup::CleanupExecutor;
 use portos_rm::time::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -260,7 +260,7 @@ impl CapStore {
     /// pools (✓(● 0 · ◯ 0): the F1 invariant survives the closing). Each cap's
     /// step is idempotent, so re-revoking after a crash resumes where it
     /// stopped.
-    pub fn revoke<W: World>(
+    pub fn revoke<W: CleanupExecutor>(
         &self,
         cap_id: &str,
         world: &mut W,
@@ -306,7 +306,7 @@ mod tests {
     use super::*;
     use crate::ledger::CLASS_SUBSCRIPTION;
     use crate::ledger::ExclusiveRequest;
-    use portos_rm::identity::{ClassId, Generation, HoldingId, InstanceId, ResourceKey, SubjectId};
+    use portos_rm::identity::{ClassId, Generation, InstanceId, ResourceKey, SubjectId};
     use portos_rm::teardown::MockWorld;
     use portos_rm::time::{LeaseRequest, Timestamp};
     use std::collections::BTreeMap;
@@ -460,7 +460,7 @@ mod tests {
         // under the cap holding (WP-08's pools/routes will look like this).
         let child = caps
             .ledger
-            .hold_exclusive(
+            .hold_managed(
                 ExclusiveRequest {
                     owner: SubjectId::new("plugin:p"),
                     resource: ResourceKey::new(
@@ -472,6 +472,14 @@ mod tests {
                         .map(|id| caps.ledger.holding(id).unwrap().unwrap().handle()),
                     lease: LeaseRequest::UseClassDefault,
                 },
+                portos_rm::cleanup::CleanupTarget::Subscription {
+                    host: portos_rm::cleanup::HostWitness::new(
+                        crate::ledger::capture_process(std::process::id()).unwrap(),
+                        "caps-test-host".into(),
+                    ).unwrap(),
+                    subscription: 1,
+                },
+                None,
                 Timestamp::try_from(1u64).unwrap(),
             )
             .map(|h| h.id())
@@ -479,19 +487,16 @@ mod tests {
         let mut world = MockWorld::default();
         let n = caps.revoke(&cap.cap_id, &mut world, 2).unwrap();
         assert_eq!(n, 1);
-        // Children first, the cap holding last.
-        let pos = |id: HoldingId| world.action_order.iter().position(|x| *x == id).unwrap();
-        assert!(
-            pos(child) < pos(cap_holding),
-            "child released before the cap holding"
-        );
+        // Only the subscription has a physical inverse. The accounting parent
+        // settles after that child has been durably confirmed.
+        assert_eq!(world.action_order, vec![child]);
         for id in [child, cap_holding] {
             assert!(
                 caps.ledger
                     .holding(id)
                     .unwrap()
                     .unwrap()
-                    .released_at
+                    .released_at()
                     .is_some(),
                 "holding {id} tombstoned"
             );

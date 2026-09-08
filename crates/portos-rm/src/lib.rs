@@ -20,3 +20,5 @@ pub mod registry;
 pub mod teardown;
 pub mod time;
 pub mod verbs;
+
+pub mod cleanup;
