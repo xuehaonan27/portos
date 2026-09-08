@@ -120,6 +120,27 @@ fn write_json(path: &Path, v: &Value) {
     std::fs::write(path, serde_json::to_string_pretty(v).unwrap()).unwrap();
 }
 
+/// The default stack as data (the shape `ensure_templates` materializes):
+/// broker + modeld + compute, plus the model driver's grants. Tests declare
+/// their stack explicitly — the CLI hardcodes none of it.
+fn stack_plugins(cli: &Path, root: &Path) -> Vec<Value> {
+    let bin = |n: &str| cli.with_file_name(n).to_string_lossy().into_owned();
+    vec![
+        json!({"bin": bin("portos-broker"),
+               "env": {"PORTOS_BROKER_DIR": root.join("broker").to_string_lossy()}}),
+        json!({"bin": bin("portos-modeld"),
+               "env": {"PORTOS_MODELD_DIR": root.join("modeld").to_string_lossy()}}),
+        json!({"bin": bin("portos-compute")}),
+    ]
+}
+
+fn stack_grants() -> Vec<Value> {
+    vec![
+        json!({"resource": "driver:egress", "verbs": ["http", "http_stream"]}),
+        json!({"resource": "driver:compute", "verbs": ["run"]}),
+    ]
+}
+
 /// A form fixture: GET / serves the form, POST /submit records the body.
 /// Returns (port, recorded bodies). Refs are deterministic: the input is e1.
 fn serve_form() -> (u16, Arc<Mutex<Vec<String>>>) {
@@ -265,11 +286,14 @@ fn portos_chat_with_renderer_plugin() {
             "max_tokens": 128,
         }),
     );
+    let mut plugins = stack_plugins(cli, &root);
+    plugins.push(json!({"bin": "node", "args": [renderer.to_str().unwrap()]}));
     write_json(
         &root.join("chat.json"),
         &json!({
             "render": "none",
-            "plugins": [{"bin": "node", "args": [renderer.to_str().unwrap()]}],
+            "plugins": plugins,
+            "grants": stack_grants(),
         }),
     );
 
@@ -375,16 +399,20 @@ fn portos_chat_end_to_end() {
             }],
         }),
     );
+    let mut plugins = stack_plugins(cli, &root);
+    plugins.push(json!({
+        "bin": "node",
+        "args": [plugin.to_str().unwrap()],
+        "env": {"WORKSHOP_HEADLESS": "1",
+                "WORKSHOP_PROFILE_DIR": root.join("profile").to_str().unwrap()},
+    }));
+    let mut grants = stack_grants();
+    grants.push(json!({"resource": "driver:browser", "verbs": ["navigate"]}));
     write_json(
         &root.join("chat.json"),
         &json!({
-            "plugins": [{
-                "bin": "node",
-                "args": [plugin.to_str().unwrap()],
-                "env": {"WORKSHOP_HEADLESS": "1",
-                         "WORKSHOP_PROFILE_DIR": root.join("profile").to_str().unwrap()},
-            }],
-            "grants": [{"resource": "driver:browser", "verbs": ["navigate"]}],
+            "plugins": plugins,
+            "grants": grants,
         }),
     );
 

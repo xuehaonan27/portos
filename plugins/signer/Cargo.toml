@@ -1,10 +1,11 @@
 [package]
-name = "portos-compute"
+name = "portos-signer"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-portos-proto = { path = "../portos-proto" }
+portos-kernel = { path = "../../crates/portos-kernel" }
 serde_json = { workspace = true }
 blake3 = { workspace = true }
+rand = { workspace = true }
 hex = { workspace = true }

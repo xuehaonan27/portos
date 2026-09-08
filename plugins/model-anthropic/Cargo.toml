@@ -1,0 +1,8 @@
+[package]
+name = "portos-model-anthropic"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+portos-model-core = { path = "../../drivers/model-core" }
+serde_json = { workspace = true }

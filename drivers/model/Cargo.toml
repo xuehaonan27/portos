@@ -8,6 +8,8 @@ name = "portos-modeld"
 path = "src/main.rs"
 
 [dependencies]
+portos-model-core = { path = "../model-core" }
+portos-model-anthropic = { path = "../../plugins/model-anthropic" }
 portos-sdk = { path = "../../crates/portos-sdk" }
 serde_json = { workspace = true }
 

@@ -1145,11 +1145,17 @@ impl Rt<'_> {
                     label = label.join(&l);
                     vals.push(v);
                 }
-                let mut fuel = portos_compute::FuelMeter::new(100_000);
-                let registry = portos_compute::Registry::builtin();
-                let v = registry
-                    .run(func, None, &vals, &mut fuel)
-                    .map_err(|e| Halt::Stop(Outcome::FailStop { at: format!("pure {func}: {e}") }))?;
+                // Pure computation runs in the zero-capability compute PLUGIN
+                // (methodology audit: never in the kernel). It rides the same
+                // capability gate as any verb; repeatable, so never budgeted.
+                let v = invoke_as(
+                    &self.svc.kernel,
+                    &self.svc.inner,
+                    self.fiber,
+                    "compute::run",
+                    json!({"func": func, "args": vals}),
+                )
+                .map_err(|e| Halt::Stop(Outcome::FailStop { at: format!("pure {func}: {e}") }))?;
                 Ok((v, label))
             }
             Expr::Const { value } => Ok((value.clone(), Label::public_trusted())),
@@ -1251,6 +1257,9 @@ fn verb_demand(plan: &Plan) -> Vec<String> {
                 }
             }
             Expr::Pure { args, .. } => {
+                // Pure computation calls the compute plugin: the demand
+                // includes it (admission's grants check and the fiber's caps).
+                out.push("compute::run".to_string());
                 for a in args {
                     of_expr(a, out);
                 }

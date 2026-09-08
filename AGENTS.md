@@ -2,7 +2,9 @@
 ## Workspace
 This is a Rust workspace.
 
-- `crates`: where project code lives.
+- `crates`: kernel and kernel-side facilities (kernel, proto, rm, sdk, broker, echo, cli).
+- `drivers`: driver plugins and family-interface libraries (browser, model, model-core, render-tty).
+- `plugins`: third-party / reference implementations (model-anthropic, compute, signer) — swappable, replaceable, never kernel-side.
 - `docs`: documentation that's short and accurate, describing current status, short and accurate enough for human to read.
 - `.dev` (gitignored): temporal development space, never added into git worktree.
     - `.dev/plans`: plans that's a draft, describing what's going to do.

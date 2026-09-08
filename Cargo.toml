@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/portos-broker", "crates/portos-cli", "crates/portos-compute", "crates/portos-echo", "crates/portos-kernel", "crates/portos-proto", "crates/portos-rm", "crates/portos-sdk", "drivers/model"]
+members = ["crates/portos-broker", "crates/portos-cli", "crates/portos-echo", "crates/portos-kernel", "crates/portos-proto", "crates/portos-rm", "crates/portos-sdk", "drivers/model", "drivers/model-core", "plugins/model-anthropic", "plugins/compute", "plugins/signer"]
 
 [workspace.package]
 version = "0.1.0"

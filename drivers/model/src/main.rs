@@ -28,10 +28,8 @@
 //! language (D31).
 
 mod backend;
-mod backends;
-mod core;
 
-use crate::core::{EgressStream, Gateway, Session, ToolDef};
+use portos_model_core::{EgressStream, Gateway, Session, ToolDef};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::mpsc::{SyncSender, sync_channel};
@@ -320,7 +318,7 @@ fn main() -> std::io::Result<()> {
                     }
                     client.invoke(verb, a)
                 };
-                let result = core::run_send(
+                let result = portos_model_core::run_send(
                     &*backend, &gw, &mut session, &tools, text, max_turns, &emit, &invoke,
                 );
                 sessions.insert(sid, session);

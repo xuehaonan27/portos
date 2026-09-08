@@ -1,21 +1,24 @@
 //! `portos chat <root>` — the standalone runtime's front door.
 //!
-//! Spawns the trusted egress broker and the model driver (sibling binaries),
-//! plus any extra drivers listed in `<root>/chat.json`, mints the configured
-//! capability grants, then runs a REPL: each line goes to `model::send`
-//! while deltas and tool activity stream live from the session's event
-//! topic. The kernel stays in this process (library-linked, D17);
-//! daemonization is still deferred.
+//! The whole stack is **data, not code**: `<root>/chat.json` (materialized on
+//! first run with a reference default) lists the plugins to spawn and the
+//! capability grants to mint; every command (`chat`, `run-plan`, `consent`,
+//! `approve`) consumes it uniformly. The shipped default — broker, a model
+//! driver, compute, plus the model driver's egress and compute grants — is a
+//! reference implementation; replace any of it by editing chat.json. The
+//! model driver is found by family (`model::start`), never by name. The
+//! kernel stays in this process (library-linked, D17); daemonization is
+//! still deferred.
 //!
 //! Layout under `<root>`:
 //!   broker/config.json + broker/secrets.json   (templates written if absent)
 //!   modeld/config.json                         (template written if absent)
-//!   chat.json                                  (optional: extra plugins + grants)
+//!   chat.json                                  (the stack: plugins + grants)
 //!
 //! chat.json shape:
 //!   { "plugins": [ {"bin": "node", "args": ["…/plugin.js"], "env": {"K": "V"},
 //!                    "slot"?: {"offers": ["family::verb", …], "provides": ["family", …]}} ],
-//!     "grants":  [ {"subject"?: "plugin:portos-modeld",
+//!     "grants":  [ {"subject"?: <the model driver>, 
 //!                   "resource": "driver:browser", "verbs": ["open", …]} ],
 //!     "render":  "builtin" | "none" }
 //! Relative paths in `args` resolve against `<root>` when they exist there.
@@ -46,60 +49,30 @@ pub fn run(root: &str) -> Result<(), Box<dyn std::error::Error>> {
     host.start_sweeper(std::time::Duration::from_secs(1)); // WP-02 lease sweeper
     host.audit_topic("egress::log");
 
-    write_templates(&root)?;
-
-    let broker = spawn_broker(&host, &root)?;
-    let modeld_dir = root.join("modeld");
-    let modeld = host.spawn(
-        &sibling("portos-modeld")?,
-        &[],
-        &[("PORTOS_MODELD_DIR", modeld_dir.to_str().unwrap())],
-    )?;
-    println!("[chat] plugins: {broker}, {modeld}");
-
-    // The model driver always gets egress (its LLM calls go through the
-    // broker; it holds no key and no network of its own).
-    kernel.caps.mint(
-        &format!("plugin:{modeld}"),
-        "driver:egress",
-        BTreeSet::from(["http".to_string(), "http_stream".to_string()]),
-        Default::default(),
-        None,
-    )?;
-
+    ensure_templates(&root)?;
     warn_if_provider_host_unlisted(&root);
 
-    // Extra drivers + grants + render mode from chat.json.
+    // The whole stack is data: chat.json (materialized on first run) drives
+    // plugins and grants uniformly. The model driver is found by family, not
+    // by name — swap it by editing chat.json.
     let mut render_builtin = true;
-    if let Ok(text) = std::fs::read_to_string(root.join("chat.json")) {
-        let cfg: Value = serde_json::from_str(&text)?;
+    let cfg = load_chat_json(&root);
+    if let Some(cfg) = &cfg {
         if cfg["render"].as_str() == Some("none") {
             render_builtin = false;
             println!("[chat] builtin rendering off — renderer plugins own the output");
         }
-        spawn_chat_plugins(&host, &root, &cfg)?;
-        if let Some(grants) = cfg["grants"].as_array() {
-            for g in grants {
-                let subject = g["subject"]
-                    .as_str()
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| format!("plugin:{modeld}"));
-                let resource = g["resource"].as_str().ok_or("grant missing resource")?;
-                let verbs: BTreeSet<String> = g["verbs"]
-                    .as_array()
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                kernel.caps.mint(&subject, resource, verbs, Default::default(), None)?;
-                println!("[chat] grant: {subject} → {resource}");
-            }
-        }
+        spawn_chat_plugins(&host, &root, cfg)?;
     } else {
-        println!("[chat] no chat.json — model-only chat (add one to wire in drivers)");
+        println!("[chat] no chat.json — no stack (materialize one with `portos consent` or write one)");
     }
+    let modeld = host
+        .verb_provider("model::start")
+        .ok_or("no model driver plugin serving model::start (check chat.json)")?;
+    if let Some(cfg) = &cfg {
+        apply_grants(&kernel, cfg, &format!("plugin:{modeld}"))?;
+    }
+    println!("[chat] model driver: {modeld}");
 
     // One session; deltas render live from its event topic.
     let started = host.call(&modeld, "model::start", json!({}))?;
@@ -232,17 +205,6 @@ fn sibling(name: &str) -> Result<PathBuf, String> {
     }
 }
 
-/// Spawn the trusted egress broker (shared by `chat` and `run-plan`).
-pub fn spawn_broker(host: &Host, root: &Path) -> Result<String, Box<dyn std::error::Error>> {
-    let dir = root.join("broker");
-    let name = host.spawn(
-        &sibling("portos-broker")?,
-        &[],
-        &[("PORTOS_BROKER_DIR", dir.to_str().unwrap())],
-    )?;
-    Ok(name)
-}
-
 /// Spawn every plugin of a chat.json `plugins` array, honoring per-entry
 /// `slot` (shared by `chat` and `run-plan`).
 pub fn spawn_chat_plugins(
@@ -285,7 +247,12 @@ pub fn spawn_chat_plugins(
     Ok(())
 }
 
-fn write_templates(root: &Path) -> std::io::Result<()> {
+/// Materialize the root's config templates on first use: broker and modeld
+/// configs, and the **default stack as data** — a `chat.json` every command
+/// consumes uniformly. The default stack (broker + modeld + compute, plus
+/// the model driver's egress and compute grants) is a reference
+/// implementation shipped as editable data, never hardcoded into the CLI.
+pub fn ensure_templates(root: &Path) -> std::io::Result<()> {
     let broker = root.join("broker");
     std::fs::create_dir_all(&broker)?;
     let cfg = broker.join("config.json");
@@ -330,6 +297,63 @@ fn write_templates(root: &Path) -> std::io::Result<()> {
             .unwrap(),
         )?;
         println!("[chat] wrote {}", mcfg.display());
+    }
+    let chat_json = root.join("chat.json");
+    if !chat_json.exists() {
+        let bin = |n: &str| sibling(n).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        std::fs::write(
+            &chat_json,
+            serde_json::to_string_pretty(&json!({
+                "plugins": [
+                    {"bin": bin("portos-broker"),
+                     "env": {"PORTOS_BROKER_DIR": root.join("broker").to_string_lossy()}},
+                    {"bin": bin("portos-modeld"),
+                     "env": {"PORTOS_MODELD_DIR": root.join("modeld").to_string_lossy()}},
+                    {"bin": bin("portos-compute")},
+                ],
+                "grants": [
+                    {"resource": "driver:egress", "verbs": ["http", "http_stream"]},
+                    {"resource": "driver:compute", "verbs": ["run"]},
+                ],
+            }))
+            .unwrap(),
+        )?;
+        println!("[chat] wrote {} — the default stack is data: edit it freely", chat_json.display());
+    }
+    Ok(())
+}
+
+/// Load `<root>/chat.json` if present.
+pub fn load_chat_json(root: &Path) -> Option<Value> {
+    let text = std::fs::read_to_string(root.join("chat.json")).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Mint the grants of a chat.json `grants` array. Entries without `subject`
+/// go to `default_subject` (the model driver found by family, not by name).
+pub fn apply_grants(
+    kernel: &Arc<Kernel>,
+    cfg: &Value,
+    default_subject: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(grants) = cfg["grants"].as_array() {
+        for g in grants {
+            let subject = g["subject"]
+                .as_str()
+                .map(String::from)
+                .unwrap_or_else(|| default_subject.to_string());
+            let resource = g["resource"].as_str().ok_or("grant missing resource")?;
+            let verbs: BTreeSet<String> = g["verbs"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            kernel.caps.mint(&subject, resource, verbs, Default::default(), None)?;
+            println!("[chat] grant: {subject} → {resource}");
+        }
     }
     Ok(())
 }

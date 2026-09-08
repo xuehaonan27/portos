@@ -1,5 +1,8 @@
 //! Anthropic Messages API backend — one implementation behind the neutral
-//! [`Backend`] seam, never the driver itself.
+//! [`Backend`] seam of `portos-model-core`, never the driver itself.
+//!
+//! This is its own crate: provider implementations iterate independently
+//! of the reference model driver (audit 2026-09-07).
 //!
 //! All traffic goes through the egress gateway (the broker injects
 //! `x-api-key`; this process never holds the key). Responses stream via SSE:
@@ -9,7 +12,7 @@
 //! payload so multi-turn replay is faithful; the neutral parts are derived
 //! from the same accumulator.
 
-use crate::core::{
+use portos_model_core::{
     Backend, EgressStream, Gateway, Msg, Part, StopKind, ToolCall, TurnRequest, TurnResult,
     TurnSink, mangle, unmangle,
 };

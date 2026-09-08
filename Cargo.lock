@@ -406,9 +406,9 @@ dependencies = [
 name = "portos-cli"
 version = "0.1.0"
 dependencies = [
- "portos-compute",
  "portos-kernel",
  "portos-proto",
+ "portos-signer",
  "serde_json",
 ]
 
@@ -419,6 +419,7 @@ dependencies = [
  "blake3",
  "hex",
  "portos-proto",
+ "portos-sdk",
  "serde_json",
 ]
 
@@ -439,9 +440,9 @@ dependencies = [
  "blake3",
  "hex",
  "nix",
- "portos-compute",
  "portos-proto",
  "portos-rm",
+ "portos-signer",
  "rand",
  "regex",
  "rusqlite",
@@ -450,10 +451,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "portos-model-anthropic"
+version = "0.1.0"
+dependencies = [
+ "portos-model-core",
+ "serde_json",
+]
+
+[[package]]
+name = "portos-model-core"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "portos-modeld"
 version = "0.1.0"
 dependencies = [
  "portos-kernel",
+ "portos-model-anthropic",
+ "portos-model-core",
  "portos-proto",
  "portos-sdk",
  "serde_json",
@@ -479,6 +497,17 @@ name = "portos-sdk"
 version = "0.1.0"
 dependencies = [
  "portos-proto",
+ "serde_json",
+]
+
+[[package]]
+name = "portos-signer"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "hex",
+ "portos-kernel",
+ "rand",
  "serde_json",
 ]
 

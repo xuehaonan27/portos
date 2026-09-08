@@ -24,7 +24,7 @@ use portos_kernel::consent::{ConsentRecord, render_budget};
 use portos_kernel::host::Host;
 use portos_kernel::Kernel;
 use portos_proto::Label;
-use serde_json::{Value, json};
+use serde_json::json;
 use std::io::Write;
 use std::sync::Arc;
 
@@ -85,14 +85,14 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             // Admission runs against the real route tables (verbs' declared
             // characters), so the driver stack comes up — plugins only, no
             // browser window (Chromium opens lazily on first verb).
-            chat::spawn_broker(&host, &root_path)?;
-            if let Ok(text) = std::fs::read_to_string(root_path.join("chat.json")) {
-                let cfg: Value = serde_json::from_str(&text)?;
+            chat::ensure_templates(&root_path)?;
+            if let Some(cfg) = chat::load_chat_json(&root_path) {
                 chat::spawn_chat_plugins(&host, &root_path, &cfg)?;
             }
             let bytes = std::fs::read(&plan_path)?;
             let out = host.plans.submit("user", &bytes)?;
             print!("{}", out.rendering);
+            let signer = portos_signer::Signer::load(&root_path)?;
             let approved = auto_yes || {
                 print!("Approve this plan? [y/N] ");
                 std::io::stdout().flush()?;
@@ -105,7 +105,7 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 host.shutdown_all();
                 return Ok(());
             }
-            let rec = ConsentRecord::sign(&k.consent_key, &out.plan_hash, out.budget.clone(), 3600);
+            let rec = signer.sign(&out.plan_hash, out.budget.clone(), 3600);
             let out_path = format!("{plan_path}.consent.json");
             std::fs::write(&out_path, serde_json::to_string_pretty(&rec)?)?;
             k.audit.lock().unwrap().append(json!({
@@ -123,13 +123,13 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let k = Arc::new(Kernel::open(&root_path)?);
             let host = Host::new(k.clone(), &root_path.join("sock"))?;
             host.start_sweeper(std::time::Duration::from_secs(1));
-            chat::spawn_broker(&host, &root_path)?;
-            if let Ok(text) = std::fs::read_to_string(root_path.join("chat.json")) {
-                let cfg: Value = serde_json::from_str(&text)?;
+            chat::ensure_templates(&root_path)?;
+            if let Some(cfg) = chat::load_chat_json(&root_path) {
                 chat::spawn_chat_plugins(&host, &root_path, &cfg)?;
             }
             let bytes = std::fs::read(&plan_path)?;
             let rec: ConsentRecord = serde_json::from_str(&std::fs::read_to_string(&consent_path)?)?;
+            let signer = portos_signer::Signer::load(&root_path)?;
             let plan_hash = portos_proto::artifact::id_for_bytes(&bytes);
             // Prefer the run `consent` already admitted for this plan.
             let run_id = match host.plans.admitted_run_for(&plan_hash)? {
@@ -163,7 +163,7 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                             for (verb, _, cost) in &batch {
                                 *budget.entry(verb.clone()).or_insert(0u64) += cost;
                             }
-                            let approval = ConsentRecord::sign(&k.consent_key, &plan_hash, budget, 3600);
+                            let approval = signer.sign(&plan_hash, budget, 3600);
                             k.audit.lock().unwrap().append(json!({
                                 "event": "consent.signed", "plan": plan_hash, "nonce": approval.nonce,
                             }))?;
@@ -183,12 +183,7 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         let mut line = String::new();
                         stdin.read_line(&mut line)?;
                         if matches!(line.trim(), "y" | "Y" | "yes") {
-                            let inc = ConsentRecord::sign(
-                                &k.consent_key,
-                                &plan_hash,
-                                rec.budget.clone(),
-                                3600,
-                            );
+                            let inc = signer.sign(&plan_hash, rec.budget.clone(), 3600);
                             host.plans.resume(&run_id, &inc)?;
                         } else {
                             println!("[run] left paused; it will be aborted at consent expiry");
@@ -206,13 +201,13 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let root_path = std::path::PathBuf::from(&root);
             let k = Arc::new(Kernel::open(&root_path)?);
             let host = Host::new(k.clone(), &root_path.join("sock"))?;
-            chat::spawn_broker(&host, &root_path)?;
-            if let Ok(text) = std::fs::read_to_string(root_path.join("chat.json")) {
-                let cfg: Value = serde_json::from_str(&text)?;
+            chat::ensure_templates(&root_path)?;
+            if let Some(cfg) = chat::load_chat_json(&root_path) {
                 chat::spawn_chat_plugins(&host, &root_path, &cfg)?;
             }
             let plan_hash = host.plans.run_plan_hash(&run_id)?;
             let batch = host.plans.withheld_batch(&run_id)?;
+            let signer = portos_signer::Signer::load(&root_path)?;
             if batch.is_empty() {
                 println!("nothing to approve for {run_id}");
                 return Ok(());
@@ -234,7 +229,7 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 println!("Denied");
                 return Ok(());
             }
-            let rec = ConsentRecord::sign(&k.consent_key, &plan_hash, budget, 3600);
+            let rec = signer.sign(&plan_hash, budget, 3600);
             host.plans.approve(&run_id, &rec)?;
             k.audit.lock().unwrap().append(json!({
                 "event": "consent.signed", "plan": plan_hash, "nonce": rec.nonce,

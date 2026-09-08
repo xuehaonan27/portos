@@ -486,6 +486,17 @@ impl Host {
         self.inner.plugins.lock().unwrap().get(plugin).map(|h| h.pid)
     }
 
+    /// The plugin serving a verb, if any — used by the CLI to find a driver
+    /// by its family rather than by name (stack entries are data).
+    pub fn verb_provider(&self, verb: &str) -> Option<String> {
+        self.inner
+            .routes
+            .lock()
+            .unwrap()
+            .get(verb)
+            .map(|e| e.plugin.clone())
+    }
+
     /// Crash-only reclamation of a plugin's holdings (children first) with
     /// the physical inverses — the one teardown path. Returns rows released.
     pub fn reclaim(&self, plugin: &str, reason: &str) -> usize {

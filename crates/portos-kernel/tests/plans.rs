@@ -64,7 +64,8 @@ fn foreach_plan(items: &[&str], bound: u32, mode: &str) -> Vec<u8> {
 fn sign(kernel: &Kernel, plan_hash: &str, budget: &[(&str, u64)], ttl_secs: u64) -> ConsentRecord {
     let b: std::collections::BTreeMap<String, u64> =
         budget.iter().map(|(k, n)| (k.to_string(), *n)).collect();
-    ConsentRecord::sign(&kernel.consent_key, plan_hash, b, ttl_secs)
+    let root = kernel.root.clone();
+    portos_signer::Signer::load(&root).unwrap().sign(plan_hash, b, ttl_secs)
 }
 
 fn wait_state(svc: &PlanService, run_id: &str, want: &str) {
@@ -387,8 +388,7 @@ fn segment_abort_rolls_back_subscriptions_and_holds_made_by_the_run() {
 
 /// The audit chain covers a whole run and replays (m0 accept_5).
 #[test]
-fn audit_chain_replays_a_run() {
-    let (kernel, host, root) = setup("audit");
+fn audit_chain_replays_a_run() {    let (kernel, host, root) = setup("audit");
     spawn_echo(&host, "echo", &[]);
     let out = host.plans.submit("user", &emit_times(&["a", "b"])).unwrap();
     let consent = sign(&kernel, &out.plan_hash, &[("echo::emit", 2)], 3600);
@@ -404,5 +404,33 @@ fn audit_chain_replays_a_run() {
         events.iter().any(|e| e["event"] == "plan.finished" && e["status"] == "Completed"),
         "the finished event carries the status: {events:?}"
     );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Pure computation runs in the compute PLUGIN, never in the kernel
+/// (methodology audit): a plan's `pure` node is dispatched as `compute::run`
+/// through the same capability gate, and the result flows into later effects.
+#[test]
+fn pure_evaluation_runs_in_the_compute_plugin() {
+    let (kernel, host, root) = setup("pure");
+    spawn_echo(&host, "echo", &[]);
+    let compute_bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/portos-compute");
+    assert!(compute_bin.exists(), "portos-compute not built");
+    host.spawn(&compute_bin, &[], &[]).unwrap();
+    let bytes = plan(json!({"stmts": [
+        {"k": "let", "var": "u",
+         "expr": {"k": "pure", "func": "upper", "args": [{"k": "const", "value": "hi"}]}},
+        {"k": "effect", "verb": "echo::emit", "args": [{"k": "var", "name": "u"}]},
+    ]}));
+    let out = host.plans.submit("user", &bytes).unwrap();
+    let consent = sign(&kernel, &out.plan_hash, &[("echo::emit", 1)], 3600);
+    host.plans.start(&out.run_id, &consent).unwrap();
+    let outcome = wait_outcome(&host.plans, &out.run_id);
+    assert!(matches!(outcome, Outcome::Completed), "{outcome:?}");
+    assert_eq!(emissions(&kernel, &out.run_id), 1);
+    // The compute call itself is gated: a consent whose fiber caps were
+    // somehow absent compute would fail — here the demand carried it, so the
+    // fiber held compute::run uncounted (repeatable, never budgeted).
+    host.shutdown_all();
     let _ = std::fs::remove_dir_all(&root);
 }

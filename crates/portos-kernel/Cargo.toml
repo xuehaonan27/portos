@@ -8,7 +8,6 @@ edition.workspace = true
 # `attach` feature stays off until WP-08.
 portos-proto = { path = "../portos-proto" }
 portos-rm = { path = "../portos-rm", default-features = false, features = ["plan-shapes"] }
-portos-compute = { path = "../portos-compute" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 blake3 = { workspace = true }
@@ -17,3 +16,6 @@ rand = { workspace = true }
 regex = { workspace = true }
 hex = { workspace = true }
 nix = { workspace = true }
+
+[dev-dependencies]
+portos-signer = { path = "../../plugins/signer" }
