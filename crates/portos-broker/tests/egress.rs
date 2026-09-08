@@ -222,7 +222,7 @@ fn streams_body_as_events() {
         json!({}),
     );
 
-    let (_sub, rx) = host.subscribe_local("sse::t1");
+    let (_sub, rx) = host.subscribe_local("sse::t1").unwrap();
     let head = host
         .call(
             &name,
@@ -256,7 +256,7 @@ fn streams_body_as_events() {
 #[test]
 fn secret_stays_out_of_responses_and_audit() {
     let (kernel, host, root) = setup("noleak");
-    host.audit_topic("egress::log");
+    host.audit_topic("egress::log").unwrap();
     let port = upstream(1, |_req| http_response("", b"ok"));
     let name = spawn_broker(
         &host,

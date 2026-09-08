@@ -24,15 +24,13 @@ use std::{
 };
 
 use portos_proto::{Capability, Constraints};
-use portos_rm::ledger::{Frag, Ledger};
-use portos_rm::ra::{Count, Ex};
+use portos_rm::identity::{AccountId, EffectClass, SpendRequest, SubjectId};
 use portos_rm::teardown::World;
+use portos_rm::time::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::KernelError;
-use crate::ledger::{
-    CLASS_CAP, CLASS_CAP_COUNT, LedgerStore, map_err, persist_on, pool_instance,
-};
+use crate::ledger::{LedgerStore, map_err};
 
 pub struct CapStore {
     // Currently we use a database to store capabilities.
@@ -41,82 +39,24 @@ pub struct CapStore {
 }
 
 impl CapStore {
-    pub fn new(db: Arc<Mutex<Connection>>, ledger: Arc<LedgerStore>) -> CapStore {
+    pub(crate) fn new(db: Arc<Mutex<Connection>>, ledger: Arc<LedgerStore>) -> CapStore {
         CapStore { db, ledger }
-    }
-
-    /// Declare every live (cap, verb) pool's capacity in the ledger. Called on
-    /// open (the ledger reloads spend rows, the cap table owns capacities).
-    /// Revoked caps keep their pools closed (revocation zeroed them and
-    /// released their spend rows in the same transaction).
-    pub fn rebuild_pools(&self) -> Result<(), KernelError> {
-        let rows: Vec<String> = {
-            let db = self.db.lock().unwrap();
-            let mut stmt = db.prepare("SELECT json FROM caps WHERE revoked=0")?;
-            stmt.query_map([], |r| r.get::<_, String>(0))?
-                .collect::<Result<_, _>>()?
-        };
-        for j in rows {
-            if let Ok(cap) = serde_json::from_str::<Capability>(&j) {
-                self.declare_pools(&cap);
-            }
-        }
-        Ok(())
-    }
-
-    fn declare_pools(&self, cap: &Capability) {
-        for (verb, n) in &cap.constraints.counts {
-            self.ledger.set_pool(&cap.cap_id, verb, *n);
-        }
     }
 
     /// Remaining balance of a counted verb: capacity minus the fold of spend
     /// rows. `None` when the verb is uncounted (unlimited).
-    pub fn counts_left(&self, cap: &Capability, verb: &str) -> Option<u64> {
-        cap.constraints
-            .counts
-            .get(verb)
-            .map(|cap_n| cap_n.saturating_sub(self.ledger.spent(&cap.cap_id, verb)))
+    pub fn counts_left(&self, cap: &Capability, verb: &str) -> Result<Option<u64>, KernelError> {
+        self.ledger
+            .count_balance(&AccountId::new(&cap.cap_id), &EffectClass::new(verb))
     }
 
     /// The one minting path (`mint` and `attenuate` converge here): the caps
     /// row, the (cap, verb) pool capacities and the `kernel/cap` holding (with
     /// the cap's expiry as its lease) commit in a single transaction.
     fn store_minted(&self, cap: &Capability) -> Result<(), KernelError> {
-        let now = crate::db::now_unix();
-        let cap = cap.clone();
-        self.ledger.transaction(move |l, conn| {
-            store_on(conn, &cap)?;
-            for (verb, n) in &cap.constraints.counts {
-                l.set_capacity(
-                    CLASS_CAP_COUNT,
-                    &pool_instance(&cap.cap_id, verb),
-                    Frag::Count(Count::Value(*n)),
-                );
-            }
-            if l.capacity(CLASS_CAP, &cap.cap_id).is_none() {
-                l.set_capacity(CLASS_CAP, &cap.cap_id, Frag::Ex(Ex::Token));
-            }
-            let id = l
-                .grant(
-                    &cap.subject,
-                    CLASS_CAP,
-                    &cap.cap_id,
-                    Frag::Ex(Ex::Token),
-                    &cap.cap_id,
-                    None,
-                    now,
-                )
-                .map_err(map_err)?;
-            if let Some(exp) = cap.constraints.expires_at {
-                // An absolute lease: the sweeper expires the grant when the
-                // constraint says so (no separate timer).
-                l.set_lease(id, &cap.cap_id, Some(exp)).map_err(map_err)?;
-            }
-            let h = l.holding(id).expect("just granted");
-            persist_on(conn, h)?;
-            Ok(())
-        })
+        let now = Timestamp::try_from(crate::db::now_unix()).map_err(map_err)?;
+        self.ledger
+            .transaction(|tx| tx.register_capability(cap, now))
     }
 
     pub fn get(&self, cap_id: &str) -> Result<Capability, KernelError> {
@@ -163,7 +103,11 @@ impl CapStore {
         constraints: Constraints,
     ) -> Result<Capability, KernelError> {
         let parent = self.get(parent_id)?;
-        if self.ledger.cap_holding(parent_id).is_none() {
+        if self
+            .ledger
+            .cap_holding(&AccountId::new(parent_id))?
+            .is_none()
+        {
             return Err(KernelError::Denied("parent revoked".into()));
         }
         let child = Capability {
@@ -187,7 +131,7 @@ impl CapStore {
         // The holding is the single source of truth for liveness (WP-03):
         // revoked, expired-and-swept, or died-with-its-holder — all read as
         // "no holding".
-        if self.ledger.cap_holding(cap_id).is_none() {
+        if self.ledger.cap_holding(&AccountId::new(cap_id))?.is_none() {
             return Err(KernelError::Denied("cap revoked".into()));
         }
         // Belt for the sweeper's lag: the lease expires the holding on the
@@ -204,7 +148,15 @@ impl CapStore {
             // F1: spending is minting one unit into the pool through the
             // issuer gate; exhaustion is the gate refusing, not a counter
             // hitting zero.
-            match self.ledger.spend(&cap.subject, &cap.cap_id, verb, now) {
+            match self.ledger.spend_many(
+                &SubjectId::new(&cap.subject),
+                &[SpendRequest {
+                    account: AccountId::new(&cap.cap_id),
+                    effect: EffectClass::new(verb),
+                    amount: 1,
+                }],
+                Timestamp::try_from(now).map_err(map_err)?,
+            ) {
                 Ok(_) => {}
                 Err(KernelError::Denied(_)) => {
                     return Err(KernelError::Denied(format!("budget exhausted: {verb}")));
@@ -236,15 +188,24 @@ impl CapStore {
                 .collect::<Result<_, _>>()?;
             rows.iter()
                 .filter_map(|j| serde_json::from_str::<Capability>(j).ok())
-                .filter(|c| c.subject == subject && c.resource == resource && c.verbs.contains(verb))
+                .filter(|c| {
+                    c.subject == subject && c.resource == resource && c.verbs.contains(verb)
+                })
                 .collect()
         };
         // The holding decides liveness (WP-03) — a dead cap never shadows a
         // live one. Filtered outside the db lock (lock order: ledger → db).
-        let candidates: Vec<Capability> = candidates
-            .into_iter()
-            .filter(|c| self.ledger.cap_holding(&c.cap_id).is_some())
-            .collect();
+        let mut live = Vec::new();
+        for cap in candidates {
+            if self
+                .ledger
+                .cap_holding(&AccountId::new(&cap.cap_id))?
+                .is_some()
+            {
+                live.push(cap);
+            }
+        }
+        let candidates = live;
         if candidates.is_empty() {
             return Err(KernelError::Denied(format!(
                 "no capability: {subject} → {resource} verb {verb}"
@@ -271,15 +232,23 @@ impl CapStore {
             stmt.query_map([], |r| r.get::<_, String>(0))?
                 .collect::<Result<_, _>>()?
         };
-        Ok(rows
+        let mut live = Vec::new();
+        for cap in rows
             .iter()
             .filter_map(|j| serde_json::from_str::<Capability>(j).ok())
             .filter(|c| {
-                c.subject == subject
-                    && c.constraints.expires_at.map(|e| now <= e).unwrap_or(true)
+                c.subject == subject && c.constraints.expires_at.map(|e| now <= e).unwrap_or(true)
             })
-            .filter(|c| self.ledger.cap_holding(&c.cap_id).is_some())
-            .collect())
+        {
+            if self
+                .ledger
+                .cap_holding(&AccountId::new(&cap.cap_id))?
+                .is_some()
+            {
+                live.push(cap);
+            }
+        }
+        Ok(live)
     }
 
     /// Revoke a capability and everything attenuated from it. The derivation
@@ -312,64 +281,17 @@ impl CapStore {
         }
         let mut n = 0u64;
         for cap in cascade {
-            let holding = self.ledger.cap_holding(&cap.cap_id);
-            let extra = |l: &mut Ledger, conn: &Connection| -> Result<(), KernelError> {
-                let mut stored = cap.clone();
-                stored.revoked = true;
-                store_on(conn, &stored)?;
-                // The account closes: live spend rows are released (their
-                // tombstones keep the history; nothing is refunded into a
-                // live pool — the pool dies in the next line), then every
-                // pool's capacity goes to zero.
-                let prefix = format!("{}/", cap.cap_id);
-                let spends: Vec<(u64, String)> = l
-                    .live()
-                    .filter(|h| h.class_id == CLASS_CAP_COUNT && h.instance.starts_with(&prefix))
-                    .map(|h| (h.id, h.generation.clone()))
-                    .collect();
-                for (sid, generation) in spends {
-                    l.release(sid, &generation, now).map_err(map_err)?;
-                    if let Some(h) = l.holding(sid) {
-                        persist_on(conn, h)?;
-                    }
-                }
-                for verb in cap.constraints.counts.keys() {
-                    l.set_capacity(
-                        CLASS_CAP_COUNT,
-                        &pool_instance(&cap.cap_id, verb),
-                        Frag::Count(Count::Value(0)),
-                    );
-                }
-                Ok(())
-            };
-            match holding {
-                Some(h) => {
-                    self.ledger
-                        .teardown_subtree(h.id, &cap.cap_id, world, now, extra)?;
-                }
-                // Already swept or revoked earlier: the bookkeeping still
-                // commits, the teardown is an empty no-op.
-                None => self.ledger.transaction(extra)?,
-            }
+            self.ledger.retire_capability(
+                &cap,
+                world,
+                Timestamp::try_from(now).map_err(map_err)?,
+            )?;
             if !cap.revoked {
                 n += 1;
             }
         }
         Ok(n)
     }
-}
-
-fn store_on(conn: &Connection, cap: &Capability) -> Result<(), KernelError> {
-    conn.execute(
-        "INSERT OR REPLACE INTO caps (cap_id, json, parent, revoked) VALUES (?1,?2,?3,?4)",
-        params![
-            cap.cap_id,
-            serde_json::to_string(cap).unwrap(),
-            cap.parent,
-            cap.revoked as i64
-        ],
-    )?;
-    Ok(())
 }
 
 fn rand_id() -> String {
@@ -383,7 +305,10 @@ fn rand_id() -> String {
 mod tests {
     use super::*;
     use crate::ledger::CLASS_SUBSCRIPTION;
+    use crate::ledger::ExclusiveRequest;
+    use portos_rm::identity::{ClassId, Generation, HoldingId, InstanceId, ResourceKey, SubjectId};
     use portos_rm::teardown::MockWorld;
+    use portos_rm::time::{LeaseRequest, Timestamp};
     use std::collections::BTreeMap;
 
     fn store(tag: &str) -> (CapStore, std::path::PathBuf) {
@@ -427,10 +352,15 @@ mod tests {
         // spend rows (F1 consequence 1).
         let stored = caps.get(&cap.cap_id).unwrap();
         assert_eq!(stored.constraints.counts["emit"], 2);
-        assert_eq!(caps.counts_left(&stored, "emit"), Some(0));
-        assert_eq!(caps.counts_left(&stored, "list"), None);
+        assert_eq!(caps.counts_left(&stored, "emit").unwrap(), Some(0));
+        assert_eq!(caps.counts_left(&stored, "list").unwrap(), None);
         // Minting granted the cap's holding (WP-03).
-        assert!(caps.ledger.cap_holding(&cap.cap_id).is_some());
+        assert!(
+            caps.ledger
+                .cap_holding(&AccountId::new(&cap.cap_id))
+                .unwrap()
+                .is_some()
+        );
         caps.ledger.invariant().unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -474,14 +404,25 @@ mod tests {
         // Both holdings are tombstoned (the holding is the truth).
         assert!(
             caps.ledger
-                .cap_holding(&parent.cap_id)
+                .cap_holding(&AccountId::new(&parent.cap_id))
+                .unwrap()
                 .is_none()
         );
-        assert!(caps.ledger.cap_holding(&kid.cap_id).is_none());
+        assert!(
+            caps.ledger
+                .cap_holding(&AccountId::new(&kid.cap_id))
+                .unwrap()
+                .is_none()
+        );
         // Attenuation from a dead parent is refused.
         assert!(
-            caps.attenuate(&parent.cap_id, "plugin:kid", verbs(&["emit"]), Constraints::default())
-                .is_err()
+            caps.attenuate(
+                &parent.cap_id,
+                "plugin:kid",
+                verbs(&["emit"]),
+                Constraints::default()
+            )
+            .is_err()
         );
         caps.ledger.invariant().unwrap();
         let _ = std::fs::remove_dir_all(&root);
@@ -509,28 +450,60 @@ mod tests {
             )
             .unwrap();
         caps.exercise(&cap.cap_id, "emit", 1).unwrap(); // one live spend row
-        let cap_holding = caps.ledger.cap_holding(&cap.cap_id).unwrap().id;
+        let cap_holding = caps
+            .ledger
+            .cap_holding(&AccountId::new(&cap.cap_id))
+            .unwrap()
+            .unwrap()
+            .id;
         // Something that exists because of the grant: a holding parented
         // under the cap holding (WP-08's pools/routes will look like this).
         let child = caps
             .ledger
-            .hold_exclusive("plugin:p", CLASS_SUBSCRIPTION, "dep-1", "dep", Some(cap_holding), 1)
+            .hold_exclusive(
+                ExclusiveRequest {
+                    owner: SubjectId::new("plugin:p"),
+                    resource: ResourceKey::new(
+                        ClassId::new(CLASS_SUBSCRIPTION),
+                        InstanceId::new("dep-1"),
+                    ),
+                    generation: Generation::new("dep"),
+                    parent: Some(cap_holding)
+                        .map(|id| caps.ledger.holding(id).unwrap().unwrap().handle()),
+                    lease: LeaseRequest::UseClassDefault,
+                },
+                Timestamp::try_from(1u64).unwrap(),
+            )
+            .map(|h| h.id())
             .unwrap();
         let mut world = MockWorld::default();
         let n = caps.revoke(&cap.cap_id, &mut world, 2).unwrap();
         assert_eq!(n, 1);
         // Children first, the cap holding last.
-        let pos = |id: u64| world.action_order.iter().position(|x| *x == id).unwrap();
-        assert!(pos(child) < pos(cap_holding), "child released before the cap holding");
+        let pos = |id: HoldingId| world.action_order.iter().position(|x| *x == id).unwrap();
+        assert!(
+            pos(child) < pos(cap_holding),
+            "child released before the cap holding"
+        );
         for id in [child, cap_holding] {
             assert!(
-                caps.ledger.holding(id).unwrap().released_at.is_some(),
+                caps.ledger
+                    .holding(id)
+                    .unwrap()
+                    .unwrap()
+                    .released_at
+                    .is_some(),
                 "holding {id} tombstoned"
             );
         }
         // The account is closed: spend rows tombstoned, pool capacity zero,
         // the gate refuses — and the F1 invariant ✓(● 0 · ◯ 0) holds.
-        assert_eq!(caps.ledger.spent(&cap.cap_id, "emit"), 0);
+        assert_eq!(
+            caps.ledger
+                .spent(&AccountId::new(&cap.cap_id), &EffectClass::new("emit"))
+                .unwrap(),
+            0
+        );
         assert!(caps.exercise(&cap.cap_id, "emit", 2).is_err());
         caps.ledger.invariant().unwrap();
         // Re-revoking is a no-op (idempotent resume).
@@ -558,18 +531,42 @@ mod tests {
                 None,
             )
             .unwrap();
-        let holding = caps.ledger.cap_holding(&cap.cap_id).unwrap();
-        assert_eq!(holding.lease_expires_at, Some(100), "lease = the cap's expiry");
+        let holding = caps
+            .ledger
+            .cap_holding(&AccountId::new(&cap.cap_id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            holding.lease.expires_at().map(|t| t.get()),
+            Some(100),
+            "lease = the cap's expiry"
+        );
         assert!(caps.exercise(&cap.cap_id, "emit", 50).is_ok());
         // Sweeper lag: past expiry but not yet swept — the constraint refuses.
-        assert!(caps.ledger.cap_holding(&cap.cap_id).is_some());
+        assert!(
+            caps.ledger
+                .cap_holding(&AccountId::new(&cap.cap_id))
+                .unwrap()
+                .is_some()
+        );
         assert!(caps.exercise(&cap.cap_id, "emit", 101).is_err());
         // After the sweep the holding is gone; the gate reads the holding.
         let mut world = MockWorld::default();
-        let report = caps.ledger.sweep_with_world(&mut world, 101).unwrap();
+        let report = caps
+            .ledger
+            .sweep_with_world(&mut world, Timestamp::try_from(101u64).unwrap())
+            .unwrap();
         assert_eq!(report.released.len(), 1);
-        assert!(caps.ledger.cap_holding(&cap.cap_id).is_none());
-        assert!(caps.exercise(&cap.cap_id, "emit", 50).is_err(), "even at an earlier clock");
+        assert!(
+            caps.ledger
+                .cap_holding(&AccountId::new(&cap.cap_id))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            caps.exercise(&cap.cap_id, "emit", 50).is_err(),
+            "even at an earlier clock"
+        );
         caps.ledger.invariant().unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -579,8 +576,7 @@ mod tests {
     /// pools not resurrected, budget where it was.
     #[test]
     fn caps_and_holdings_agree_after_reopen() {
-        let root =
-            std::env::temp_dir().join(format!("portos-caps-reopen-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("portos-caps-reopen-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let db = Arc::new(Mutex::new(crate::db::open(&root).unwrap()));
@@ -594,7 +590,10 @@ mod tests {
                     "plugin:p",
                     "driver:toy",
                     verbs(&["emit"]),
-                    Constraints { expires_at: None, counts: counts.clone() },
+                    Constraints {
+                        expires_at: None,
+                        counts: counts.clone(),
+                    },
                     None,
                 )
                 .unwrap();
@@ -603,24 +602,43 @@ mod tests {
                     "plugin:p",
                     "driver:toy",
                     verbs(&["emit"]),
-                    Constraints { expires_at: None, counts },
+                    Constraints {
+                        expires_at: None,
+                        counts,
+                    },
                     None,
                 )
                 .unwrap();
             caps.exercise(&live.cap_id, "emit", 1).unwrap();
-            caps.revoke(&dead.cap_id, &mut MockWorld::default(), 2).unwrap();
+            caps.revoke(&dead.cap_id, &mut MockWorld::default(), 2)
+                .unwrap();
             (live.cap_id, dead.cap_id)
         };
-        // Reopen: the ledger reloads rows, the cap table re-declares pools.
+        // Reopen loads the same durable pool bindings and holdings.
         let (ledger, _r) = LedgerStore::open(db.clone()).unwrap();
         let ledger = Arc::new(ledger);
         let caps = CapStore::new(db.clone(), ledger.clone());
-        caps.rebuild_pools().unwrap();
+
         ledger.invariant().unwrap();
-        assert!(ledger.cap_holding(&live_id).is_some());
-        assert!(ledger.cap_holding(&dead_id).is_none(), "revoked stays dead across reopen");
-        // The live cap's budget survived (spend rows reloaded, pool redeclared).
-        assert_eq!(caps.counts_left(&caps.get(&live_id).unwrap(), "emit"), Some(1));
+        assert!(
+            ledger
+                .cap_holding(&AccountId::new(&live_id))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            ledger
+                .cap_holding(&AccountId::new(&dead_id))
+                .unwrap()
+                .is_none(),
+            "revoked stays dead across reopen"
+        );
+        // The live cap's budget survived with its persisted capacity.
+        assert_eq!(
+            caps.counts_left(&caps.get(&live_id).unwrap(), "emit")
+                .unwrap(),
+            Some(1)
+        );
         assert!(caps.exercise(&live_id, "emit", 3).is_ok());
         assert!(caps.exercise(&dead_id, "emit", 3).is_err());
         // list_live agrees with the holdings.

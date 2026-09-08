@@ -137,7 +137,7 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 None => host.plans.submit("user", &bytes)?.run_id,
             };
             println!("[run] admitted {run_id} ({plan_hash})");
-            let (_sub, rx) = host.subscribe_local(&format!("plan::run::{run_id}"));
+            let (_sub, rx) = host.subscribe_local(&format!("plan::run::{run_id}"))?;
             host.plans.start(&run_id, &rec)?;
             let stdin = std::io::stdin();
             loop {

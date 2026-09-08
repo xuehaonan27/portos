@@ -2,10 +2,13 @@
 //! chunked artifact streaming (D25), capability-gated invoke (D23/D26),
 //! the event bus, ephemeral refs, and the JS protocol client.
 
-use portos_kernel::host::{Host, Slot};
-use portos_kernel::ledger::{CLASS_PLUGIN, CLASS_PROCESS, CLASS_SUBSCRIPTION};
 use portos_kernel::Kernel;
+use portos_kernel::host::{Host, Slot};
+use portos_kernel::ledger::ExclusiveRequest;
+use portos_kernel::ledger::{CLASS_PLUGIN, CLASS_PROCESS, CLASS_SUBSCRIPTION};
 use portos_proto::cap::Constraints;
+use portos_rm::identity::{AccountId, ClassId, Generation, InstanceId, ResourceKey, SubjectId};
+use portos_rm::time::{LeaseRequest, Timestamp};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -23,12 +26,8 @@ fn setup(tag: &str) -> (Arc<Kernel>, Host, PathBuf) {
 }
 
 fn spawn_echo(host: &Host, family: &str) -> String {
-    host.spawn(
-        Path::new(ECHO_BIN),
-        &[],
-        &[("PORTOS_ECHO_FAMILY", family)],
-    )
-    .unwrap()
+    host.spawn(Path::new(ECHO_BIN), &[], &[("PORTOS_ECHO_FAMILY", family)])
+        .unwrap()
 }
 
 fn pattern(n: usize) -> Vec<u8> {
@@ -53,9 +52,7 @@ fn call_stream_digest_and_ephemeral_refs() {
             "test",
         )
         .unwrap();
-    let out = host
-        .call(&name, "echo::digest", json!([meta.id]))
-        .unwrap();
+    let out = host.call(&name, "echo::digest", json!([meta.id])).unwrap();
     assert_eq!(out["bytes"].as_u64(), Some(payload.len() as u64));
     let head_hex: String = payload[..32].iter().map(|b| format!("{b:02x}")).collect();
     assert_eq!(out["head_hex"].as_str(), Some(head_hex.as_str()));
@@ -91,9 +88,7 @@ fn accept_zero_context_data_plane() {
     let n = mb * 1024 * 1024;
 
     // Plugin streams n bytes INTO the CAS through its client channel…
-    let stored = host
-        .call(&name, "echo::put_pattern", json!([n]))
-        .unwrap();
+    let stored = host.call(&name, "echo::put_pattern", json!([n])).unwrap();
     let id = stored["meta"]["id"].as_str().unwrap().to_string();
     assert_eq!(stored["meta"]["size"].as_u64(), Some(n));
     // …and reads them back out for the digest.
@@ -105,7 +100,11 @@ fn accept_zero_context_data_plane() {
         "health metric: context={context}B data={data}B ratio={:.2e}",
         context as f64 / data as f64
     );
-    assert!(data >= 2 * n, "both directions count as data: {data} < {}", 2 * n);
+    assert!(
+        data >= 2 * n,
+        "both directions count as data: {data} < {}",
+        2 * n
+    );
     assert!(
         context < 8 * 1024,
         "control-plane bytes stay tiny: {context}"
@@ -155,8 +154,7 @@ fn invoke_is_capability_gated_routed_and_audited() {
 
     // Both outcomes are on the audit chain.
     drop(host);
-    let entries =
-        portos_kernel::audit::AuditLog::verify(&root.join("audit.log")).unwrap();
+    let entries = portos_kernel::audit::AuditLog::verify(&root.join("audit.log")).unwrap();
     let events: Vec<&str> = entries
         .iter()
         .filter_map(|e| e["body"]["event"].as_str())
@@ -173,7 +171,7 @@ fn events_flow_to_local_and_plugin_subscribers() {
     let b = spawn_echo(&host, "echob");
 
     // A local (in-process) subscriber and a plugin subscriber on one topic.
-    let (_sub, rx) = host.subscribe_local("echoa::ping");
+    let (_sub, rx) = host.subscribe_local("echoa::ping").unwrap();
     host.call(&b, "echob::subscribe", json!(["echoa::ping"]))
         .unwrap();
 
@@ -217,7 +215,7 @@ fn slow_local_subscriber_is_dropped_not_wedged() {
     let (_kernel, host, root) = setup("overflow");
     // Subscribe and never drain: the bounded queue fills, the subscriber is
     // dropped, and later emits simply deliver to nobody.
-    let (_sub, rx) = host.subscribe_local("noisy::topic");
+    let (_sub, rx) = host.subscribe_local("noisy::topic").unwrap();
     let mut dropped = false;
     for i in 0..(portos_kernel::host::EVENT_QUEUE + 16) {
         let delivered = host.emit("noisy::topic", json!({"i": i}));
@@ -240,7 +238,7 @@ fn wildcard_topics_and_grants_introspection() {
     let b = spawn_echo(&host, "echob");
 
     // Wildcard subscription: a prefix pattern sees every matching topic.
-    let (_sub, rx) = host.subscribe_local("echoa::*");
+    let (_sub, rx) = host.subscribe_local("echoa::*").unwrap();
     host.call(&a, "echoa::publish", json!(["echoa::anything", {"n": 9}]))
         .unwrap();
     let ev = rx
@@ -272,7 +270,10 @@ fn wildcard_topics_and_grants_introspection() {
         .find(|g| g["verb"] == "echob::emit")
         .expect("granted verb introspected");
     assert!(
-        emit["description"].as_str().unwrap().contains("Print a line"),
+        emit["description"]
+            .as_str()
+            .unwrap()
+            .contains("Print a line"),
         "driver-advertised description joined in"
     );
     assert!(emit["schema"]["properties"]["text"].is_object());
@@ -282,7 +283,10 @@ fn wildcard_topics_and_grants_introspection() {
         .find(|g| g["verb"] == "echob::digest")
         .expect("verb without advertised metadata still listed");
     assert_eq!(digest["schema"], json!({"type": "object"}));
-    assert!(digest.get("counts_left").is_none(), "uncounted grant is unlimited");
+    assert!(
+        digest.get("counts_left").is_none(),
+        "uncounted grant is unlimited"
+    );
     assert_eq!(list.len(), 2, "only granted verbs appear");
     drop(b);
 
@@ -320,7 +324,10 @@ fn counting_budget_is_ledger_rows_and_survives_kernel_reopen() {
             "plugin:portos-echoa",
             "driver:echob",
             BTreeSet::from(["emit".to_string()]),
-            Constraints { expires_at: None, counts: counts.clone() },
+            Constraints {
+                expires_at: None,
+                counts: counts.clone(),
+            },
             None,
         )
         .unwrap();
@@ -331,21 +338,45 @@ fn counting_budget_is_ledger_rows_and_survives_kernel_reopen() {
             "session:cli",
             "driver:echob",
             BTreeSet::from(["emit".to_string()]),
-            Constraints { expires_at: None, counts },
+            Constraints {
+                expires_at: None,
+                counts,
+            },
             None,
         )
         .unwrap();
-    host.call(&a, "echoa::relay", json!(["echob::emit", ["one"]])).unwrap();
+    host.call(&a, "echoa::relay", json!(["echob::emit", ["one"]]))
+        .unwrap();
     kernel.caps.exercise(&standing.cap_id, "emit", 1).unwrap();
     let stored = kernel.caps.get(&cap.cap_id).unwrap();
-    assert_eq!(stored.constraints.counts["emit"], 2, "capacity is immutable");
-    assert_eq!(kernel.caps.counts_left(&stored, "emit"), Some(1), "balance = capacity − spend rows");
+    assert_eq!(
+        stored.constraints.counts["emit"], 2,
+        "capacity is immutable"
+    );
+    assert_eq!(
+        kernel.caps.counts_left(&stored, "emit").unwrap(),
+        Some(1),
+        "balance = capacity − spend rows"
+    );
     kernel.ledger.invariant().unwrap();
     host.shutdown_all();
     // WP-03: a grant is exactly as alive as its holder — the plugin's teardown
     // tombstoned its holding; the standing grant's holding survives.
-    assert!(kernel.ledger.cap_holding(&cap.cap_id).is_none(), "grant died with its holder");
-    assert!(kernel.ledger.cap_holding(&standing.cap_id).is_some());
+    assert!(
+        kernel
+            .ledger
+            .cap_holding(&AccountId::new(&cap.cap_id))
+            .unwrap()
+            .is_none(),
+        "grant died with its holder"
+    );
+    assert!(
+        kernel
+            .ledger
+            .cap_holding(&AccountId::new(&standing.cap_id))
+            .unwrap()
+            .is_some()
+    );
     drop(host);
     drop(kernel);
     std::thread::sleep(std::time::Duration::from_millis(200));
@@ -355,12 +386,22 @@ fn counting_budget_is_ledger_rows_and_survives_kernel_reopen() {
     // refuses it); the standing grant's budget continues where it was.
     let kernel = Arc::new(Kernel::open(&root).unwrap());
     let host = Host::new(kernel.clone(), &root.join("sock")).unwrap();
-    assert!(kernel.caps.exercise(&cap.cap_id, "emit", 2).is_err(), "dead grant stays dead");
+    assert!(
+        kernel.caps.exercise(&cap.cap_id, "emit", 2).is_err(),
+        "dead grant stays dead"
+    );
     let stored = kernel.caps.get(&standing.cap_id).unwrap();
-    assert_eq!(kernel.caps.counts_left(&stored, "emit"), Some(1), "budget continues across restart");
+    assert_eq!(
+        kernel.caps.counts_left(&stored, "emit").unwrap(),
+        Some(1),
+        "budget continues across restart"
+    );
     kernel.caps.exercise(&standing.cap_id, "emit", 2).unwrap();
-    assert!(kernel.caps.exercise(&standing.cap_id, "emit", 2).is_err(), "gate refuses at capacity");
-    assert_eq!(kernel.caps.counts_left(&stored, "emit"), Some(0));
+    assert!(
+        kernel.caps.exercise(&standing.cap_id, "emit", 2).is_err(),
+        "gate refuses at capacity"
+    );
+    assert_eq!(kernel.caps.counts_left(&stored, "emit").unwrap(), Some(0));
     kernel.ledger.invariant().unwrap();
     host.shutdown_all();
     drop(host);
@@ -369,7 +410,11 @@ fn counting_budget_is_ledger_rows_and_survives_kernel_reopen() {
         !events.iter().any(|e| e["event"] == "ledger.reconciled"),
         "a graceful shutdown leaves no stale rows for the reopen to reconcile"
     );
-    assert_eq!(kernel.ledger.counts(CLASS_PLUGIN), (0, 2), "both plugins tombstoned");
+    assert_eq!(
+        kernel.ledger.counts(&ClassId::new(CLASS_PLUGIN)).unwrap(),
+        (0, 2),
+        "both plugins tombstoned"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -382,41 +427,94 @@ fn plugin_death_is_reclaimed_crash_only_children_first() {
     let (kernel, host, root) = setup("death");
     let a = spawn_echo(&host, "echoa");
     let b = spawn_echo(&host, "echob");
-    host.call(&a, "echoa::subscribe", json!(["echob::ping"])).unwrap();
+    host.call(&a, "echoa::subscribe", json!(["echob::ping"]))
+        .unwrap();
     let subject = "plugin:portos-echoa";
-    assert_eq!(kernel.ledger.live_closure(subject).len(), 2, "plugin holding + subscription holding");
-    assert_eq!(host.call(&b, "echob::publish", json!(["echob::ping", {"n": 1}])).unwrap()["delivered"], 1);
+    assert_eq!(
+        kernel
+            .ledger
+            .live_closure(&SubjectId::new(subject))
+            .unwrap()
+            .len(),
+        2,
+        "plugin holding + subscription holding"
+    );
+    assert_eq!(
+        host.call(&b, "echob::publish", json!(["echob::ping", {"n": 1}]))
+            .unwrap()["delivered"],
+        1
+    );
 
     // The plugin dies without notice.
     let pid = host.pid(&a).expect("pid");
-    std::process::Command::new("kill").args(["-9", &pid.to_string()]).status().unwrap();
+    std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status()
+        .unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !kernel.ledger.live_snapshot(subject).is_empty() {
-        assert!(std::time::Instant::now() < deadline, "death never reclaimed");
+    while !kernel
+        .ledger
+        .live_snapshot(&SubjectId::new(subject))
+        .unwrap()
+        .is_empty()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "death never reclaimed"
+        );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    assert!(host.call(&a, "echoa::events", json!([])).is_err(), "handle gone");
-    assert!(host.call_verb("echoa::emit", json!(["x"])).is_err(), "route gone");
+    assert!(
+        host.call(&a, "echoa::events", json!([])).is_err(),
+        "handle gone"
+    );
+    assert!(
+        host.call_verb("echoa::emit", json!(["x"])).is_err(),
+        "route gone"
+    );
     assert_eq!(
-        host.call(&b, "echob::publish", json!(["echob::ping", {"n": 2}])).unwrap()["delivered"],
+        host.call(&b, "echob::publish", json!(["echob::ping", {"n": 2}]))
+            .unwrap()["delivered"],
         0,
         "subscription gone with its holder"
     );
-    assert_eq!(kernel.ledger.counts(CLASS_PLUGIN), (1, 1), "echob live, echoa tombstoned");
-    assert_eq!(kernel.ledger.counts(CLASS_SUBSCRIPTION), (0, 1));
+    assert_eq!(
+        kernel.ledger.counts(&ClassId::new(CLASS_PLUGIN)).unwrap(),
+        (1, 1),
+        "echob live, echoa tombstoned"
+    );
+    assert_eq!(
+        kernel
+            .ledger
+            .counts(&ClassId::new(CLASS_SUBSCRIPTION))
+            .unwrap(),
+        (0, 1)
+    );
     kernel.ledger.invariant().unwrap();
 
     // Graceful shutdown is the same path, triggered early.
     host.shutdown(&b);
-    assert_eq!(kernel.ledger.counts(CLASS_PLUGIN), (0, 2));
+    assert_eq!(
+        kernel.ledger.counts(&ClassId::new(CLASS_PLUGIN)).unwrap(),
+        (0, 2)
+    );
     drop(host);
     let events = audit_events(&root);
-    let reclaimed: Vec<&Value> = events.iter().filter(|e| e["event"] == "plugin.reclaimed").collect();
+    let reclaimed: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["event"] == "plugin.reclaimed")
+        .collect();
     assert!(
-        reclaimed.iter().any(|e| e["plugin"] == "portos-echoa" && e["reason"] == "exited" && e["released"] == 2),
+        reclaimed.iter().any(|e| e["plugin"] == "portos-echoa"
+            && e["reason"] == "exited"
+            && e["released"] == 2),
         "death reclaimed both rows on the exited path: {reclaimed:?}"
     );
-    assert!(reclaimed.iter().any(|e| e["plugin"] == "portos-echob" && e["reason"] == "shutdown"));
+    assert!(
+        reclaimed
+            .iter()
+            .any(|e| e["plugin"] == "portos-echob" && e["reason"] == "shutdown")
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -429,12 +527,28 @@ fn verb_kind_metadata_is_checked_at_spawn_and_exposed_in_grants() {
     let bad = host.spawn(
         Path::new(ECHO_BIN),
         &[],
-        &[("PORTOS_ECHO_FAMILY", "echobad"), ("PORTOS_ECHO_BAD_KIND", "1")],
+        &[
+            ("PORTOS_ECHO_FAMILY", "echobad"),
+            ("PORTOS_ECHO_BAD_KIND", "1"),
+        ],
     );
-    let err = bad.err().expect("incoherent verb metadata must refuse the spawn").to_string();
+    let err = bad
+        .err()
+        .expect("incoherent verb metadata must refuse the spawn")
+        .to_string();
     assert!(err.contains("verb metadata rejected"), "{err}");
-    assert!(kernel.ledger.live_snapshot("plugin:portos-echobad").is_empty(), "nothing held");
-    assert!(host.call_verb("echobad::emit", json!(["x"])).is_err(), "nothing routed");
+    assert!(
+        kernel
+            .ledger
+            .live_snapshot(&SubjectId::new("plugin:portos-echobad"))
+            .unwrap()
+            .is_empty(),
+        "nothing held"
+    );
+    assert!(
+        host.call_verb("echobad::emit", json!(["x"])).is_err(),
+        "nothing routed"
+    );
 
     let a = spawn_echo(&host, "echoa");
     let _b = spawn_echo(&host, "echob");
@@ -445,8 +559,15 @@ fn verb_kind_metadata_is_checked_at_spawn_and_exposed_in_grants() {
         .mint(
             "plugin:portos-echoa",
             "driver:echob",
-            BTreeSet::from(["emit".to_string(), "digest".to_string(), "relay".to_string()]),
-            Constraints { expires_at: None, counts },
+            BTreeSet::from([
+                "emit".to_string(),
+                "digest".to_string(),
+                "relay".to_string(),
+            ]),
+            Constraints {
+                expires_at: None,
+                counts,
+            },
             None,
         )
         .unwrap();
@@ -457,7 +578,10 @@ fn verb_kind_metadata_is_checked_at_spawn_and_exposed_in_grants() {
     assert_eq!(find("echob::emit")["budgeted"], true);
     assert_eq!(find("echob::digest")["kind"], "repeatable");
     assert_eq!(find("echob::digest")["budgeted"], false);
-    assert!(find("echob::relay").get("kind").is_none(), "verb without a declared kind carries none");
+    assert!(
+        find("echob::relay").get("kind").is_none(),
+        "verb without a declared kind carries none"
+    );
 
     host.shutdown_all();
     let _ = std::fs::remove_dir_all(&root);
@@ -471,28 +595,52 @@ fn slot_row_bounds_invoke_and_admits_requires() {
     let (kernel, host, root) = setup("slot");
     let _b = spawn_echo(&host, "echob");
 
-    let narrow = Slot { offers: vec!["echob::digest".into()], provides: vec![] };
+    let narrow = Slot {
+        offers: vec!["echob::digest".into()],
+        provides: vec![],
+    };
     let refused = host.spawn_in(
         Path::new(ECHO_BIN),
         &[],
-        &[("PORTOS_ECHO_FAMILY", "echoa"), ("PORTOS_ECHO_RELAY_REQUIRES", "echob::emit")],
+        &[
+            ("PORTOS_ECHO_FAMILY", "echoa"),
+            ("PORTOS_ECHO_RELAY_REQUIRES", "echob::emit"),
+        ],
         Some(&narrow),
     );
-    let err = refused.err().expect("requires outside the row must refuse the spawn").to_string();
-    assert!(err.contains("slot admission failed") && err.contains("VerbExceedsRow"), "{err}");
+    let err = refused
+        .err()
+        .expect("requires outside the row must refuse the spawn")
+        .to_string();
+    assert!(
+        err.contains("slot admission failed") && err.contains("VerbExceedsRow"),
+        "{err}"
+    );
 
     let unmet = host.spawn_in(
         Path::new(ECHO_BIN),
         &[],
-        &[("PORTOS_ECHO_FAMILY", "echoa"), ("PORTOS_ECHO_RELAY_DEPS", "nosuch")],
-        Some(&Slot { offers: vec![], provides: vec![] }),
+        &[
+            ("PORTOS_ECHO_FAMILY", "echoa"),
+            ("PORTOS_ECHO_RELAY_DEPS", "nosuch"),
+        ],
+        Some(&Slot {
+            offers: vec![],
+            provides: vec![],
+        }),
     );
-    let err = unmet.err().expect("unmet dependency must refuse the spawn").to_string();
+    let err = unmet
+        .err()
+        .expect("unmet dependency must refuse the spawn")
+        .to_string();
     assert!(err.contains("MissingDependency"), "{err}");
 
     // Fits: relay requires echob::emit and depends on the echob family
     // (already routed). Then the row bounds invoke regardless of grants.
-    let slot = Slot { offers: vec!["echob::emit".into()], provides: vec![] };
+    let slot = Slot {
+        offers: vec!["echob::emit".into()],
+        provides: vec![],
+    };
     let a = host
         .spawn_in(
             Path::new(ECHO_BIN),
@@ -515,13 +663,20 @@ fn slot_row_bounds_invoke_and_admits_requires() {
             None,
         )
         .unwrap();
-    assert!(host.call(&a, "echoa::relay", json!(["echob::emit", ["in row"]])).is_ok());
+    assert!(
+        host.call(&a, "echoa::relay", json!(["echob::emit", ["in row"]]))
+            .is_ok()
+    );
     let out = host.call(&a, "echoa::relay", json!(["echob::make_ref", []]));
     assert!(out.is_err(), "granted but outside the row: refused");
     host.shutdown_all();
     drop(host);
     let events = audit_events(&root);
-    assert!(events.iter().any(|e| e["event"] == "invoke.denied" && e["reason"] == "verb outside the slot row"));
+    assert!(
+        events
+            .iter()
+            .any(|e| e["event"] == "invoke.denied" && e["reason"] == "verb outside the slot row")
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -535,11 +690,17 @@ fn protocol_order_is_enforced_at_call() {
         .spawn(
             Path::new(ECHO_BIN),
             &[],
-            &[("PORTOS_ECHO_FAMILY", "echo"), ("PORTOS_ECHO_PROTOCOL", "1")],
+            &[
+                ("PORTOS_ECHO_FAMILY", "echo"),
+                ("PORTOS_ECHO_PROTOCOL", "1"),
+            ],
         )
         .unwrap();
     let early = host.call(&name, "echo::use_ref", json!(["e1"]));
-    let err = early.err().expect("use_ref before make_ref violates the protocol").to_string();
+    let err = early
+        .err()
+        .expect("use_ref before make_ref violates the protocol")
+        .to_string();
     assert!(err.contains("protocol violation"), "{err}");
     let r = host.call(&name, "echo::make_ref", json!([])).unwrap();
     let rid = r["ref"].as_str().unwrap().to_string();
@@ -599,7 +760,7 @@ fn js_plugin_speaks_abi_v2() {
     assert_eq!(fetched["text"].as_str(), Some("kernel says hi"));
 
     // plugin emit → local subscriber
-    let (_sub, rx) = host.subscribe_local("jse::tick");
+    let (_sub, rx) = host.subscribe_local("jse::tick").unwrap();
     let pub_out = host
         .call(&name, "jse::publish", json!(["jse::tick", {"n": 7}]))
         .unwrap();
@@ -625,9 +786,16 @@ fn spawn_child_is_capability_gated_and_parent_death_reclaims_children_first() {
 
     // No capability: the kernel refuses and audits the denial.
     let denied = host.call(&parent, "echop::spawn_child", json!(["echoc"]));
-    assert!(denied.is_err(), "spawn_child without kernel:spawn must be refused");
     assert!(
-        kernel.ledger.live_snapshot("plugin:portos-echoc").is_empty(),
+        denied.is_err(),
+        "spawn_child without kernel:spawn must be refused"
+    );
+    assert!(
+        kernel
+            .ledger
+            .live_snapshot(&SubjectId::new("plugin:portos-echoc"))
+            .unwrap()
+            .is_empty(),
         "nothing spawned"
     );
 
@@ -642,28 +810,41 @@ fn spawn_child_is_capability_gated_and_parent_death_reclaims_children_first() {
             None,
         )
         .unwrap();
-    let out = host.call(&parent, "echop::spawn_child", json!(["echoc"])).unwrap();
+    let out = host
+        .call(&parent, "echop::spawn_child", json!(["echoc"]))
+        .unwrap();
     assert_eq!(out["name"].as_str(), Some("portos-echoc"));
     let p_row = kernel
         .ledger
-        .live_snapshot("plugin:portos-echop")
+        .live_snapshot(&SubjectId::new("plugin:portos-echop"))
+        .unwrap()
         .into_iter()
-        .find(|it| it.class_id == CLASS_PLUGIN)
+        .find(|it| it.class_id.as_str() == CLASS_PLUGIN)
         .expect("parent row");
     let c_row = kernel
         .ledger
-        .live_snapshot("plugin:portos-echoc")
+        .live_snapshot(&SubjectId::new("plugin:portos-echoc"))
+        .unwrap()
         .into_iter()
-        .find(|it| it.class_id == CLASS_PLUGIN)
+        .find(|it| it.class_id.as_str() == CLASS_PLUGIN)
         .expect("child row");
-    assert_eq!(c_row.parent, Some(p_row.id), "child holding parented under the parent's");
     assert_eq!(
-        kernel.ledger.live_closure("plugin:portos-echop").len(),
+        c_row.parent,
+        Some(p_row.id),
+        "child holding parented under the parent's"
+    );
+    assert_eq!(
+        kernel
+            .ledger
+            .live_closure(&SubjectId::new("plugin:portos-echop"))
+            .unwrap()
+            .len(),
         3,
         "the parent's ownership closure is parent + its spawn cap (WP-03) + child"
     );
     assert_eq!(
-        host.call("portos-echoc", "echoc::events", json!([])).unwrap(),
+        host.call("portos-echoc", "echoc::events", json!([]))
+            .unwrap(),
         json!([]),
         "the child answers calls"
     );
@@ -672,10 +853,16 @@ fn spawn_child_is_capability_gated_and_parent_death_reclaims_children_first() {
     // closure, children first — the child process is reaped with it.
     let cpid = host.pid("portos-echoc").expect("child pid");
     let ppid = host.pid(&parent).expect("parent pid");
-    std::process::Command::new("kill").args(["-9", &ppid.to_string()]).status().unwrap();
+    std::process::Command::new("kill")
+        .args(["-9", &ppid.to_string()])
+        .status()
+        .unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while kernel.ledger.counts(CLASS_PLUGIN).0 > 0 {
-        assert!(std::time::Instant::now() < deadline, "parent death never reclaimed the child");
+    while kernel.ledger.counts(&ClassId::new(CLASS_PLUGIN)).unwrap().0 > 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "parent death never reclaimed the child"
+        );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     let alive = |pid: u32| {
@@ -686,14 +873,20 @@ fn spawn_child_is_capability_gated_and_parent_death_reclaims_children_first() {
             .unwrap_or(false)
     };
     assert!(!alive(cpid), "child process reaped with its parent");
-    assert_eq!(kernel.ledger.counts(CLASS_PLUGIN), (0, 2), "both tombstoned");
+    assert_eq!(
+        kernel.ledger.counts(&ClassId::new(CLASS_PLUGIN)).unwrap(),
+        (0, 2),
+        "both tombstoned"
+    );
     kernel.ledger.invariant().unwrap();
 
     host.shutdown_all();
     drop(host);
     let events = audit_events(&root);
     assert!(
-        events.iter().any(|e| e["event"] == "spawn_child.denied" && e["from"] == "portos-echop"),
+        events
+            .iter()
+            .any(|e| e["event"] == "spawn_child.denied" && e["from"] == "portos-echop"),
         "the denial is audited"
     );
     assert!(
@@ -724,8 +917,19 @@ fn plugin_registers_a_child_process_holding_and_kill_minus_nine_reaps_it() {
 
     // The sleeper is alive, on the ledger, a child of the plugin holding.
     let subject = "plugin:portos-echoa";
-    assert_eq!(kernel.ledger.counts(CLASS_PROCESS), (1, 0));
-    assert_eq!(kernel.ledger.live_closure(subject).len(), 2, "plugin row + process row");
+    assert_eq!(
+        kernel.ledger.counts(&ClassId::new(CLASS_PROCESS)).unwrap(),
+        (1, 0)
+    );
+    assert_eq!(
+        kernel
+            .ledger
+            .live_closure(&SubjectId::new(subject))
+            .unwrap()
+            .len(),
+        2,
+        "plugin row + process row"
+    );
     let alive = |pid: u32| {
         std::process::Command::new("kill")
             .args(["-0", &pid.to_string()])
@@ -737,24 +941,41 @@ fn plugin_registers_a_child_process_holding_and_kill_minus_nine_reaps_it() {
 
     // kill -9 the plugin: reclaim must kill the witnessed incarnation too.
     let ppid = host.pid(&a).expect("plugin pid");
-    std::process::Command::new("kill").args(["-9", &ppid.to_string()]).status().unwrap();
+    std::process::Command::new("kill")
+        .args(["-9", &ppid.to_string()])
+        .status()
+        .unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while kernel.ledger.counts(CLASS_PROCESS).0 > 0 {
-        assert!(std::time::Instant::now() < deadline, "process holding never reclaimed");
+    while kernel
+        .ledger
+        .counts(&ClassId::new(CLASS_PROCESS))
+        .unwrap()
+        .0
+        > 0
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "process holding never reclaimed"
+        );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     while alive(sleeper) {
         assert!(std::time::Instant::now() < deadline, "sleeper never died");
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    assert_eq!(kernel.ledger.counts(CLASS_PLUGIN), (0, 1));
+    assert_eq!(
+        kernel.ledger.counts(&ClassId::new(CLASS_PLUGIN)).unwrap(),
+        (0, 1)
+    );
     kernel.ledger.invariant().unwrap();
 
     host.shutdown_all();
     drop(host);
     let events = audit_events(&root);
     assert!(
-        events.iter().any(|e| e["event"] == "substrate.held" && e["class"] == "kernel/process"),
+        events
+            .iter()
+            .any(|e| e["event"] == "substrate.held" && e["class"] == "kernel/process"),
         "the hold is audited"
     );
     assert!(
@@ -803,27 +1024,63 @@ fn attenuated_child_capability_dies_with_its_parent_grant() {
         )
         .unwrap();
     kernel.caps.exercise(&kid.cap_id, "emit", 1).unwrap();
-    let parent_holding = kernel.ledger.cap_holding(&parent.cap_id).unwrap().id;
-    let kid_holding = kernel.ledger.cap_holding(&kid.cap_id).unwrap().id;
+    let parent_holding = kernel
+        .ledger
+        .cap_holding(&AccountId::new(&parent.cap_id))
+        .unwrap()
+        .unwrap()
+        .id;
+    let kid_holding = kernel
+        .ledger
+        .cap_holding(&AccountId::new(&kid.cap_id))
+        .unwrap()
+        .unwrap()
+        .id;
     // A dependent under the parent grant's holding (WP-08's pools and routes
     // will hang exactly here).
     let dep = kernel
         .ledger
-        .hold_exclusive(&subject, CLASS_SUBSCRIPTION, "route-1", "dep", Some(parent_holding), 1)
+        .hold_exclusive(
+            ExclusiveRequest {
+                owner: SubjectId::new(&subject),
+                resource: ResourceKey::new(
+                    ClassId::new(CLASS_SUBSCRIPTION),
+                    InstanceId::new("route-1"),
+                ),
+                generation: Generation::new("dep"),
+                parent: Some(parent_holding)
+                    .map(|id| kernel.ledger.holding(id).unwrap().unwrap().handle()),
+                lease: LeaseRequest::UseClassDefault,
+            },
+            Timestamp::try_from(1u64).unwrap(),
+        )
+        .map(|h| h.id())
         .unwrap();
 
     let n = host.revoke_capability(&parent.cap_id).unwrap();
     assert_eq!(n, 2, "parent and child both revoked");
     for id in [parent_holding, kid_holding, dep] {
         assert!(
-            kernel.ledger.holding(id).unwrap().released_at.is_some(),
+            kernel
+                .ledger
+                .holding(id)
+                .unwrap()
+                .unwrap()
+                .released_at
+                .is_some(),
             "holding {id} tombstoned by the cascade"
         );
     }
-    assert!(kernel.caps.exercise(&kid.cap_id, "emit", 2).is_err(), "dead child cap refused");
+    assert!(
+        kernel.caps.exercise(&kid.cap_id, "emit", 2).is_err(),
+        "dead child cap refused"
+    );
     // The revocation is subtree-scoped: the plugin holding the grant keeps
     // serving (its own holdings were never in the grant's tree).
-    assert_eq!(host.call(&a, "echoa::events", json!([])).unwrap(), json!([]));
+    assert_eq!(
+        host.call(&a, "echoa::events", json!([])).unwrap(),
+        json!([])
+    );
     kernel.ledger.invariant().unwrap();
 
     host.shutdown_all();

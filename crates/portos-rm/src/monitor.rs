@@ -47,9 +47,15 @@
 //! **预算/界超限**的三态语义（读/效应不对称：读自由故可截断，效应受控故宁停不越）；
 //! sink 越界不在三态商量之列——规划前提崩塌，fail-stop（或按声明降档/改写）。
 
+use crate::identity::{
+    ClassId, Generation, HoldingHandle, HoldingId, InstanceId, ResourceKey, SubjectId,
+};
+use crate::ledger::GrantRequest;
 use crate::ledger::{AlgebraTag, ClassDecl, Frag, Ledger, LedgerError, RevertGrade};
 use crate::ra::Count;
+use crate::registry::{Capacity, Claim, PoolRef, RuntimeAlgebra};
 use crate::teardown::{Orchestrator, RunOutcome};
+use crate::time::{LeaseRequest, Timestamp};
 use std::collections::{BTreeMap, BTreeSet};
 
 // ---------------------------------------------------------------------------
@@ -67,7 +73,12 @@ pub struct WAction {
 
 impl WAction {
     pub fn new(verb: &str, target: &str, payload: &str, cost: u64) -> Self {
-        Self { verb: verb.into(), target: target.into(), payload: payload.into(), cost }
+        Self {
+            verb: verb.into(),
+            target: target.into(),
+            payload: payload.into(),
+            cost,
+        }
     }
 }
 
@@ -136,28 +147,71 @@ pub struct EmissionWorld {
 // ---------------------------------------------------------------------------
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Ev {
-    Admitted { nonce: String },
-    Refused { why: Refusal },
-    Emitted { verb: String, target: String },
-    Suppressed { verb: String, target: String },
-    InsertedOnApproval { count: usize, nonce: String },
-    Attenuated { from: String, to: String },
-    Confined { verb: String, target: String },
-    BudgetExhausted { at: usize },
-    Truncation { dropped: usize },
-    Escalated { at: usize },
-    Resumed { nonce: String },
-    SegmentAborted { expired: bool },
-    SegmentRolledBack { holdings: usize },
+    Admitted {
+        nonce: String,
+    },
+    Refused {
+        why: Refusal,
+    },
+    Emitted {
+        verb: String,
+        target: String,
+    },
+    Suppressed {
+        verb: String,
+        target: String,
+    },
+    InsertedOnApproval {
+        count: usize,
+        nonce: String,
+    },
+    Attenuated {
+        from: String,
+        to: String,
+    },
+    Confined {
+        verb: String,
+        target: String,
+    },
+    BudgetExhausted {
+        at: usize,
+    },
+    Truncation {
+        dropped: usize,
+    },
+    Escalated {
+        at: usize,
+    },
+    Resumed {
+        nonce: String,
+    },
+    SegmentAborted {
+        expired: bool,
+    },
+    SegmentRolledBack {
+        holdings: usize,
+    },
     /// [SEG-TX] commit：段内剩余持有转授给 fiber。
-    SegmentCommitted { holdings: usize },
+    SegmentCommitted {
+        holdings: usize,
+    },
     /// [SEG-TX] 提前 commit 一笔持有（此后 abort 不再回滚它）。
-    Promoted { holding: u64 },
-    FailStop { at: usize },
+    Promoted {
+        holding: HoldingId,
+    },
+    FailStop {
+        at: usize,
+    },
     /// F6 [PROTO]：协议违规（safety 档，与 sink 越界同级：fail-stop）。
-    ProtocolViolation { verb: String, state: String, at: usize },
+    ProtocolViolation {
+        verb: String,
+        state: String,
+        at: usize,
+    },
     /// F6 [CEFF]：段回滚时对被界内变换触及的持有调了类 restore（恰好一次）。
-    Restored { target: String },
+    Restored {
+        target: String,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -200,11 +254,17 @@ pub enum MonState {
 pub enum MonOutcome {
     Completed,
     /// [PREFIX] 前缀交付：at = 计划中未执行的首个下标。
-    FailStop { at: usize },
+    FailStop {
+        at: usize,
+    },
     /// 截断非失败：处理了前缀，弃量入 trace（[LOUD]）。
-    Truncated { dropped: usize },
+    Truncated {
+        dropped: usize,
+    },
     /// [TTL] 悬置段到期即废（或显式放弃）。
-    Aborted { expired: bool },
+    Aborted {
+        expired: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -239,13 +299,15 @@ impl Monitor {
     pub fn new(policy: Policy, mode: Mode, mut ledger: Ledger, fiber: &str) -> Self {
         // [GATE] 预算是一个资源类：Counted 代数、无租约、Inverse 档
         //（花费行是纯记账，无世界侧动作）。
-        ledger.register_class(ClassDecl {
-            class_id: "budget".into(),
-            algebra: AlgebraTag::Counted,
-            release_idempotent: true,
-            lease_secs: None,
-            revert_grade: RevertGrade::Inverse,
-        });
+        ledger
+            .register_class(ClassDecl {
+                class_id: "budget".into(),
+                algebra: AlgebraTag::Counted,
+                release_idempotent: true,
+                lease_duration: None,
+                revert_grade: RevertGrade::Inverse,
+            })
+            .unwrap();
         Self {
             policy,
             mode,
@@ -302,7 +364,16 @@ impl Monitor {
     fn mint_pool(&mut self, c: &Consent) {
         self.orch
             .ledger
-            .set_capacity("budget", &c.nonce, Frag::Count(Count::Value(c.budget)));
+            .create_pool(
+                &self
+                    .orch
+                    .ledger
+                    .registered_class::<Count>(&ClassId::new("budget"))
+                    .unwrap(),
+                InstanceId::new(&c.nonce),
+                Capacity::new(Count::Value(c.budget)).unwrap(),
+            )
+            .unwrap();
         self.used_nonces.insert(c.nonce.clone());
         self.active_pool = c.nonce.clone();
     }
@@ -328,7 +399,9 @@ impl Monitor {
             return Err(why);
         }
         self.mint_pool(&consent);
-        self.trace.push(Ev::Admitted { nonce: consent.nonce.clone() });
+        self.trace.push(Ev::Admitted {
+            nonce: consent.nonce.clone(),
+        });
         self.consent = Some(consent);
         self.plan = plan;
         self.cursor = 0;
@@ -343,7 +416,21 @@ impl Monitor {
         let spender = format!("{}:spent", self.fiber);
         self.orch
             .ledger
-            .grant(&spender, "budget", &pool, Frag::Count(Count::Value(cost)), "consent", None, now)
+            .grant(
+                &self.orch.ledger.pool::<Count>(&ResourceKey::new(
+                    ClassId::new("budget"),
+                    InstanceId::new(&pool),
+                ))?,
+                GrantRequest {
+                    owner: SubjectId::new(&spender),
+                    claim: Claim::new(Count::Value(cost)).unwrap(),
+                    generation: Generation::new("consent"),
+                    parent: None,
+                    lease: LeaseRequest::UseClassDefault,
+                    now: Timestamp::try_from(now)?,
+                },
+            )
+            .map(|h| h.id())
             .map(|_| ())
     }
 
@@ -352,7 +439,7 @@ impl Monitor {
         self.orch
             .ledger
             .live()
-            .filter(|h| h.class_id == "budget" && h.instance == nonce)
+            .filter(|h| h.class_id.as_str() == "budget" && h.instance.as_str() == nonce)
             .map(|h| match &h.frag {
                 Frag::Count(Count::Value(n)) => *n,
                 _ => 0,
@@ -361,16 +448,24 @@ impl Monitor {
     }
 
     /// 计划获取侧持有（演练里由测试代放，模拟计划中的 reserve/acquire 步）。
-    pub fn stage_acquire(
+    pub fn stage_acquire<A: RuntimeAlgebra>(
         &mut self,
-        class_id: &str,
-        instance: &str,
-        generation: &str,
-        frag: Frag,
-        now: u64,
-    ) -> Result<u64, LedgerError> {
-        let subj = self.seg_subject();
-        self.orch.ledger.grant(&subj, class_id, instance, frag, generation, None, now)
+        pool: &PoolRef<A>,
+        generation: Generation,
+        claim: Claim<A>,
+        now: Timestamp,
+    ) -> Result<HoldingHandle, LedgerError> {
+        self.orch.ledger.grant(
+            pool,
+            GrantRequest {
+                owner: SubjectId::new(self.seg_subject()),
+                claim,
+                generation,
+                parent: None,
+                lease: LeaseRequest::UseClassDefault,
+                now,
+            },
+        )
     }
 
     /// 逐动作步进：m0 的"逐效应四连"（sink 复检、预算闸、执行、记 trace）
@@ -387,7 +482,10 @@ impl Monitor {
         // ① confine：声明为隔离目标 ⇒ 改写到替身。替身不是真实边界——
         //    无需同意、不占真实预算；staged 动词也一样进替身（隔离优先）。
         if self.policy.confined_targets.contains(&act.target) {
-            self.trace.push(Ev::Confined { verb: act.verb.clone(), target: act.target.clone() });
+            self.trace.push(Ev::Confined {
+                verb: act.verb.clone(),
+                target: act.target.clone(),
+            });
             self.world.standin.push(act);
             self.cursor += 1;
             return true;
@@ -399,8 +497,10 @@ impl Monitor {
         if !self.policy.in_scope(&act) {
             let rescued = match self.policy.degrade.get(&act.verb).cloned() {
                 Some(degraded) => {
-                    self.trace
-                        .push(Ev::Attenuated { from: act.verb.clone(), to: degraded.clone() });
+                    self.trace.push(Ev::Attenuated {
+                        from: act.verb.clone(),
+                        to: degraded.clone(),
+                    });
                     act.verb = degraded;
                     self.policy.in_scope(&act) // edit 之后必须重新过同一谓词
                 }
@@ -416,7 +516,10 @@ impl Monitor {
         // ③ [SUPPR] 事务形状动词（此处 act 已在范围内）：压进缓冲。
         //    世界不可见、预算未花（预算约束真实发射；插入时按批准池计费）。
         if self.policy.staged_verbs.contains(&act.verb) {
-            self.trace.push(Ev::Suppressed { verb: act.verb.clone(), target: act.target.clone() });
+            self.trace.push(Ev::Suppressed {
+                verb: act.verb.clone(),
+                target: act.target.clone(),
+            });
             self.buffer.push(act);
             self.cursor += 1;
             return true;
@@ -428,7 +531,11 @@ impl Monitor {
             (Some(p), Some(st)) => match p.step(st, &act.verb) {
                 Ok(n) => Some(n),
                 Err(v) => {
-                    self.trace.push(Ev::ProtocolViolation { verb: v.verb, state: v.state, at: self.cursor });
+                    self.trace.push(Ev::ProtocolViolation {
+                        verb: v.verb,
+                        state: v.state,
+                        at: self.cursor,
+                    });
                     self.trace.push(Ev::FailStop { at: self.cursor });
                     self.finish_abort(now, MonOutcome::FailStop { at: self.cursor });
                     return false;
@@ -440,7 +547,10 @@ impl Monitor {
         // ④ [GATE] 预算闸 → 执行 → 记账。
         match self.spend(act.cost, now) {
             Ok(()) => {
-                self.trace.push(Ev::Emitted { verb: act.verb.clone(), target: act.target.clone() });
+                self.trace.push(Ev::Emitted {
+                    verb: act.verb.clone(),
+                    target: act.target.clone(),
+                });
                 // F6 [CEFF]：界内变换触及的目标入段清单，回滚时 restore。
                 if self.policy.contained.contains(&act.verb) {
                     self.touched.insert(act.target.clone());
@@ -522,7 +632,9 @@ impl Monitor {
         // 事务形状：整批放出或整批不放——预算先盖住全部缓冲再动手。
         let total: u64 = self.buffer.iter().map(|a| a.cost).sum();
         if approval.budget < total {
-            self.trace.push(Ev::Refused { why: Refusal::ApprovalBudgetShort });
+            self.trace.push(Ev::Refused {
+                why: Refusal::ApprovalBudgetShort,
+            });
             return Err(Refusal::ApprovalBudgetShort);
         }
         // F6 [PROTO]+[REORDER]：整批在当前协议状态下预演；任一件无转移 ⇒ 整批拒。
@@ -534,7 +646,9 @@ impl Monitor {
                 match p.step(&cur, &a.verb) {
                     Ok(n) => cur = n,
                     Err(_) => {
-                        self.trace.push(Ev::Refused { why: Refusal::ProtocolViolation });
+                        self.trace.push(Ev::Refused {
+                            why: Refusal::ProtocolViolation,
+                        });
                         return Err(Refusal::ProtocolViolation);
                     }
                 }
@@ -550,24 +664,31 @@ impl Monitor {
             }
         }
         self.proto_state = end_state;
-        self.trace
-            .push(Ev::InsertedOnApproval { count: batch.len(), nonce: approval.nonce.clone() });
+        self.trace.push(Ev::InsertedOnApproval {
+            count: batch.len(),
+            nonce: approval.nonce.clone(),
+        });
         self.finish_commit(); // [SEG-TX] 批准放出＝commit
         Ok(())
     }
 
     /// [SEG-TX] 提前 commit 一笔段内持有：转授给 fiber，此后 abort 不再回滚它。
     /// 只在段未终态时可用；句柄必须在段内（转授对来源主体核对）。
-    pub fn promote(&mut self, holding_id: u64, generation: &str) -> Result<(), PromoteError> {
-        if !matches!(self.state, MonState::Running | MonState::AwaitingApproval | MonState::Paused) {
+    pub fn promote(&mut self, holding: &HoldingHandle) -> Result<(), PromoteError> {
+        if !matches!(
+            self.state,
+            MonState::Running | MonState::AwaitingApproval | MonState::Paused
+        ) {
             return Err(PromoteError::SegmentClosed);
         }
         let seg = self.seg_subject();
         self.orch
             .ledger
-            .transfer(holding_id, generation, &seg, &self.fiber)
+            .transfer(holding, &SubjectId::new(&seg), SubjectId::new(&self.fiber))
             .map_err(PromoteError::Ledger)?;
-        self.trace.push(Ev::Promoted { holding: holding_id });
+        self.trace.push(Ev::Promoted {
+            holding: holding.id(),
+        });
         Ok(())
     }
 
@@ -575,22 +696,28 @@ impl Monitor {
     /// 界内变换的触及清单作废（不 restore）；状态 Done(Completed)。
     fn finish_commit(&mut self) {
         let seg = self.seg_subject();
-        let items: Vec<(u64, String)> = self
+        let items: Vec<(HoldingId, Generation)> = self
             .orch
             .ledger
-            .live_snapshot(&seg)
+            .live_snapshot(&SubjectId::new(&seg))
             .into_iter()
             .map(|it| (it.id, it.generation))
             .collect();
         for (id, generation) in &items {
-            match self.orch.ledger.transfer(*id, generation, &seg, &self.fiber) {
+            match self.orch.ledger.transfer(
+                &HoldingHandle::new(*id, generation.clone()),
+                &SubjectId::new(&seg),
+                SubjectId::new(&self.fiber),
+            ) {
                 Ok(()) => {}
                 Err(e) => panic!("segment commit invariant broken: {e:?}"),
             }
         }
         self.touched.clear();
         if !items.is_empty() {
-            self.trace.push(Ev::SegmentCommitted { holdings: items.len() });
+            self.trace.push(Ev::SegmentCommitted {
+                holdings: items.len(),
+            });
         }
         self.state = MonState::Done(MonOutcome::Completed);
     }
@@ -632,7 +759,9 @@ impl Monitor {
         }
         let orig = self.consent.as_ref().expect("admitted");
         if now > orig.ttl_expires_at {
-            self.trace.push(Ev::Refused { why: Refusal::ExpiredTtl });
+            self.trace.push(Ev::Refused {
+                why: Refusal::ExpiredTtl,
+            });
             return Err(Refusal::ExpiredTtl);
         }
         let plan_hash = orig.plan_hash.clone();
@@ -641,7 +770,9 @@ impl Monitor {
             return Err(why);
         }
         self.mint_pool(&incremental);
-        self.trace.push(Ev::Resumed { nonce: incremental.nonce.clone() });
+        self.trace.push(Ev::Resumed {
+            nonce: incremental.nonce.clone(),
+        });
         self.state = MonState::Running;
         Ok(self.run(now))
     }
@@ -667,13 +798,18 @@ impl Monitor {
         // 钥匙 = handler:target:seg，跨重试去重 ⇒ 恰好一次（与 F2 补偿同款承重）。
         let touched: Vec<String> = std::mem::take(&mut self.touched).into_iter().collect();
         for t in touched {
-            let key = format!("restore:{}:{}:{}", self.policy.handler, t, self.seg_subject());
+            let key = format!(
+                "restore:{}:{}:{}",
+                self.policy.handler,
+                t,
+                self.seg_subject()
+            );
             if self.orch.world.restore(&key) {
                 self.trace.push(Ev::Restored { target: t });
             }
         }
         let subj = self.seg_subject();
-        let n = self.orch.ledger.live_snapshot(&subj).len();
+        let n = self.orch.ledger.live_snapshot(&SubjectId::new(&subj)).len();
         if n == 0 {
             return;
         }

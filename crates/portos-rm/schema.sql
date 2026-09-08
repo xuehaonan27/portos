@@ -1,4 +1,5 @@
--- portos-rm — Phase D 持有账本 DDL（冻结演练 F1 产物；与 src/ledger.rs 同构）
+-- F1 演练的历史 DDL 参照，不由内核执行。
+-- 当前 SQLite 定义与迁移见 portos-kernel/src/db.rs 和 ledger/recovery.rs。
 -- 设计后果 1（无消去性）：碎片逐行为真相，合成值只可重算/缓存对账，绝不原地扣减。
 -- 设计后果 2（发放方闸门）：grant 必须对照 authoritative 行做全量合成检查。
 
@@ -27,7 +28,7 @@ CREATE TABLE holding (
   fragment            TEXT NOT NULL,      -- ◯ 碎片（序列化；一行=一笔）
   generation          TEXT NOT NULL,      -- 世代见证（pid 启动时间 / CDP target nonce / fd inode）
   parent              INTEGER REFERENCES holding(holding_id),  -- ownership 树边
-  lease_expires_at    INTEGER,            -- unix 秒；NULL = 仅随 parent 生命期
+  lease_expires_at    INTEGER,            -- unix 秒；历史 NULL：有 parent 随父，无 parent 无期限；运行中用 Lease 枚举区分
   acquired_at         INTEGER NOT NULL,
   released_at         INTEGER             -- NULL = live；墓碑仅为回放便利，权威审计在哈希链
 );

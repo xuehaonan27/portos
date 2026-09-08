@@ -27,6 +27,8 @@
 //! A crashed kernel's suspended runs are aborted at open (`recover`), which
 //! matches the drill's crash model (buffer loss = degraded abort).
 
+use portos_rm::identity::SubjectId;
+use portos_rm::time::Timestamp;
 use crate::consent::{ConsentRecord, render_budget};
 use crate::host::{HostInner, HostWorld, dispatch_event, invoke_as, kernel_schemas};
 use crate::plancheck::{self, VerbSchemas};
@@ -169,7 +171,7 @@ impl PlanService {
             let _ = self.set_buffer_state(&run_id, "held", "aborted");
             let seg = Self::seg_of(&fiber);
             let mut world = HostWorld { inner: self.inner.clone() };
-            let _ = self.kernel.ledger.teardown(&seg, &mut world, now);
+            let _ = self.kernel.ledger.teardown(&SubjectId::new(&seg), &mut world, Timestamp::try_from(now).expect("system timestamp in range"));
             self.finish_row(&run_id, &Outcome::Aborted { expired: false });
             let _ = self.kernel.audit.lock().unwrap().append(json!({
                 "event": "plan.aborted", "run": run_id, "crashed": true,
@@ -470,7 +472,7 @@ impl PlanService {
             let _ = self.set_buffer_state(run_id, "held", "aborted");
             let seg = Self::seg_of(&row.subject);
             let mut world = HostWorld { inner: self.inner.clone() };
-            let _ = self.kernel.ledger.teardown(&seg, &mut world, crate::db::now_unix());
+            let _ = self.kernel.ledger.teardown(&SubjectId::new(&seg), &mut world, Timestamp::try_from(crate::db::now_unix()).expect("system timestamp in range"));
             self.finish_run(run_id, &Outcome::FailStop { at: why.clone() }, 0);
             return Err(KernelError::Denied(format!("approve release failed: {why}")));
         }
@@ -482,7 +484,7 @@ impl PlanService {
         self.emit(run_id, json!({"kind": "approved", "released": batch.len()}));
         // [SEG-TX] approval = commit.
         let seg = Self::seg_of(&row.subject);
-        let moved = self.kernel.ledger.transfer_all(&seg, &row.subject)?;
+        let moved = self.kernel.ledger.transfer_all(&SubjectId::new(&seg), &SubjectId::new(&row.subject))?;
         self.finish_run(run_id, &Outcome::Completed, moved);
         Ok(())
     }
@@ -558,7 +560,7 @@ impl PlanService {
         let _ = self.set_buffer_state(run_id, "held", "aborted");
         let seg = Self::seg_of(fiber);
         let mut world = HostWorld { inner: self.inner.clone() };
-        let _ = self.kernel.ledger.teardown(&seg, &mut world, now);
+        let _ = self.kernel.ledger.teardown(&SubjectId::new(&seg), &mut world, Timestamp::try_from(now).expect("system timestamp in range"));
         self.finish_run(run_id, &Outcome::Aborted { expired }, 0);
     }
 
@@ -610,7 +612,7 @@ impl PlanService {
                 if rt.withheld == 0 {
                     // [SEG-TX] walked to the end with nothing withheld = commit.
                     let seg = Self::seg_of(&fiber);
-                    let moved = self.kernel.ledger.transfer_all(&seg, &fiber).unwrap_or(0);
+                    let moved = self.kernel.ledger.transfer_all(&SubjectId::new(&seg), &SubjectId::new(&fiber)).unwrap_or(0);
                     self.finish_run(run_id, &Outcome::Completed, moved);
                 } else {
                     self.set_state(run_id, RunState::AwaitingApproval);
@@ -629,7 +631,7 @@ impl PlanService {
                 let _ = self.set_buffer_state(run_id, "held", "aborted");
                 let seg = Self::seg_of(&fiber);
                 let mut world = HostWorld { inner: self.inner.clone() };
-                let _ = self.kernel.ledger.teardown(&seg, &mut world, crate::db::now_unix());
+                let _ = self.kernel.ledger.teardown(&SubjectId::new(&seg), &mut world, Timestamp::try_from(crate::db::now_unix()).expect("system timestamp in range"));
                 self.finish_run(run_id, &outcome, 0);
             }
         }

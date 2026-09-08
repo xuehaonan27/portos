@@ -447,6 +447,7 @@ version = "0.1.0"
 dependencies = [
  "portos-kernel",
  "portos-proto",
+ "portos-rm",
  "portos-signer",
  "serde_json",
 ]
@@ -468,6 +469,7 @@ version = "0.1.0"
 dependencies = [
  "portos-kernel",
  "portos-proto",
+ "portos-rm",
  "portos-sdk",
  "serde_json",
 ]

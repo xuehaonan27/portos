@@ -1,9 +1,6 @@
-//! The holding ledger — freeze drill F1's engineering translation.
-//!
-//! Schema (mirrored in schema.sql): one row per fragment for lifecycle tracking,
-//! generation-stable handles, ownership tree via `parent`, leases, tombstones.
-//! Error taxonomy = the "⊕ 无定义的三种运行时对应" of theory-spec §2.2 plus the
-//! generation/teardown checks.
+//! Resource aggregate with typed pool admission and checked reconstruction.
+//! Holdings and capacities change only through invariant-preserving operations.
+//! Persistence and external resource cleanup belong to the kernel adapter.
 
 use crate::auth::auth_valid;
 use crate::ra::{Count, Ex, Frac, GSet, Ra, Ranges};
@@ -101,9 +98,14 @@ fn frag_auth_valid(capacity: &Frag, outstanding: &Option<Frag>) -> bool {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Class declarations (the registry row — Σ/E/T/W flags the drill needs).
-// ---------------------------------------------------------------------------
+use crate::identity::{
+    ClassId, Generation, HoldingHandle, HoldingId, InstanceId, PoolId, ResourceKey, SubjectId,
+};
+use crate::registry::{Capacity, Claim, ClassBinding, PoolRef, RegisteredClass, RuntimeAlgebra};
+use crate::time::{Lease, LeaseDuration, LeaseRequest, Timestamp};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RevertGrade {
     Inverse,
@@ -111,396 +113,589 @@ pub enum RevertGrade {
     External,
 }
 
-#[derive(Clone, Debug)]
+/// A declaration is input. Registration checks it and returns an immutable binding.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClassDecl {
-    pub class_id: String,
+    pub class_id: ClassId,
     pub algebra: AlgebraTag,
-    /// E: release∘release = release (blind replay safe). All drill classes: true.
     pub release_idempotent: bool,
-    /// T: lease duration; None = lifetime bound to parent only.
-    pub lease_secs: Option<u64>,
-    /// W: ρ 档（枚举形态；等价格的语义见 theory-spec §2.5）
+    pub lease_duration: Option<LeaseDuration>,
     pub revert_grade: RevertGrade,
 }
 
-// ---------------------------------------------------------------------------
-// Holdings.
-// ---------------------------------------------------------------------------
-#[derive(Clone, Debug)]
-pub struct Holding {
-    pub id: u64,
-    pub subject: String,
-    pub class_id: String,
-    pub instance: String,
+/// Untrusted reconstruction data, accepted only by LedgerBuilder::finish.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HoldingRecord {
+    pub id: HoldingId,
+    pub subject: SubjectId,
+    pub class_id: ClassId,
+    pub instance: InstanceId,
     pub frag: Frag,
-    /// Generation witness — stable denotation for substrates that recycle names
-    /// (pid start-time, CDP target nonce). RA carriers need stable identity.
-    pub generation: String,
-    pub parent: Option<u64>,
-    pub lease_expires_at: Option<u64>,
-    pub acquired_at: u64,
-    pub released_at: Option<u64>, // tombstone; audit chain proper lives in aos-kernel
+    pub generation: Generation,
+    pub parent: Option<HoldingId>,
+    pub lease: Lease,
+    pub acquired_at: Timestamp,
+    pub released_at: Option<Timestamp>,
 }
 
-/// F2 规划器消费的持有视图。
+/// The live aggregate never exposes mutable records, even through a cloned view.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Holding {
+    record: HoldingRecord,
+}
+impl std::ops::Deref for Holding {
+    type Target = HoldingRecord;
+    fn deref(&self) -> &Self::Target {
+        &self.record
+    }
+}
+impl Holding {
+    pub fn handle(&self) -> HoldingHandle {
+        HoldingHandle::new(self.id, self.generation.clone())
+    }
+    pub fn key(&self) -> ResourceKey {
+        ResourceKey::new(self.class_id.clone(), self.instance.clone())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct LiveItem {
-    pub id: u64,
-    pub parent: Option<u64>,
-    pub class_id: String,
-    pub instance: String,
-    pub generation: String,
+    pub id: HoldingId,
+    pub parent: Option<HoldingId>,
+    pub class_id: ClassId,
+    pub instance: InstanceId,
+    pub generation: Generation,
     pub grade: RevertGrade,
+}
+impl LiveItem {
+    pub fn handle(&self) -> HoldingHandle {
+        HoldingHandle::new(self.id, self.generation.clone())
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LedgerError {
     UnknownClass,
+    UnknownPool,
     AlgebraMismatch,
-    /// ⊕ invalid or not ≼ capacity — grant refused (conflict / over-capacity).
     Conflict,
-    /// Handle not in the ledger — forged or long-gone.
     ForgedHandle,
-    /// Right name, wrong incarnation (ABA).
     StaleGeneration,
-    /// Releasing a parent with live children outside teardown order.
     TeardownOrder,
-    /// Double release on a class that declared release NOT idempotent.
     DoubleRelease,
-    /// [AUTH-EDGE] 跨主体 parent 无权：父持有既不是自己的，也不属于实例化了自己的主体。
     ParentAuthority,
+    InvalidValue,
+    InvalidLease,
+    OutOfRange,
+    ClassConflict,
+    PoolExists,
+    ForeignReference,
+    DuplicateId,
+    InvalidGraph,
+    InvalidGeneration,
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone, Debug)]
+pub struct GrantRequest<A: RuntimeAlgebra> {
+    pub owner: SubjectId,
+    pub claim: Claim<A>,
+    pub generation: Generation,
+    pub parent: Option<HoldingHandle>,
+    pub lease: LeaseRequest,
+    pub now: Timestamp,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PoolRecord {
+    pub key: ResourceKey,
+    pub capacity: Frag,
+}
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LedgerSnapshot {
+    pub classes: Vec<ClassDecl>,
+    pub pools: Vec<PoolRecord>,
+    pub holdings: Vec<HoldingRecord>,
+    pub instantiations: Vec<(SubjectId, SubjectId)>,
+}
+
+/// Reconstruction has no operational methods. Only a checked graph becomes Ledger.
+pub struct LedgerBuilder {
+    snapshot: LedgerSnapshot,
+}
+impl LedgerBuilder {
+    pub fn new(snapshot: LedgerSnapshot) -> Self {
+        Self { snapshot }
+    }
+    pub fn finish(self) -> Result<Ledger, LedgerError> {
+        let mut ledger = Ledger::new();
+        for decl in self.snapshot.classes {
+            if ledger.classes.contains_key(&decl.class_id) {
+                return Err(LedgerError::ClassConflict);
+            }
+            ledger.register_class(decl)?;
+        }
+        for pool in self.snapshot.pools {
+            if ledger.capacities.insert(pool.key, pool.capacity).is_some() {
+                return Err(LedgerError::PoolExists);
+            }
+        }
+        for (child, parent) in self.snapshot.instantiations {
+            if ledger.instantiations.insert(child, parent).is_some() {
+                return Err(LedgerError::InvalidGraph);
+            }
+        }
+        for row in self.snapshot.holdings {
+            ledger.next_id = ledger
+                .next_id
+                .max(row.id.get().checked_add(1).ok_or(LedgerError::OutOfRange)?);
+            ledger.holdings.push(Holding { record: row });
+        }
+        ledger.invariant()?;
+        Ok(ledger)
+    }
+}
+
+static NEXT_LEDGER: AtomicU64 = AtomicU64::new(1);
 pub struct Ledger {
-    classes: std::collections::BTreeMap<String, ClassDecl>,
-    capacities: std::collections::BTreeMap<(String, String), Frag>,
+    identity: u64,
+    classes: BTreeMap<ClassId, ClassDecl>,
+    capacities: BTreeMap<ResourceKey, Frag>,
     holdings: Vec<Holding>,
     next_id: u64,
-    /// [AUTH-EDGE] 实例化关系：child subject → 实例化它的 subject（内核在拉起子实例时登记）。
-    /// 决策 2（用户裁定 2026-09-05）：ownership 边可跨主体，但只沿这条关系——
-    /// 父持有须是自己的，或属于实例化了自己的主体；关系不传递（祖父的树要经父的持有进入）。
-    instantiations: std::collections::BTreeMap<String, String>,
+    instantiations: BTreeMap<SubjectId, SubjectId>,
 }
-
+impl Default for Ledger {
+    fn default() -> Self {
+        Self {
+            identity: NEXT_LEDGER
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+                .expect("ledger identity exhausted"),
+            classes: BTreeMap::new(),
+            capacities: BTreeMap::new(),
+            holdings: Vec::new(),
+            next_id: 0,
+            instantiations: BTreeMap::new(),
+        }
+    }
+}
+impl Clone for Ledger {
+    fn clone(&self) -> Self {
+        let mut copy = Self::new();
+        copy.classes = self.classes.clone();
+        copy.capacities = self.capacities.clone();
+        copy.holdings = self.holdings.clone();
+        copy.next_id = self.next_id;
+        copy.instantiations = self.instantiations.clone();
+        copy
+    }
+}
 impl Ledger {
     pub fn new() -> Self {
         Self::default()
     }
-
-    pub fn register_class(&mut self, decl: ClassDecl) {
-        self.classes.insert(decl.class_id.clone(), decl);
+    pub fn snapshot(&self) -> LedgerSnapshot {
+        LedgerSnapshot {
+            classes: self.classes.values().cloned().collect(),
+            pools: self
+                .capacities
+                .iter()
+                .map(|(key, capacity)| PoolRecord {
+                    key: key.clone(),
+                    capacity: capacity.clone(),
+                })
+                .collect(),
+            holdings: self.holdings.iter().map(|h| h.record.clone()).collect(),
+            instantiations: self
+                .instantiations
+                .iter()
+                .map(|(c, p)| (c.clone(), p.clone()))
+                .collect(),
+        }
     }
-
-    pub fn set_capacity(&mut self, class_id: &str, instance: &str, cap: Frag) {
+    pub fn register_class(&mut self, decl: ClassDecl) -> Result<ClassBinding, LedgerError> {
+        if let Some(existing) = self.classes.get(&decl.class_id) {
+            if existing != &decl {
+                return Err(LedgerError::ClassConflict);
+            }
+        }
+        let binding = ClassBinding {
+            ledger: self.identity,
+            id: decl.class_id.clone(),
+            algebra: decl.algebra,
+        };
+        self.classes.entry(decl.class_id.clone()).or_insert(decl);
+        Ok(binding)
+    }
+    pub fn registered_class<A: RuntimeAlgebra>(
+        &self,
+        id: &ClassId,
+    ) -> Result<RegisteredClass<A>, LedgerError> {
+        let decl = self.classes.get(id).ok_or(LedgerError::UnknownClass)?;
+        ClassBinding {
+            ledger: self.identity,
+            id: id.clone(),
+            algebra: decl.algebra,
+        }
+        .for_algebra()
+    }
+    pub fn create_pool<A: RuntimeAlgebra>(
+        &mut self,
+        class: &RegisteredClass<A>,
+        instance: InstanceId,
+        capacity: Capacity<A>,
+    ) -> Result<PoolRef<A>, LedgerError> {
+        if class.binding.ledger != self.identity {
+            return Err(LedgerError::ForeignReference);
+        }
+        let current = self.registered_class::<A>(class.id())?;
+        let key = ResourceKey::new(current.id().clone(), instance);
+        if let Some(existing) = self.capacities.get(&key) {
+            if A::from_fragment(existing) == Some(capacity.value()) {
+                return Ok(PoolRef::new(self.identity, PoolId::new(key)));
+            }
+            return Err(LedgerError::PoolExists);
+        }
         self.capacities
-            .insert((class_id.to_string(), instance.to_string()), cap);
+            .insert(key.clone(), capacity.into_fragment());
+        Ok(PoolRef::new(self.identity, PoolId::new(key)))
     }
-
-    /// [AUTH-EDGE] 登记"`parent_subject` 实例化了 `child`"——是内核在拉起子实例（Cordis Def 52
-    /// 的实例化效应）时写下的事实，不是插件自报。此后 `child` 才可把持有挂到 `parent_subject` 的持有下。
-    pub fn declare_instantiation(&mut self, child: &str, parent_subject: &str) {
-        self.instantiations.insert(child.to_string(), parent_subject.to_string());
+    pub fn pool<A: RuntimeAlgebra>(&self, key: &ResourceKey) -> Result<PoolRef<A>, LedgerError> {
+        let cap = self.capacities.get(key).ok_or(LedgerError::UnknownPool)?;
+        if cap.tag() != A::TAG {
+            return Err(LedgerError::AlgebraMismatch);
+        }
+        Ok(PoolRef::new(self.identity, PoolId::new(key.clone())))
     }
-
-    /// Change the holder, preserving every pool's aggregate and capacity invariant.
-    /// `parent` remains an existence dependency: transferring a child does not
-    /// detach it from the old provider's cleanup closure or transfer that provider.
-    /// 世代不符拒（ABA）；来源主体不符拒（句柄不是你的）；已释放拒。
-    pub fn transfer(&mut self, id: u64, generation: &str, from_subject: &str, to_subject: &str) -> Result<(), LedgerError> {
-        let h = self
-            .holdings
-            .iter_mut()
-            .find(|h| h.id == id)
-            .ok_or(LedgerError::ForgedHandle)?;
-        if h.released_at.is_some() || h.subject != from_subject {
-            return Err(LedgerError::ForgedHandle);
+    fn check_pool<A: RuntimeAlgebra>(&self, pool: &PoolRef<A>) -> Result<&Frag, LedgerError> {
+        if pool.ledger != self.identity {
+            return Err(LedgerError::ForeignReference);
         }
-        if h.generation != generation {
-            return Err(LedgerError::StaleGeneration);
+        let cap = self
+            .capacities
+            .get(pool.id().key())
+            .ok_or(LedgerError::UnknownPool)?;
+        if cap.tag() != A::TAG {
+            return Err(LedgerError::AlgebraMismatch);
         }
-        h.subject = to_subject.to_string();
+        Ok(cap)
+    }
+    pub fn resize_pool<A: RuntimeAlgebra>(
+        &mut self,
+        pool: &PoolRef<A>,
+        capacity: Capacity<A>,
+    ) -> Result<(), LedgerError> {
+        self.check_pool(pool)?;
+        let cap = capacity.into_fragment();
+        if !frag_auth_valid(&cap, &compose_frags(&self.live_frags(pool.id().key()))?) {
+            return Err(LedgerError::Conflict);
+        }
+        self.capacities.insert(pool.id().key().clone(), cap);
         Ok(())
     }
-
+    /// Settle exactly this account pool; failure leaves the original graph intact.
+    pub fn settle_and_zero_pool(
+        &mut self,
+        pool: &PoolRef<Count>,
+        now: Timestamp,
+    ) -> Result<(), LedgerError> {
+        self.check_pool(pool)?;
+        let mut staged = self.clone();
+        let mut rows: Vec<_> = staged
+            .live()
+            .filter(|h| h.key() == *pool.id().key())
+            .map(|h| (staged.depth(h.id), h.handle()))
+            .collect();
+        rows.sort_by(|a, b| b.0.cmp(&a.0));
+        for (_, handle) in rows {
+            staged.release(&handle, now)?;
+        }
+        staged
+            .capacities
+            .insert(pool.id().key().clone(), Frag::Count(Count::Value(0)));
+        // Preserve references to this aggregate for this atomic in-memory operation.
+        staged.identity = self.identity;
+        *self = staged;
+        Ok(())
+    }
+    pub fn capacity(&self, key: &ResourceKey) -> Option<&Frag> {
+        self.capacities.get(key)
+    }
+    pub fn has_class(&self, id: &ClassId) -> bool {
+        self.classes.contains_key(id)
+    }
+    pub fn grade_of(&self, id: &ClassId) -> Option<RevertGrade> {
+        self.classes.get(id).map(|d| d.revert_grade)
+    }
+    pub fn declare_instantiation(&mut self, child: SubjectId, parent: SubjectId) {
+        self.instantiations.insert(child, parent);
+    }
     pub fn live(&self) -> impl Iterator<Item = &Holding> {
         self.holdings.iter().filter(|h| h.released_at.is_none())
     }
-
-    /// 全部行（含墓碑）——实装写穿持久化用。
     pub fn holdings(&self) -> &[Holding] {
         &self.holdings
     }
-
-    /// 单行查询（含墓碑）。
-    pub fn holding(&self, id: u64) -> Option<&Holding> {
+    pub fn holding(&self, id: HoldingId) -> Option<&Holding> {
         self.holdings.iter().find(|h| h.id == id)
     }
-
-    /// 实装重启时从持久层回灌一行：**不过闸门**——行来自持久层，只恢复 id 计数；完整账本的验证由恢复流程负责。
-    /// 回灌后 `invariant()` 仍应成立；不成立即持久层已损坏（实装应拒绝启动或走对账）。
-    pub fn restore_row(&mut self, h: Holding) {
-        self.next_id = self.next_id.max(h.id + 1);
-        self.holdings.push(h);
-    }
-
-    /// 类声明是否已登记（实装：内核内置类在每次启动时重新登记）。
-    pub fn has_class(&self, class_id: &str) -> bool {
-        self.classes.contains_key(class_id)
-    }
-
-    /// 类声明的可逆档（实装：sweep 的世界动作按档选路，与 teardown 同纪律）。
-    pub fn grade_of(&self, class_id: &str) -> Option<RevertGrade> {
-        self.classes.get(class_id).map(|d| d.revert_grade)
-    }
-
-    /// 实装：逐持有租约覆盖。类声明的 `lease_secs` 只是缺省；内核 `hold` op 的
-    /// `lease_secs` 走这里（per-holding 租约，见实现计划 §10 的陷阱条目）。
-    pub fn set_lease(
-        &mut self,
-        id: u64,
-        generation: &str,
-        lease_expires_at: Option<u64>,
-    ) -> Result<(), LedgerError> {
-        let h = self
-            .holdings
-            .iter_mut()
-            .find(|h| h.id == id)
-            .ok_or(LedgerError::ForgedHandle)?;
-        if h.released_at.is_some() {
-            return Err(LedgerError::ForgedHandle);
-        }
-        if h.generation != generation {
+    pub fn resolve(&self, handle: &HoldingHandle) -> Result<&Holding, LedgerError> {
+        let h = self.holding(handle.id()).ok_or(LedgerError::ForgedHandle)?;
+        if &h.generation != handle.generation() {
             return Err(LedgerError::StaleGeneration);
         }
-        h.lease_expires_at = lease_expires_at;
-        Ok(())
+        Ok(h)
     }
-
-    /// 某 (class, instance) 的容量元素（实装：cap 计数池的容量）。
-    pub fn capacity(&self, class_id: &str, instance: &str) -> Option<&Frag> {
-        self.capacities.get(&(class_id.to_string(), instance.to_string()))
-    }
-
-    fn live_frags(&self, class_id: &str, instance: &str) -> Vec<Frag> {
+    fn live_frags(&self, key: &ResourceKey) -> Vec<Frag> {
         self.live()
-            .filter(|h| h.class_id == class_id && h.instance == instance)
+            .filter(|h| h.key() == *key)
             .map(|h| h.frag.clone())
             .collect()
     }
-
-    /// Grant checks the complete pool composition against capacity.
-    #[allow(clippy::too_many_arguments)]
-    pub fn grant(
+    pub fn grant<A: RuntimeAlgebra>(
         &mut self,
-        subject: &str,
-        class_id: &str,
-        instance: &str,
-        want: Frag,
-        generation: &str,
-        parent: Option<u64>,
-        now: u64,
-    ) -> Result<u64, LedgerError> {
-        let decl = self.classes.get(class_id).ok_or(LedgerError::UnknownClass)?;
-        if want.tag() != decl.algebra {
-            return Err(LedgerError::AlgebraMismatch);
+        pool: &PoolRef<A>,
+        request: GrantRequest<A>,
+    ) -> Result<HoldingHandle, LedgerError> {
+        let cap = self.check_pool(pool)?;
+        let key = pool.id().key();
+        let decl = self
+            .classes
+            .get(key.class())
+            .ok_or(LedgerError::UnknownClass)?;
+        if request.generation.as_str().is_empty() {
+            return Err(LedgerError::InvalidGeneration);
         }
-        if let Some(p) = parent {
-            let ph = self
-                .holdings
-                .iter()
-                .find(|h| h.id == p)
-                .ok_or(LedgerError::ForgedHandle)?;
+        if let Some(parent) = &request.parent {
+            let ph = self.resolve(parent)?;
             if ph.released_at.is_some() {
                 return Err(LedgerError::ForgedHandle);
             }
-            // [AUTH-EDGE] 决策 2：跨主体 parent 只沿实例化关系。
-            if ph.subject != subject
-                && self.instantiations.get(subject).map(String::as_str) != Some(ph.subject.as_str())
+            if ph.subject != request.owner
+                && self.instantiations.get(&request.owner) != Some(&ph.subject)
             {
                 return Err(LedgerError::ParentAuthority);
             }
         }
-        let cap = self
-            .capacities
-            .get(&(class_id.to_string(), instance.to_string()))
-            .ok_or(LedgerError::UnknownClass)?;
-        let live = self.live_frags(class_id, instance);
-        if cap.tag() != want.tag() {
-            return Err(LedgerError::AlgebraMismatch);
-        }
-        let mut all = live;
+        let lease =
+            request
+                .lease
+                .resolve(decl.lease_duration, request.parent.is_some(), request.now)?;
+        let want = request.claim.into_fragment();
+        let mut all = self.live_frags(key);
         all.push(want.clone());
         if !frag_auth_valid(cap, &compose_frags(&all)?) {
             return Err(LedgerError::Conflict);
         }
-        let id = self.next_id;
-        self.next_id += 1;
-        let lease = decl.lease_secs.map(|s| now + s);
+        let id = HoldingId::try_from(self.next_id)?;
+        let next_id = self.next_id.checked_add(1).ok_or(LedgerError::OutOfRange)?;
+        let handle = HoldingHandle::new(id, request.generation.clone());
         self.holdings.push(Holding {
-            id,
-            subject: subject.to_string(),
-            class_id: class_id.to_string(),
-            instance: instance.to_string(),
-            frag: want,
-            generation: generation.to_string(),
-            parent,
-            lease_expires_at: lease,
-            acquired_at: now,
-            released_at: None,
+            record: HoldingRecord {
+                id,
+                subject: request.owner,
+                class_id: key.class().clone(),
+                instance: key.instance().clone(),
+                frag: want,
+                generation: request.generation,
+                parent: request.parent.map(|p| p.id()),
+                lease,
+                acquired_at: request.now,
+                released_at: None,
+            },
         });
-        Ok(id)
+        self.next_id = next_id;
+        Ok(handle)
     }
-
-    fn has_live_children(&self, id: u64) -> bool {
-        self.live().any(|h| h.parent == Some(id))
-    }
-
-    /// Release marks the holding as a tombstone; aggregates follow the remaining live rows.
-    pub fn release(&mut self, id: u64, generation: &str, now: u64) -> Result<(), LedgerError> {
-        let idx = self
-            .holdings
-            .iter()
-            .position(|h| h.id == id)
-            .ok_or(LedgerError::ForgedHandle)?;
-        if self.holdings[idx].generation != generation {
-            return Err(LedgerError::StaleGeneration);
+    pub fn transfer(
+        &mut self,
+        handle: &HoldingHandle,
+        from: &SubjectId,
+        to: SubjectId,
+    ) -> Result<(), LedgerError> {
+        let h = self.resolve(handle)?;
+        if h.released_at.is_some() || &h.subject != from {
+            return Err(LedgerError::ForgedHandle);
         }
-        if self.holdings[idx].released_at.is_some() {
-            let decl = self
+        self.holdings
+            .iter_mut()
+            .find(|h| h.id == handle.id())
+            .unwrap()
+            .record
+            .subject = to;
+        Ok(())
+    }
+    pub fn release(&mut self, handle: &HoldingHandle, now: Timestamp) -> Result<(), LedgerError> {
+        let h = self.resolve(handle)?;
+        if h.released_at.is_some() {
+            return if self
                 .classes
-                .get(&self.holdings[idx].class_id)
-                .ok_or(LedgerError::UnknownClass)?;
-            return if decl.release_idempotent {
+                .get(&h.class_id)
+                .ok_or(LedgerError::UnknownClass)?
+                .release_idempotent
+            {
                 Ok(())
             } else {
                 Err(LedgerError::DoubleRelease)
             };
         }
-        if self.has_live_children(id) {
+        if self.live().any(|h| h.parent == Some(handle.id())) {
             return Err(LedgerError::TeardownOrder);
         }
-        self.holdings[idx].released_at = Some(now);
+        self.holdings
+            .iter_mut()
+            .find(|h| h.id == handle.id())
+            .unwrap()
+            .record
+            .released_at = Some(now);
         Ok(())
     }
-
-    pub fn renew(&mut self, id: u64, generation: &str, now: u64) -> Result<(), LedgerError> {
-        let decl_secs = {
-            let h = self
-                .holdings
-                .iter()
-                .find(|h| h.id == id && h.released_at.is_none())
-                .ok_or(LedgerError::ForgedHandle)?;
-            if h.generation != generation {
-                return Err(LedgerError::StaleGeneration);
-            }
-            self.classes
-                .get(&h.class_id)
-                .ok_or(LedgerError::UnknownClass)?
-                .lease_secs
+    pub fn renew(
+        &mut self,
+        handle: &HoldingHandle,
+        request: LeaseRequest,
+        now: Timestamp,
+    ) -> Result<Lease, LedgerError> {
+        let h = self.resolve(handle)?;
+        if h.released_at.is_some() {
+            return Err(LedgerError::ForgedHandle);
+        }
+        let decl = self
+            .classes
+            .get(&h.class_id)
+            .ok_or(LedgerError::UnknownClass)?;
+        let lease = if request == LeaseRequest::UseClassDefault && decl.lease_duration.is_none() {
+            h.lease // Historical heartbeat on classes without defaults preserves the override.
+        } else {
+            request.resolve(decl.lease_duration, h.parent.is_some(), now)?
         };
-        if let Some(s) = decl_secs {
-            let h = self.holdings.iter_mut().find(|h| h.id == id).unwrap();
-            h.lease_expires_at = Some(now + s);
-        }
-        Ok(())
+        self.holdings
+            .iter_mut()
+            .find(|h| h.id == handle.id())
+            .unwrap()
+            .record
+            .lease = lease;
+        Ok(lease)
     }
-
-    fn depth(&self, id: u64) -> usize {
-        let mut d = 0;
-        let mut cur = self.holdings.iter().find(|h| h.id == id).and_then(|h| h.parent);
-        while let Some(p) = cur {
-            d += 1;
-            cur = self.holdings.iter().find(|h| h.id == p).and_then(|h| h.parent);
+    fn depth(&self, id: HoldingId) -> usize {
+        let mut depth = 0;
+        let mut parent = self.holding(id).and_then(|h| h.parent);
+        while let Some(p) = parent {
+            depth += 1;
+            parent = self.holding(p).and_then(|h| h.parent);
         }
-        d
+        depth
     }
-
-    /// Lease sweeper — the involuntary path. Children first (depth desc).
-    ///
-    /// [B14] 租约为 `None` 的持有"仅随 parent 生命期"（schema.sql 注释）：父项租约到期时它们
-    /// 必须随之回收，否则 `TeardownOrder` 会把父项永远挡住——非自愿路径失效。故到期集取
-    /// **闭包**：到期持有 ∪ 其全部租约为 None 的后代（递归）。带自身未到期租约的后代不动，
-    /// 父项保守等待（子先于父不破）。
-    pub fn sweep(&mut self, now: u64) -> Vec<u64> {
-        let mut due: Vec<u64> = self
+    /// Expired parents wait for children with independent, unexpired leases.
+    pub fn sweep(&mut self, now: Timestamp) -> Vec<HoldingId> {
+        let mut due: BTreeSet<_> = self
             .live()
-            .filter(|h| matches!(h.lease_expires_at, Some(t) if t <= now))
+            .filter(|h| matches!(h.lease, Lease::Until(t) if t <= now))
             .map(|h| h.id)
             .collect();
-        let mut i = 0;
-        while i < due.len() {
-            let p = due[i];
-            let kids: Vec<u64> = self
+        loop {
+            let kids: Vec<_> = self
                 .live()
-                .filter(|h| h.parent == Some(p) && h.lease_expires_at.is_none() && !due.contains(&h.id))
+                .filter(|h| {
+                    h.lease == Lease::ParentBound && h.parent.is_some_and(|p| due.contains(&p))
+                })
                 .map(|h| h.id)
                 .collect();
+            let old = due.len();
             due.extend(kids);
-            i += 1;
+            if due.len() == old {
+                break;
+            }
         }
-        let mut order: Vec<(usize, u64, String)> = due
-            .iter()
-            .map(|id| {
-                let h = self.holdings.iter().find(|h| h.id == *id).expect("due id is live");
-                (self.depth(*id), *id, h.generation.clone())
-            })
+        self.release_order(due, now)
+    }
+    fn release_order(&mut self, ids: BTreeSet<HoldingId>, now: Timestamp) -> Vec<HoldingId> {
+        let mut order: Vec<_> = ids
+            .into_iter()
+            .map(|id| (self.depth(id), self.holding(id).unwrap().handle()))
             .collect();
         order.sort_by(|a, b| b.0.cmp(&a.0));
-        let mut released = Vec::new();
-        for (_, id, generation) in order {
-            if self.release(id, &generation, now).is_ok() {
-                released.push(id);
-            }
-        }
-        released
+        order
+            .into_iter()
+            .filter_map(|(_, h)| self.release(&h, now).ok().map(|_| h.id()))
+            .collect()
     }
-
-    /// crash-only 单路径：teardown(主体) 是唯一的回收路径；优雅卸载＝提前调用它。
-    /// Children before parents (reverse topological order on the ownership tree).
-    pub fn teardown(&mut self, subject: &str, now: u64) -> Vec<u64> {
-        let mut mine: Vec<(usize, u64, String)> = self
-            .live()
-            .filter(|h| h.subject == subject)
-            .map(|h| (self.depth(h.id), h.id, h.generation.clone()))
-            .collect();
-        mine.sort_by(|a, b| b.0.cmp(&a.0));
-        let mut plan = Vec::new();
-        for (_, id, generation) in mine {
-            if self.release(id, &generation, now).is_ok() {
-                plan.push(id);
-            }
-        }
-        plan
+    pub fn teardown(&mut self, subject: &SubjectId, now: Timestamp) -> Vec<HoldingId> {
+        self.release_order(
+            self.live()
+                .filter(|h| &h.subject == subject)
+                .map(|h| h.id)
+                .collect(),
+            now,
+        )
     }
-
-    /// Global invariant (recomputed, never cached in the drill):
-    /// for every (class, instance): ✓(● capacity · ◯ fold(live fragments)).
+    /// Includes orphan rows and the entire parent graph, not just capacity keys.
     pub fn invariant(&self) -> Result<(), LedgerError> {
-        for ((class_id, instance), cap) in &self.capacities {
-            let frags = self.live_frags(class_id, instance);
-            let outstanding = compose_frags(&frags)?;
-            if !frag_auth_valid(cap, &outstanding) {
+        let mut ids = BTreeSet::new();
+        for h in &self.holdings {
+            if !ids.insert(h.id) {
+                return Err(LedgerError::DuplicateId);
+            }
+            if h.generation.as_str().is_empty() {
+                return Err(LedgerError::InvalidGeneration);
+            }
+            let decl = self
+                .classes
+                .get(&h.class_id)
+                .ok_or(LedgerError::UnknownClass)?;
+            if h.frag.tag() != decl.algebra {
+                return Err(LedgerError::AlgebraMismatch);
+            }
+            if !h.frag.valid() {
+                return Err(LedgerError::InvalidValue);
+            }
+            if h.lease == Lease::ParentBound && h.parent.is_none() {
+                return Err(LedgerError::InvalidLease);
+            }
+            if h.released_at.is_none() && !self.capacities.contains_key(&h.key()) {
+                return Err(LedgerError::UnknownPool);
+            }
+            let mut ancestors = BTreeSet::from([h.id]);
+            let mut parent = h.parent;
+            while let Some(id) = parent {
+                if !ancestors.insert(id) {
+                    return Err(LedgerError::InvalidGraph);
+                }
+                let ph = self.holding(id).ok_or(LedgerError::InvalidGraph)?;
+                if h.released_at.is_none() && ph.released_at.is_some() {
+                    return Err(LedgerError::InvalidGraph);
+                }
+                parent = ph.parent;
+            }
+        }
+        for (key, cap) in &self.capacities {
+            let decl = self
+                .classes
+                .get(key.class())
+                .ok_or(LedgerError::UnknownClass)?;
+            if cap.tag() != decl.algebra {
+                return Err(LedgerError::AlgebraMismatch);
+            }
+            if !cap.valid() {
+                return Err(LedgerError::InvalidValue);
+            }
+            if !frag_auth_valid(cap, &compose_frags(&self.live_frags(key))?) {
                 return Err(LedgerError::Conflict);
             }
         }
         Ok(())
     }
-
-    /// Reconciliation against a substrate view: (instance, generation) pairs alive
-    /// underneath. Returns (decayed holdings, untracked substrate entries).
     pub fn reconcile(
         &self,
-        class_id: &str,
-        substrate: &[(String, String)],
-    ) -> (Vec<u64>, Vec<(String, String)>) {
+        class: &ClassId,
+        substrate: &[(InstanceId, Generation)],
+    ) -> (Vec<HoldingId>, Vec<(InstanceId, Generation)>) {
         let decayed = self
             .live()
-            .filter(|h| h.class_id == class_id)
             .filter(|h| {
-                !substrate
-                    .iter()
-                    .any(|(i, g)| *i == h.instance && *g == h.generation)
+                &h.class_id == class
+                    && !substrate
+                        .iter()
+                        .any(|(i, g)| i == &h.instance && g == &h.generation)
             })
             .map(|h| h.id)
             .collect();
@@ -509,13 +704,12 @@ impl Ledger {
             .filter(|(i, g)| {
                 !self
                     .live()
-                    .any(|h| h.class_id == class_id && h.instance == *i && h.generation == *g)
+                    .any(|h| &h.class_id == class && &h.instance == i && &h.generation == g)
             })
             .cloned()
             .collect();
         (decayed, untracked)
     }
-
     fn live_item(&self, h: &Holding) -> LiveItem {
         LiveItem {
             id: h.id,
@@ -523,56 +717,20 @@ impl Ledger {
             class_id: h.class_id.clone(),
             instance: h.instance.clone(),
             generation: h.generation.clone(),
-            grade: self
-                .classes
-                .get(&h.class_id)
-                .map(|d| d.revert_grade)
-                .unwrap_or(RevertGrade::External),
+            grade: self.classes[&h.class_id].revert_grade,
         }
     }
-
-    /// 主体名下的持有快照（含类声明的可逆档）——只看 subject 本人的行。
-    pub fn live_snapshot(&self, subject: &str) -> Vec<LiveItem> {
-        self.live().filter(|h| h.subject == subject).map(|h| self.live_item(h)).collect()
-    }
-
-    /// F2 规划器消费的视图：主体持有的 **ownership 闭包**——主体名下的持有及其全部后代，
-    /// 不论后代记在哪个主体名下。
-    ///
-    /// [B15] plugin-system 裁定 6-7／§5.3：父插件（或 enclosure）死 ⇒ 子插件的持有沿 ownership 树
-    /// 拆、子先于父。只按 subject 取快照会让规划器看不见跨主体子项：父项 release 被
-    /// `TeardownOrder` 拒绝，执行器把它当作账本不变量破坏而 panic。闭包让"子先于父"对整棵树成立。
-    pub fn live_closure(&self, subject: &str) -> Vec<LiveItem> {
-        let mut items: Vec<LiveItem> = self.live_snapshot(subject);
-        let mut i = 0;
-        while i < items.len() {
-            let p = items[i].id;
-            let kids: Vec<LiveItem> = self
-                .live()
-                .filter(|h| h.parent == Some(p) && !items.iter().any(|it| it.id == h.id))
-                .map(|h| self.live_item(h))
-                .collect();
-            items.extend(kids);
-            i += 1;
-        }
-        items
-    }
-
-    /// 子树闭包：`root` 本人及其全部后代（不论后代记在哪个主体名下）——与
-    /// [`live_closure`](Self::live_closure) 同纪律，只沿 ownership 边走。撤销（revoke）
-    /// 的清理域：能力入帐本后（WP-03），撤销一项授权＝释放它的持有子树——因该授权
-    /// 而存在的东西（池、路由）子先于父收掉，根最后；主体名下的其他持有不动。
-    pub fn live_subtree(&self, root: u64) -> Vec<LiveItem> {
-        let mut items: Vec<LiveItem> = self
-            .live()
-            .find(|h| h.id == root)
+    pub fn live_snapshot(&self, subject: &SubjectId) -> Vec<LiveItem> {
+        self.live()
+            .filter(|h| &h.subject == subject)
             .map(|h| self.live_item(h))
-            .into_iter()
-            .collect();
+            .collect()
+    }
+    fn closure(&self, mut items: Vec<LiveItem>) -> Vec<LiveItem> {
         let mut i = 0;
         while i < items.len() {
             let p = items[i].id;
-            let kids: Vec<LiveItem> = self
+            let kids: Vec<_> = self
                 .live()
                 .filter(|h| h.parent == Some(p) && !items.iter().any(|it| it.id == h.id))
                 .map(|h| self.live_item(h))
@@ -582,20 +740,49 @@ impl Ledger {
         }
         items
     }
-
+    pub fn live_closure(&self, subject: &SubjectId) -> Vec<LiveItem> {
+        self.closure(self.live_snapshot(subject))
+    }
+    pub fn live_subtree(&self, root: HoldingId) -> Vec<LiveItem> {
+        self.closure(
+            self.live()
+                .filter(|h| h.id == root)
+                .map(|h| self.live_item(h))
+                .collect(),
+        )
+    }
     pub fn live_count(&self) -> usize {
         self.live().count()
     }
     pub fn tombstone_count(&self) -> usize {
-        self.holdings.iter().filter(|h| h.released_at.is_some()).count()
+        self.holdings.len() - self.live_count()
     }
 }
 
-/// Deterministic pseudo-random generator for the law tests (no dependencies).
+/// Deterministic pseudo-random generator for the law tests.
 pub struct Lcg(pub u64);
 impl Lcg {
     pub fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         self.0 >> 33
     }
 }
+
+/// ```compile_fail
+/// use portos_rm::{ledger::Holding, identity::SubjectId};
+/// fn rewrite(mut h: Holding) { h.subject = SubjectId::new("other"); }
+/// ```
+/// ```compile_fail
+/// use portos_rm::{ledger::{LedgerBuilder, GrantRequest}, registry::PoolRef, ra::Count};
+/// fn unfinished(mut builder: LedgerBuilder, pool: &PoolRef<Count>, request: GrantRequest<Count>) {
+///     builder.grant(pool, request);
+/// }
+/// ```
+/// ```compile_fail
+/// use portos_rm::ledger::{Ledger, HoldingRecord};
+/// fn inject(l: &mut Ledger, row: HoldingRecord) { l.restore_row(row); }
+/// ```
+const _: () = ();

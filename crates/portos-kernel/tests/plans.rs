@@ -2,11 +2,14 @@
 //! (echo over ABI v2), mirroring the F3 laws by name. Each test opens a fresh
 //! kernel root, spawns echo plugins, and drives `PlanService`.
 
+use portos_kernel::Kernel;
 use portos_kernel::consent::ConsentRecord;
 use portos_kernel::host::Host;
 use portos_kernel::ledger::CLASS_FILE_LOCK;
+use portos_kernel::ledger::ExclusiveRequest;
 use portos_kernel::plans::{Outcome, PlanService};
-use portos_kernel::Kernel;
+use portos_rm::identity::{ClassId, Generation, InstanceId, ResourceKey, SubjectId};
+use portos_rm::time::{LeaseRequest, Timestamp};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,7 +25,10 @@ fn setup(tag: &str) -> (Arc<Kernel>, Host, PathBuf) {
 
 fn echo_bin() -> PathBuf {
     let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/portos-echo");
-    assert!(p.exists(), "portos-echo not built (run under cargo test --workspace)");
+    assert!(
+        p.exists(),
+        "portos-echo not built (run under cargo test --workspace)"
+    );
     p
 }
 
@@ -65,7 +71,9 @@ fn sign(kernel: &Kernel, plan_hash: &str, budget: &[(&str, u64)], ttl_secs: u64)
     let b: std::collections::BTreeMap<String, u64> =
         budget.iter().map(|(k, n)| (k.to_string(), *n)).collect();
     let root = kernel.root.clone();
-    portos_signer::Signer::load(&root).unwrap().sign(plan_hash, b, ttl_secs)
+    portos_signer::Signer::load(&root)
+        .unwrap()
+        .sign(plan_hash, b, ttl_secs)
 }
 
 fn wait_state(svc: &PlanService, run_id: &str, want: &str) {
@@ -75,7 +83,10 @@ fn wait_state(svc: &PlanService, run_id: &str, want: &str) {
         if state == want || state == "done" {
             return;
         }
-        assert!(std::time::Instant::now() < deadline, "run never reached {want}");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "run never reached {want}"
+        );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
@@ -92,7 +103,11 @@ fn wait_outcome(svc: &PlanService, run_id: &str) -> Outcome {
 }
 
 fn emissions(kernel: &Kernel, run_id: &str) -> u64 {
-    let conn = kernel.db.lock().unwrap();
+    let conn = rusqlite::Connection::open_with_flags(
+        kernel.root.join("kernel.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
     conn.query_row(
         "SELECT COUNT(*) FROM emission_log WHERE run_id = ?1",
         rusqlite::params![run_id],
@@ -127,7 +142,10 @@ fn wysiwys_tampered_plan_is_refused_with_zero_effects() {
     let mut forged = consent_a.clone();
     forged.budget.insert("echo::emit".into(), 99);
     let e = host.plans.start(&out_a.run_id, &forged).unwrap_err();
-    assert!(e.to_string().contains("MAC") || e.to_string().contains("mismatch"), "{e}");
+    assert!(
+        e.to_string().contains("MAC") || e.to_string().contains("mismatch"),
+        "{e}"
+    );
     assert_eq!(emissions(&kernel, &out_a.run_id), 0);
     assert_eq!(emissions(&kernel, &out_b.run_id), 0);
     assert_eq!(host.plans.run_state(&out_a.run_id).unwrap(), "admitted");
@@ -141,7 +159,10 @@ fn wysiwys_tampered_plan_is_refused_with_zero_effects() {
 fn admission_rejects_derived_budget_over_consent() {
     let (kernel, host, root) = setup("admit");
     spawn_echo(&host, "echo", &[]);
-    let out = host.plans.submit("user", &emit_times(&["a", "b", "c"])).unwrap();
+    let out = host
+        .plans
+        .submit("user", &emit_times(&["a", "b", "c"]))
+        .unwrap();
     let consent = sign(&kernel, &out.plan_hash, &[("echo::emit", 2)], 3600);
     let e = host.plans.start(&out.run_id, &consent).unwrap_err();
     assert!(e.to_string().contains("exceeds consent"), "{e}");
@@ -181,7 +202,10 @@ fn strict_bound_fail_stops_with_prefix_delivered() {
 fn truncate_reports_and_never_silent() {
     let (kernel, host, root) = setup("truncate");
     spawn_echo(&host, "echo", &[]);
-    let out = host.plans.submit("user", &foreach_plan(&["a", "b", "c"], 2, "truncate")).unwrap();
+    let out = host
+        .plans
+        .submit("user", &foreach_plan(&["a", "b", "c"], 2, "truncate"))
+        .unwrap();
     let consent = sign(&kernel, &out.plan_hash, &[("echo::emit", 2)], 3600);
     host.plans.start(&out.run_id, &consent).unwrap();
     let outcome = wait_outcome(&host.plans, &out.run_id);
@@ -190,7 +214,9 @@ fn truncate_reports_and_never_silent() {
     drop(host);
     let events = audit_events(&root);
     assert!(
-        events.iter().any(|e| e["event"] == "plan.truncated" && e["dropped"] == 1),
+        events
+            .iter()
+            .any(|e| e["event"] == "plan.truncated" && e["dropped"] == 1),
         "the truncation is audited: {events:?}"
     );
     let _ = std::fs::remove_dir_all(&root);
@@ -210,13 +236,19 @@ fn budget_is_rows_the_gate_refuses_at_capacity() {
     let outcome = wait_outcome(&host.plans, &out.run_id);
     assert!(matches!(outcome, Outcome::Completed), "{outcome:?}");
     let spent_subject = format!("{fiber}:spent");
-    let rows = kernel.ledger.live_snapshot(&spent_subject);
+    let rows = kernel
+        .ledger
+        .live_snapshot(&SubjectId::new(&spent_subject))
+        .unwrap();
     assert_eq!(rows.len(), 2, "one spend row per emission");
     // Rows survive a reopen: the pool continues where it was.
     let root2 = root.clone();
     drop(host);
     let kernel2 = Arc::new(Kernel::open(&root2).unwrap());
-    let rows2 = kernel2.ledger.live_snapshot(&spent_subject);
+    let rows2 = kernel2
+        .ledger
+        .live_snapshot(&SubjectId::new(&spent_subject))
+        .unwrap();
     assert_eq!(rows2.len(), 2, "spend rows reloaded");
     let host2 = Host::new(kernel2.clone(), &root2.join("sock")).unwrap();
     host2.shutdown_all();
@@ -234,7 +266,11 @@ fn withheld_batch_is_released_exactly_once_in_order_after_approval() {
     let consent = sign(&kernel, &out.plan_hash, &[("echo::emit", 2)], 3600);
     host.plans.start(&out.run_id, &consent).unwrap();
     wait_state(&host.plans, &out.run_id, "awaiting_approval");
-    assert_eq!(emissions(&kernel, &out.run_id), 0, "withheld effects are unseen");
+    assert_eq!(
+        emissions(&kernel, &out.run_id),
+        0,
+        "withheld effects are unseen"
+    );
     // Approve from a fresh process on the same root: everything it needs is
     // durable (buffer rows are fully evaluated).
     drop(host);
@@ -250,22 +286,37 @@ fn withheld_batch_is_released_exactly_once_in_order_after_approval() {
     assert_eq!(emissions(&kernel2, &out.run_id), 2, "released exactly once");
     // Original order, journaled as inserted.
     {
-        let conn = kernel2.db.lock().unwrap();
+        let conn = rusqlite::Connection::open_with_flags(
+            kernel2.root.join("kernel.sqlite"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
         let mut stmt = conn
             .prepare("SELECT args, state FROM suppression_buffer WHERE run_id = ?1 ORDER BY seq")
             .unwrap();
         let rows: Vec<(String, String)> = stmt
-            .query_map(rusqlite::params![out.run_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_map(rusqlite::params![out.run_id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .unwrap()
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(rows.len(), 2);
-        assert!(rows[0].0.contains("\"a\"") && rows[1].0.contains("\"b\""), "original order: {rows:?}");
-        assert!(rows.iter().all(|(_, s)| s == "inserted"), "journaled: {rows:?}");
+        assert!(
+            rows[0].0.contains("\"a\"") && rows[1].0.contains("\"b\""),
+            "original order: {rows:?}"
+        );
+        assert!(
+            rows.iter().all(|(_, s)| s == "inserted"),
+            "journaled: {rows:?}"
+        );
     }
     // A second approval with a replayed nonce is refused (one-time consent).
     let e = host2.plans.approve(&out.run_id, &approval).unwrap_err();
-    assert!(e.to_string().contains("not awaiting approval") || e.to_string().contains("stale nonce"), "{e}");
+    assert!(
+        e.to_string().contains("not awaiting approval") || e.to_string().contains("stale nonce"),
+        "{e}"
+    );
     host2.shutdown_all();
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -285,8 +336,15 @@ fn ttl_expiry_aborts_awaiting_approval_and_paused_alike() {
         std::thread::sleep(std::time::Duration::from_millis(2100));
         host.plans.expire(portos_kernel::db::now_unix());
         let outcome = wait_outcome(&host.plans, &out.run_id);
-        assert!(matches!(outcome, Outcome::Aborted { expired: true }), "{outcome:?}");
-        assert_eq!(emissions(&kernel, &out.run_id), 0, "the batch is dropped, never emitted");
+        assert!(
+            matches!(outcome, Outcome::Aborted { expired: true }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            emissions(&kernel, &out.run_id),
+            0,
+            "the batch is dropped, never emitted"
+        );
         host.shutdown_all();
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -294,14 +352,20 @@ fn ttl_expiry_aborts_awaiting_approval_and_paused_alike() {
     {
         let (kernel, host, root) = setup("ttl-paused");
         spawn_echo(&host, "echo", &[]);
-        let out = host.plans.submit("user", &foreach_plan(&["a", "b"], 1, "escalate")).unwrap();
+        let out = host
+            .plans
+            .submit("user", &foreach_plan(&["a", "b"], 1, "escalate"))
+            .unwrap();
         let consent = sign(&kernel, &out.plan_hash, &[("echo::emit", 2)], 1);
         host.plans.start(&out.run_id, &consent).unwrap();
         wait_state(&host.plans, &out.run_id, "paused");
         std::thread::sleep(std::time::Duration::from_millis(2100));
         host.plans.expire(portos_kernel::db::now_unix());
         let outcome = wait_outcome(&host.plans, &out.run_id);
-        assert!(matches!(outcome, Outcome::Aborted { expired: true }), "{outcome:?}");
+        assert!(
+            matches!(outcome, Outcome::Aborted { expired: true }),
+            "{outcome:?}"
+        );
         host.shutdown_all();
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -315,11 +379,18 @@ fn escalate_pauses_and_resumes_exactly_with_fresh_consent() {
     let (kernel, host, root) = setup("escalate");
     spawn_echo(&host, "echo", &[]);
     // bound 2 over 3 items, escalate: the loop pauses at the bound check.
-    let out = host.plans.submit("user", &foreach_plan(&["a", "b", "c"], 2, "escalate")).unwrap();
+    let out = host
+        .plans
+        .submit("user", &foreach_plan(&["a", "b", "c"], 2, "escalate"))
+        .unwrap();
     let consent = sign(&kernel, &out.plan_hash, &[("echo::emit", 2)], 3600);
     host.plans.start(&out.run_id, &consent).unwrap();
     wait_state(&host.plans, &out.run_id, "paused");
-    assert_eq!(emissions(&kernel, &out.run_id), 0, "paused before any emission");
+    assert_eq!(
+        emissions(&kernel, &out.run_id),
+        0,
+        "paused before any emission"
+    );
 
     // Resume with an empty pool: the first two items spend the original
     // budget, the third finds every live pool spent and parks again.
@@ -327,14 +398,22 @@ fn escalate_pauses_and_resumes_exactly_with_fresh_consent() {
     host.plans.resume(&out.run_id, &inc_empty).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(400));
     assert_eq!(host.plans.run_state(&out.run_id).unwrap(), "paused");
-    assert_eq!(emissions(&kernel, &out.run_id), 2, "the original pool bought exactly two");
+    assert_eq!(
+        emissions(&kernel, &out.run_id),
+        2,
+        "the original pool bought exactly two"
+    );
 
     // Resume with one more unit: the remaining item completes the plan.
     let inc_one = sign(&kernel, &out.plan_hash, &[("echo::emit", 1)], 3600);
     host.plans.resume(&out.run_id, &inc_one).unwrap();
     let outcome = wait_outcome(&host.plans, &out.run_id);
     assert!(matches!(outcome, Outcome::Completed), "{outcome:?}");
-    assert_eq!(emissions(&kernel, &out.run_id), 3, "each item emitted exactly once");
+    assert_eq!(
+        emissions(&kernel, &out.run_id),
+        3,
+        "each item emitted exactly once"
+    );
     host.shutdown_all();
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -349,23 +428,52 @@ fn segment_abort_rolls_back_subscriptions_and_holds_made_by_the_run() {
     // Abort case: the run fail-stops; its seg holdings must go. They are
     // staged before the start so the teardown deterministically covers them
     // (the drill stages acquisitions the same way).
-    let out = host.plans.submit("user", &foreach_plan(&["a", "b", "c"], 2, "strict")).unwrap();
+    let out = host
+        .plans
+        .submit("user", &foreach_plan(&["a", "b", "c"], 2, "strict"))
+        .unwrap();
     let fiber = format!("plan:{}#{}", out.plan_hash, out.run_id);
     let seg = format!("{fiber}:seg");
     let lock = root.join("run.lock");
     std::fs::write(&lock, b"x").unwrap();
-    let (_sub_id, _rx) = host.subscribe_for(&seg, "t::*");
+    let (_sub_id, _rx) = host.subscribe_for(&seg, "t::*").unwrap();
     kernel
         .ledger
-        .hold_substrate(&seg, CLASS_FILE_LOCK, lock.to_str().unwrap(), "lk", None, &json!({}), None, portos_kernel::db::now_unix())
+        .hold_substrate(
+            ExclusiveRequest {
+                owner: SubjectId::new(&seg),
+                resource: ResourceKey::new(
+                    ClassId::new(CLASS_FILE_LOCK),
+                    InstanceId::new(lock.to_str().unwrap()),
+                ),
+                generation: Generation::new("lk"),
+                parent: None,
+                lease: LeaseRequest::UseClassDefault,
+            },
+            &json!({}),
+            Timestamp::try_from(portos_kernel::db::now_unix()).unwrap(),
+        )
+        .map(|h| h.id())
         .unwrap();
-    assert_eq!(kernel.ledger.live_snapshot(&seg).len(), 2, "sub + lock staged in the segment");
+    assert_eq!(
+        kernel
+            .ledger
+            .live_snapshot(&SubjectId::new(&seg))
+            .unwrap()
+            .len(),
+        2,
+        "sub + lock staged in the segment"
+    );
     let consent = sign(&kernel, &out.plan_hash, &[("echo::emit", 2)], 3600);
     host.plans.start(&out.run_id, &consent).unwrap();
     let outcome = wait_outcome(&host.plans, &out.run_id);
     assert!(matches!(outcome, Outcome::FailStop { .. }), "{outcome:?}");
     assert!(
-        kernel.ledger.live_snapshot(&seg).is_empty(),
+        kernel
+            .ledger
+            .live_snapshot(&SubjectId::new(&seg))
+            .unwrap()
+            .is_empty(),
         "the segment was rolled back on fail-stop"
     );
     assert!(!lock.exists(), "the lock file went with the segment");
@@ -374,29 +482,41 @@ fn segment_abort_rolls_back_subscriptions_and_holds_made_by_the_run() {
     let out2 = host.plans.submit("user", &emit_once("ok")).unwrap();
     let fiber2 = format!("plan:{}#{}", out2.plan_hash, out2.run_id);
     let seg2 = format!("{fiber2}:seg");
-    let (_s2, _r2) = host.subscribe_for(&seg2, "t::*");
+    let (_s2, _r2) = host.subscribe_for(&seg2, "t::*").unwrap();
     let consent2 = sign(&kernel, &out2.plan_hash, &[("echo::emit", 1)], 3600);
     host.plans.start(&out2.run_id, &consent2).unwrap();
     let outcome2 = wait_outcome(&host.plans, &out2.run_id);
     assert!(matches!(outcome2, Outcome::Completed), "{outcome2:?}");
-    let moved = kernel.ledger.live_snapshot(&fiber2);
+    let moved = kernel
+        .ledger
+        .live_snapshot(&SubjectId::new(&fiber2))
+        .unwrap();
     assert_eq!(
         moved.len(),
         2,
         "the transferred subscription plus the fiber's own cap holding (WP-03)"
     );
     assert!(
-        moved.iter().any(|it| it.class_id == "kernel/subscription"),
+        moved
+            .iter()
+            .any(|it| it.class_id.as_str() == "kernel/subscription"),
         "the subscription was transferred to the fiber"
     );
-    assert!(kernel.ledger.live_snapshot(&seg2).is_empty());
+    assert!(
+        kernel
+            .ledger
+            .live_snapshot(&SubjectId::new(&seg2))
+            .unwrap()
+            .is_empty()
+    );
     host.shutdown_all();
     let _ = std::fs::remove_dir_all(&root);
 }
 
 /// The audit chain covers a whole run and replays (m0 accept_5).
 #[test]
-fn audit_chain_replays_a_run() {    let (kernel, host, root) = setup("audit");
+fn audit_chain_replays_a_run() {
+    let (kernel, host, root) = setup("audit");
     spawn_echo(&host, "echo", &[]);
     let out = host.plans.submit("user", &emit_times(&["a", "b"])).unwrap();
     let consent = sign(&kernel, &out.plan_hash, &[("echo::emit", 2)], 3600);
@@ -406,10 +526,15 @@ fn audit_chain_replays_a_run() {    let (kernel, host, root) = setup("audit");
     drop(host);
     let events = audit_events(&root);
     for want in ["plan.admitted", "plan.started", "plan.finished"] {
-        assert!(events.iter().any(|e| e["event"] == want), "missing {want}: {events:?}");
+        assert!(
+            events.iter().any(|e| e["event"] == want),
+            "missing {want}: {events:?}"
+        );
     }
     assert!(
-        events.iter().any(|e| e["event"] == "plan.finished" && e["status"] == "Completed"),
+        events
+            .iter()
+            .any(|e| e["event"] == "plan.finished" && e["status"] == "Completed"),
         "the finished event carries the status: {events:?}"
     );
     let _ = std::fs::remove_dir_all(&root);
@@ -422,7 +547,8 @@ fn audit_chain_replays_a_run() {    let (kernel, host, root) = setup("audit");
 fn pure_evaluation_runs_in_the_compute_plugin() {
     let (kernel, host, root) = setup("pure");
     spawn_echo(&host, "echo", &[]);
-    let compute_bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/portos-compute");
+    let compute_bin =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/portos-compute");
     assert!(compute_bin.exists(), "portos-compute not built");
     host.spawn(&compute_bin, &[], &[]).unwrap();
     let bytes = plan(json!({"stmts": [

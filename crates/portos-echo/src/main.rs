@@ -178,9 +178,9 @@ fn main() -> std::io::Result<()> {
                     let pid = child.id();
                     children_by_call.lock().unwrap().push(child);
                     let instance = format!("{plugin_name}/{pid}");
-                    let (id, generation) =
+                    let holding =
                         client.hold("kernel/process", &instance, json!({"pid": pid}), None)?;
-                    Ok(json!({"pid": pid, "holding": id, "generation": generation}))
+                    Ok(json!({"pid": pid, "holding": holding.id, "generation": holding.generation}))
                 }
                 // two-layer naming demo: refs are driver-session-local,
                 // volatile, and never enter the kernel handle table.

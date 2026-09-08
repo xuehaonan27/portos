@@ -53,7 +53,7 @@ pub struct Kernel {
     pub audit: Arc<Mutex<audit::AuditLog>>,
     pub consent_key: consent::ConsentKey,
     /// The shared SQLite connection (holdings, journal, substrate, plan runs).
-    pub db: Arc<Mutex<rusqlite::Connection>>,
+    pub(crate) db: Arc<Mutex<rusqlite::Connection>>,
 }
 
 impl Kernel {
@@ -65,7 +65,6 @@ impl Kernel {
         let (ledger, report) = ledger::LedgerStore::open(db.clone())?;
         let ledger = Arc::new(ledger);
         let caps = caps::CapStore::new(db.clone(), ledger.clone());
-        caps.rebuild_pools()?;
         let audit = Arc::new(Mutex::new(audit::AuditLog::open(root)?));
         if report.stale_rows > 0 || !report.substrate.is_empty() {
             let _ = audit.lock().unwrap().append(serde_json::json!({

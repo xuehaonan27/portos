@@ -30,8 +30,14 @@
 //!
 //! 法则见 tests/f8_attach.rs（每个测试名＝它执行的定理/纪律）。
 
+use crate::identity::{
+    ClassId, Generation, HoldingHandle, HoldingId, InstanceId, ResourceKey, SubjectId,
+};
+use crate::ledger::GrantRequest;
 use crate::ledger::{AlgebraTag, ClassDecl, Frag, Ledger, LedgerError, RevertGrade};
 use crate::ra::{Count, Ex};
+use crate::registry::{Capacity, Claim};
+use crate::time::{LeaseDuration, LeaseRequest, Timestamp};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// [Q12] 内核加入的合成效应类：每次触发花费 1，池容量＝n_max。
@@ -66,7 +72,9 @@ impl Budget {
     }
     /// F5 application 规则：`scale(N, body) = numeral(N) ~ body`（逐分量乘）。
     pub fn scale(&self, n: u64) -> Option<Budget> {
-        let scaled: Option<BTreeMap<_, _>> = self.0.iter()
+        let scaled: Option<BTreeMap<_, _>> = self
+            .0
+            .iter()
             .map(|(k, v)| v.checked_mul(n).map(|amount| (k.clone(), amount)))
             .collect();
         scaled.map(Budget)
@@ -118,9 +126,20 @@ impl Declaration {
     pub fn h_attach(&self) -> String {
         let canonical = format!(
             "id={};plan={};trigger={:?};pre={};budget={:?};n_max={};ttl={};table={};min={};depth={};overflow={:?};k={};cap={};nonce={}",
-            self.id, self.h_plan, self.trigger, self.require_integrity, self.budget_firing.0, self.n_max,
-            self.ttl, self.h_table, self.min_interval, self.queue_depth, self.overflow, self.failure_budget,
-            self.run_cap, self.nonce
+            self.id,
+            self.h_plan,
+            self.trigger,
+            self.require_integrity,
+            self.budget_firing.0,
+            self.n_max,
+            self.ttl,
+            self.h_table,
+            self.min_interval,
+            self.queue_depth,
+            self.overflow,
+            self.failure_budget,
+            self.run_cap,
+            self.nonce
         );
         fnv(canonical.as_bytes())
     }
@@ -210,13 +229,24 @@ pub struct Run {
 
 impl Run {
     pub fn ok(effects: &[(&str, u64)], emits: u64) -> Self {
-        Run { effects: effects.iter().map(|(c, n)| (c.to_string(), *n)).collect(), emits, end: End::Completed, crash: None }
+        Run {
+            effects: effects.iter().map(|(c, n)| (c.to_string(), *n)).collect(),
+            emits,
+            end: End::Completed,
+            crash: None,
+        }
     }
     pub fn fail(effects: &[(&str, u64)], emits: u64) -> Self {
-        Run { end: End::FailStop, ..Run::ok(effects, emits) }
+        Run {
+            end: End::FailStop,
+            ..Run::ok(effects, emits)
+        }
     }
     pub fn crash(c: Crash) -> Self {
-        Run { crash: Some(c), ..Run::ok(&[], 0) }
+        Run {
+            crash: Some(c),
+            ..Run::ok(&[], 0)
+        }
     }
 }
 
@@ -246,19 +276,60 @@ pub enum Reject {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Audit {
-    Attached { id: String, h_attach: String },
-    Fired { id: String, seq: u64, nonce: String },
-    Settled { id: String, seq: u64, end: End },
-    Rejected { id: String, why: Reject },
-    Dropped { id: String, policy: Overflow, dropped: u64 },
-    Coalesced { id: String, missed: u64 },
-    Paused { id: String, status: Status },
-    Resumed { id: String },
-    Detached { id: String, why: String },
-    Expired { id: String },
-    RecoveredEmpty { id: String, seq: u64 },
-    Withdrawn { id: String, seq: u64, events: u64 },
-    TableChanged { id: String, h_table: String },
+    Attached {
+        id: String,
+        h_attach: String,
+    },
+    Fired {
+        id: String,
+        seq: u64,
+        nonce: String,
+    },
+    Settled {
+        id: String,
+        seq: u64,
+        end: End,
+    },
+    Rejected {
+        id: String,
+        why: Reject,
+    },
+    Dropped {
+        id: String,
+        policy: Overflow,
+        dropped: u64,
+    },
+    Coalesced {
+        id: String,
+        missed: u64,
+    },
+    Paused {
+        id: String,
+        status: Status,
+    },
+    Resumed {
+        id: String,
+    },
+    Detached {
+        id: String,
+        why: String,
+    },
+    Expired {
+        id: String,
+    },
+    RecoveredEmpty {
+        id: String,
+        seq: u64,
+    },
+    Withdrawn {
+        id: String,
+        seq: u64,
+        events: u64,
+    },
+    TableChanged {
+        id: String,
+        h_table: String,
+    },
     Crashed,
     Recovered,
 }
@@ -285,7 +356,7 @@ pub struct AttachState {
     pub h_attach: String,
     pub status: Status,
     pub consecutive_failures: u64,
-    pub root: u64,
+    pub root: HoldingId,
     pub last_fire_at: Option<u64>,
     pub last_tick: u64,
     pub firings: Vec<FiringRecord>,
@@ -295,7 +366,7 @@ pub struct AttachState {
 struct InFlight {
     seq: u64,
     seg_subject: String,
-    seg_holding: u64,
+    seg_holding: HoldingId,
     quad: Quad,
 }
 
@@ -363,19 +434,74 @@ impl Scheduler {
             (CLASS_INBOX, AlgebraTag::Exclusive, None),
             (CLASS_USER_ROOT, AlgebraTag::Exclusive, None),
         ] {
-            ledger.register_class(ClassDecl {
-                class_id: cid.into(),
-                algebra,
-                release_idempotent: true,
-                lease_secs: lease,
-                revert_grade: RevertGrade::Inverse,
-            });
+            ledger
+                .register_class(ClassDecl {
+                    class_id: cid.into(),
+                    algebra,
+                    release_idempotent: true,
+                    lease_duration: lease.map(|s: u64| LeaseDuration::try_from(s).unwrap()),
+                    revert_grade: RevertGrade::Inverse,
+                })
+                .unwrap();
         }
         // powerbox 主体的根持有与收件箱（归消费方 user，与任何附着的生死无关——Q1）。
-        ledger.set_capacity(CLASS_USER_ROOT, USER, Frag::Ex(Ex::Token));
-        let user_root = ledger.grant(USER, CLASS_USER_ROOT, USER, Frag::Ex(Ex::Token), "g", None, 0).unwrap();
-        ledger.set_capacity(CLASS_INBOX, USER_INBOX, Frag::Ex(Ex::Token));
-        ledger.grant(USER, CLASS_INBOX, USER_INBOX, Frag::Ex(Ex::Token), "g", Some(user_root), 0).unwrap();
+        ledger
+            .create_pool(
+                &ledger
+                    .registered_class::<Ex>(&ClassId::new(CLASS_USER_ROOT))
+                    .unwrap(),
+                InstanceId::new(USER),
+                Capacity::new(Ex::Token).unwrap(),
+            )
+            .unwrap();
+        let user_root = ledger
+            .grant(
+                &ledger
+                    .pool::<Ex>(&ResourceKey::new(
+                        ClassId::new(CLASS_USER_ROOT),
+                        InstanceId::new(USER),
+                    ))
+                    .unwrap(),
+                GrantRequest {
+                    owner: SubjectId::new(USER),
+                    claim: Claim::new(Ex::Token).unwrap(),
+                    generation: Generation::new("g"),
+                    parent: None,
+                    lease: LeaseRequest::UseClassDefault,
+                    now: Timestamp::try_from(0u64).unwrap(),
+                },
+            )
+            .map(|h| h.id())
+            .unwrap();
+        ledger
+            .create_pool(
+                &ledger
+                    .registered_class::<Ex>(&ClassId::new(CLASS_INBOX))
+                    .unwrap(),
+                InstanceId::new(USER_INBOX),
+                Capacity::new(Ex::Token).unwrap(),
+            )
+            .unwrap();
+        ledger
+            .grant(
+                &ledger
+                    .pool::<Ex>(&ResourceKey::new(
+                        ClassId::new(CLASS_INBOX),
+                        InstanceId::new(USER_INBOX),
+                    ))
+                    .unwrap(),
+                GrantRequest {
+                    owner: SubjectId::new(USER),
+                    claim: Claim::new(Ex::Token).unwrap(),
+                    generation: Generation::new("g"),
+                    parent: Some(user_root)
+                        .map(|id| ledger.holding(id).expect("parent exists").handle()),
+                    lease: LeaseRequest::UseClassDefault,
+                    now: Timestamp::try_from(0u64).unwrap(),
+                },
+            )
+            .map(|h| h.id())
+            .unwrap();
         Scheduler {
             ledger,
             attachments: BTreeMap::new(),
@@ -390,10 +516,10 @@ impl Scheduler {
         }
     }
 
-    fn user_root(&self) -> u64 {
+    fn user_root(&self) -> HoldingId {
         self.ledger
             .live()
-            .find(|h| h.class_id == CLASS_USER_ROOT)
+            .find(|h| h.class_id.as_str() == CLASS_USER_ROOT)
             .map(|h| h.id)
             .expect("user root")
     }
@@ -408,50 +534,176 @@ impl Scheduler {
         let id = decl.id.clone();
         let h_attach = decl.h_attach();
         // ① 附着池：B_total = scale(n_max, B_firing) ⊕ attach::fire = n_max。
-        let total = decl.budget_firing.scale(decl.n_max).ok_or(AttachError::BudgetOverflow)?;
-        for (class, cap) in total.0.iter().chain(std::iter::once((&FIRE_CLASS.to_string(), &decl.n_max))) {
+        let total = decl
+            .budget_firing
+            .scale(decl.n_max)
+            .ok_or(AttachError::BudgetOverflow)?;
+        for (class, cap) in total
+            .0
+            .iter()
+            .chain(std::iter::once((&FIRE_CLASS.to_string(), &decl.n_max)))
+        {
             self.ledger
-                .set_capacity(CLASS_POOL, &pool_instance(&id, class), Frag::Count(Count::Value(*cap)));
+                .create_pool(
+                    &self
+                        .ledger
+                        .registered_class::<Count>(&ClassId::new(CLASS_POOL))
+                        .unwrap(),
+                    InstanceId::new(&pool_instance(&id, class)),
+                    Capacity::new(Count::Value(*cap)).unwrap(),
+                )
+                .unwrap();
             self.cached_outstanding.insert(pool_instance(&id, class), 0);
         }
         // 根持有：类＝声明含 T（租约＝ttl）。
-        self.ledger.register_class(ClassDecl {
-            class_id: root_class(&id),
-            algebra: AlgebraTag::Exclusive,
-            release_idempotent: true,
-            lease_secs: Some(decl.ttl),
-            revert_grade: RevertGrade::Inverse,
-        });
-        self.ledger.set_capacity(&root_class(&id), &id, Frag::Ex(Ex::Token));
+        self.ledger
+            .register_class(ClassDecl {
+                class_id: root_class(&id).into(),
+                algebra: AlgebraTag::Exclusive,
+                release_idempotent: true,
+                lease_duration: Some(decl.ttl).map(|s: u64| LeaseDuration::try_from(s).unwrap()),
+                revert_grade: RevertGrade::Inverse,
+            })
+            .unwrap();
+        self.ledger
+            .create_pool(
+                &self
+                    .ledger
+                    .registered_class::<Ex>(&ClassId::new(&root_class(&id)))
+                    .unwrap(),
+                InstanceId::new(&id),
+                Capacity::new(Ex::Token).unwrap(),
+            )
+            .unwrap();
         let subject = attach_subject(&id);
-        self.ledger.declare_instantiation(&subject, USER);
+        self.ledger
+            .declare_instantiation(SubjectId::new(&subject), SubjectId::new(USER));
         let user_root = self.user_root();
         let root = self
             .ledger
-            .grant(&subject, &root_class(&id), &id, Frag::Ex(Ex::Token), &h_attach, Some(user_root), now)
+            .grant(
+                &self
+                    .ledger
+                    .pool::<Ex>(&ResourceKey::new(
+                        ClassId::new(&root_class(&id)),
+                        InstanceId::new(&id),
+                    ))
+                    .unwrap(),
+                GrantRequest {
+                    owner: SubjectId::new(&subject),
+                    claim: Claim::new(Ex::Token).unwrap(),
+                    generation: Generation::new(&h_attach),
+                    parent: Some(user_root)
+                        .map(|id| self.ledger.holding(id).expect("parent exists").handle()),
+                    lease: LeaseRequest::UseClassDefault,
+                    now: Timestamp::try_from(now).unwrap(),
+                },
+            )
+            .map(|h| h.id())
             .map_err(AttachError::Ledger)?;
         // 触发器持有（租约 None、随根走）。
         match &decl.trigger {
             Trigger::Topic { topic } => {
                 let inst = format!("{id}/{topic}");
-                self.ledger.set_capacity(CLASS_SUB, &inst, Frag::Ex(Ex::Token));
                 self.ledger
-                    .grant(&subject, CLASS_SUB, &inst, Frag::Ex(Ex::Token), "g", Some(root), now)
+                    .create_pool(
+                        &self
+                            .ledger
+                            .registered_class::<Ex>(&ClassId::new(CLASS_SUB))
+                            .unwrap(),
+                        InstanceId::new(&inst),
+                        Capacity::new(Ex::Token).unwrap(),
+                    )
+                    .unwrap();
+                self.ledger
+                    .grant(
+                        &self
+                            .ledger
+                            .pool::<Ex>(&ResourceKey::new(
+                                ClassId::new(CLASS_SUB),
+                                InstanceId::new(&inst),
+                            ))
+                            .unwrap(),
+                        GrantRequest {
+                            owner: SubjectId::new(&subject),
+                            claim: Claim::new(Ex::Token).unwrap(),
+                            generation: Generation::new("g"),
+                            parent: Some(root)
+                                .map(|id| self.ledger.holding(id).expect("parent exists").handle()),
+                            lease: LeaseRequest::UseClassDefault,
+                            now: Timestamp::try_from(now).unwrap(),
+                        },
+                    )
+                    .map(|h| h.id())
                     .map_err(AttachError::Ledger)?;
             }
             Trigger::Timer { .. } => {
-                self.ledger.set_capacity(CLASS_TIMER, &id, Frag::Ex(Ex::Token));
                 self.ledger
-                    .grant(&subject, CLASS_TIMER, &id, Frag::Ex(Ex::Token), "g", Some(root), now)
+                    .create_pool(
+                        &self
+                            .ledger
+                            .registered_class::<Ex>(&ClassId::new(CLASS_TIMER))
+                            .unwrap(),
+                        InstanceId::new(&id),
+                        Capacity::new(Ex::Token).unwrap(),
+                    )
+                    .unwrap();
+                self.ledger
+                    .grant(
+                        &self
+                            .ledger
+                            .pool::<Ex>(&ResourceKey::new(
+                                ClassId::new(CLASS_TIMER),
+                                InstanceId::new(&id),
+                            ))
+                            .unwrap(),
+                        GrantRequest {
+                            owner: SubjectId::new(&subject),
+                            claim: Claim::new(Ex::Token).unwrap(),
+                            generation: Generation::new("g"),
+                            parent: Some(root)
+                                .map(|id| self.ledger.holding(id).expect("parent exists").handle()),
+                            lease: LeaseRequest::UseClassDefault,
+                            now: Timestamp::try_from(now).unwrap(),
+                        },
+                    )
+                    .map(|h| h.id())
                     .map_err(AttachError::Ledger)?;
             }
             Trigger::Manual => {}
         }
         // 投递路由（到 user/inbox）。
         let route_inst = format!("{id}->{USER_INBOX}");
-        self.ledger.set_capacity(CLASS_ROUTE, &route_inst, Frag::Ex(Ex::Token));
         self.ledger
-            .grant(&subject, CLASS_ROUTE, &route_inst, Frag::Ex(Ex::Token), "g", Some(root), now)
+            .create_pool(
+                &self
+                    .ledger
+                    .registered_class::<Ex>(&ClassId::new(CLASS_ROUTE))
+                    .unwrap(),
+                InstanceId::new(&route_inst),
+                Capacity::new(Ex::Token).unwrap(),
+            )
+            .unwrap();
+        self.ledger
+            .grant(
+                &self
+                    .ledger
+                    .pool::<Ex>(&ResourceKey::new(
+                        ClassId::new(CLASS_ROUTE),
+                        InstanceId::new(&route_inst),
+                    ))
+                    .unwrap(),
+                GrantRequest {
+                    owner: SubjectId::new(&subject),
+                    claim: Claim::new(Ex::Token).unwrap(),
+                    generation: Generation::new("g"),
+                    parent: Some(root)
+                        .map(|id| self.ledger.holding(id).expect("parent exists").handle()),
+                    lease: LeaseRequest::UseClassDefault,
+                    now: Timestamp::try_from(now).unwrap(),
+                },
+            )
+            .map(|h| h.id())
             .map_err(AttachError::Ledger)?;
         self.attachments.insert(
             id.clone(),
@@ -467,7 +719,10 @@ impl Scheduler {
             },
         );
         self.queues.insert(id.clone(), VecDeque::new());
-        self.audit.push(Audit::Attached { id: id.clone(), h_attach });
+        self.audit.push(Audit::Attached {
+            id: id.clone(),
+            h_attach,
+        });
         Ok(id)
     }
 
@@ -486,7 +741,14 @@ impl Scheduler {
             .map(|a| a.decl.id.clone())
             .collect();
         for id in ids {
-            self.enqueue(&id, Event { at: now, integrity_ok, missed: 0 });
+            self.enqueue(
+                &id,
+                Event {
+                    at: now,
+                    integrity_ok,
+                    missed: 0,
+                },
+            );
         }
     }
 
@@ -507,18 +769,33 @@ impl Scheduler {
                     last.missed += 1 + ev.missed;
                     last.at = ev.at;
                 }
-                self.audit.push(Audit::Coalesced { id: id.to_string(), missed: 1 });
+                self.audit.push(Audit::Coalesced {
+                    id: id.to_string(),
+                    missed: 1,
+                });
             }
             Overflow::DropOldest => {
                 q.pop_front();
                 q.push_back(ev);
-                self.audit.push(Audit::Dropped { id: id.to_string(), policy, dropped: 1 });
+                self.audit.push(Audit::Dropped {
+                    id: id.to_string(),
+                    policy,
+                    dropped: 1,
+                });
             }
             Overflow::DropNewest => {
-                self.audit.push(Audit::Dropped { id: id.to_string(), policy, dropped: 1 });
+                self.audit.push(Audit::Dropped {
+                    id: id.to_string(),
+                    policy,
+                    dropped: 1,
+                });
             }
             Overflow::FailStop => {
-                self.audit.push(Audit::Dropped { id: id.to_string(), policy, dropped: 1 });
+                self.audit.push(Audit::Dropped {
+                    id: id.to_string(),
+                    policy,
+                    dropped: 1,
+                });
                 self.pause(id, Status::PausedFailure);
             }
         }
@@ -528,7 +805,10 @@ impl Scheduler {
         if let Some(a) = self.attachments.get_mut(id) {
             if !a.status.is_terminal() && a.status != status {
                 a.status = status;
-                self.audit.push(Audit::Paused { id: id.to_string(), status });
+                self.audit.push(Audit::Paused {
+                    id: id.to_string(),
+                    status,
+                });
             }
         }
     }
@@ -540,7 +820,7 @@ impl Scheduler {
     /// 推进时钟：租约 sweep（唯一到期路径，[LEASE]）＋ Timer 节拍入队。
     pub fn tick(&mut self, now: u64) {
         assert!(!self.crashed, "recover() first");
-        let released = self.ledger.sweep(now);
+        let released = self.ledger.sweep(Timestamp::try_from(now).unwrap());
         let expired: Vec<String> = self
             .attachments
             .values()
@@ -570,7 +850,14 @@ impl Scheduler {
                 }
             };
             if due {
-                self.enqueue(&id, Event { at: now, integrity_ok: true, missed: 0 });
+                self.enqueue(
+                    &id,
+                    Event {
+                        at: now,
+                        integrity_ok: true,
+                        missed: 0,
+                    },
+                );
             }
         }
     }
@@ -589,7 +876,7 @@ impl Scheduler {
         let inst = pool_instance(id, FIRE_CLASS);
         self.ledger
             .live()
-            .filter(|h| h.class_id == CLASS_POOL && h.instance == inst)
+            .filter(|h| h.class_id.as_str() == CLASS_POOL && h.instance.as_str() == inst)
             .count() as u64
     }
 
@@ -607,12 +894,22 @@ impl Scheduler {
 
     fn begin_with(&mut self, id: &str, now: u64, crash: Option<Crash>) -> Result<u64, Reject> {
         assert!(!self.crashed, "recover() first");
-        let (status, trigger, min_interval, last_fire, require_integrity) = match self.attachments.get(id) {
-            Some(a) => (a.status, a.decl.trigger.clone(), a.decl.min_interval, a.last_fire_at, a.decl.require_integrity),
-            None => return Err(Reject::Unknown),
-        };
+        let (status, trigger, min_interval, last_fire, require_integrity) =
+            match self.attachments.get(id) {
+                Some(a) => (
+                    a.status,
+                    a.decl.trigger.clone(),
+                    a.decl.min_interval,
+                    a.last_fire_at,
+                    a.decl.require_integrity,
+                ),
+                None => return Err(Reject::Unknown),
+            };
         let reject = |me: &mut Self, why: Reject| {
-            me.audit.push(Audit::Rejected { id: id.to_string(), why: why.clone() });
+            me.audit.push(Audit::Rejected {
+                id: id.to_string(),
+                why: why.clone(),
+            });
             Err(why)
         };
         if status != Status::Active {
@@ -639,15 +936,27 @@ impl Scheduler {
         let seq = self.next_seq(id);
         let spent = spent_subject(id);
         let generation = format!("seq:{seq}");
-        let fire_row = match self.ledger.grant(
-            &spent,
-            CLASS_POOL,
-            &pool_instance(id, FIRE_CLASS),
-            Frag::Count(Count::Value(1)),
-            &generation,
-            None,
-            now,
-        ) {
+        let fire_row = match self
+            .ledger
+            .grant(
+                &self
+                    .ledger
+                    .pool::<Count>(&ResourceKey::new(
+                        ClassId::new(CLASS_POOL),
+                        InstanceId::new(&pool_instance(id, FIRE_CLASS)),
+                    ))
+                    .unwrap(),
+                GrantRequest {
+                    owner: SubjectId::new(&spent),
+                    claim: Claim::new(Count::Value(1)).unwrap(),
+                    generation: Generation::new(&generation),
+                    parent: None,
+                    lease: LeaseRequest::UseClassDefault,
+                    now: Timestamp::try_from(now).unwrap(),
+                },
+            )
+            .map(|h| h.id())
+        {
             Ok(h) => h,
             Err(LedgerError::Conflict) => return reject(self, Reject::NMax),
             Err(e) => panic!("fire row: {e:?}"),
@@ -655,9 +964,7 @@ impl Scheduler {
         let budget = self.attachments[id].decl.budget_firing.clone();
         let mut spend_rows = vec![fire_row];
         for (class, n) in budget.0.iter().filter(|(_, n)| **n > 0) {
-            let h = self
-                .ledger
-                .grant(&spent, CLASS_POOL, &pool_instance(id, class), Frag::Count(Count::Value(*n)), &generation, None, now)
+            let h = self.ledger.grant(&self.ledger.pool::<Count>(&ResourceKey::new(ClassId::new(CLASS_POOL), InstanceId::new(&pool_instance(id, class)))).unwrap(), GrantRequest { owner: SubjectId::new(&spent), claim: Claim::new(Count::Value(*n)).unwrap(), generation: Generation::new(&generation), parent: None, lease: LeaseRequest::UseClassDefault, now: Timestamp::try_from(now).unwrap() }).map(|h| h.id())
                 .expect("B_total = scale(n_max, B_firing): a class pool cannot run out before the fire pool");
             spend_rows.push(h);
         }
@@ -666,40 +973,98 @@ impl Scheduler {
             if self.transactional {
                 // 事务未提交：②不存在（演练以释放表达——墓碑不计存活、不计 seq）。
                 for h in spend_rows {
-                    self.ledger.release(h, &generation, now).unwrap();
+                    self.ledger
+                        .release(
+                            &HoldingHandle::new(h, Generation::new(&generation)),
+                            Timestamp::try_from(now).unwrap(),
+                        )
+                        .unwrap();
                 }
             } else {
                 // 逐行写入：②留在盘上，③没有——第三态，交给恢复规则。
                 for (class, n) in budget.0.iter().filter(|(_, n)| **n > 0) {
-                    *self.cached_outstanding.entry(pool_instance(id, class)).or_insert(0) += n;
+                    *self
+                        .cached_outstanding
+                        .entry(pool_instance(id, class))
+                        .or_insert(0) += n;
                 }
-                *self.cached_outstanding.entry(pool_instance(id, FIRE_CLASS)).or_insert(0) += 1;
+                *self
+                    .cached_outstanding
+                    .entry(pool_instance(id, FIRE_CLASS))
+                    .or_insert(0) += 1;
             }
             self.crash();
             return Err(Reject::Crashed);
         }
         for (class, n) in budget.0.iter().filter(|(_, n)| **n > 0) {
-            *self.cached_outstanding.entry(pool_instance(id, class)).or_insert(0) += n;
+            *self
+                .cached_outstanding
+                .entry(pool_instance(id, class))
+                .or_insert(0) += n;
         }
-        *self.cached_outstanding.entry(pool_instance(id, FIRE_CLASS)).or_insert(0) += 1;
+        *self
+            .cached_outstanding
+            .entry(pool_instance(id, FIRE_CLASS))
+            .or_insert(0) += 1;
         // ---- ③ 触发池（容量＝②的值）＋ 段持有：与②同一事务 ----
         for (class, n) in budget.0.iter().filter(|(_, n)| **n > 0) {
             self.ledger
-                .set_capacity(CLASS_POOL, &firing_pool_instance(id, seq, class), Frag::Count(Count::Value(*n)));
-            self.cached_outstanding.insert(firing_pool_instance(id, seq, class), 0);
+                .create_pool(
+                    &self
+                        .ledger
+                        .registered_class::<Count>(&ClassId::new(CLASS_POOL))
+                        .unwrap(),
+                    InstanceId::new(&firing_pool_instance(id, seq, class)),
+                    Capacity::new(Count::Value(*n)).unwrap(),
+                )
+                .unwrap();
+            self.cached_outstanding
+                .insert(firing_pool_instance(id, seq, class), 0);
         }
         let h_attach = self.attachments[id].h_attach.clone();
         let nonce = derive_nonce(&h_attach, seq);
         let seg = seg_subject(id, seq);
         let root = self.attachments[id].root;
-        self.ledger.declare_instantiation(&seg, &attach_subject(id));
-        self.ledger.set_capacity(CLASS_SEG, &seg_instance(id, seq), Frag::Ex(Ex::Token));
+        self.ledger
+            .declare_instantiation(SubjectId::new(&seg), SubjectId::new(&attach_subject(id)));
+        self.ledger
+            .create_pool(
+                &self
+                    .ledger
+                    .registered_class::<Ex>(&ClassId::new(CLASS_SEG))
+                    .unwrap(),
+                InstanceId::new(&seg_instance(id, seq)),
+                Capacity::new(Ex::Token).unwrap(),
+            )
+            .unwrap();
         let seg_holding = self
             .ledger
-            .grant(&seg, CLASS_SEG, &seg_instance(id, seq), Frag::Ex(Ex::Token), &nonce, Some(root), now)
+            .grant(
+                &self
+                    .ledger
+                    .pool::<Ex>(&ResourceKey::new(
+                        ClassId::new(CLASS_SEG),
+                        InstanceId::new(&seg_instance(id, seq)),
+                    ))
+                    .unwrap(),
+                GrantRequest {
+                    owner: SubjectId::new(&seg),
+                    claim: Claim::new(Ex::Token).unwrap(),
+                    generation: Generation::new(&nonce),
+                    parent: Some(root)
+                        .map(|id| self.ledger.holding(id).expect("parent exists").handle()),
+                    lease: LeaseRequest::UseClassDefault,
+                    now: Timestamp::try_from(now).unwrap(),
+                },
+            )
+            .map(|h| h.id())
             .expect("segment row");
         // ---- 派生四元组：ttl_i = min(now + run_cap, 根租约到期) ----
-        let lease_end = self.ledger.holding(root).and_then(|h| h.lease_expires_at).unwrap_or(u64::MAX);
+        let lease_end = self
+            .ledger
+            .holding(root)
+            .and_then(|h| h.lease.expires_at().map(|t| t.get()))
+            .unwrap_or(u64::MAX);
         let run_cap = self.attachments[id].decl.run_cap;
         let quad = Quad {
             h_plan: self.attachments[id].decl.h_plan.clone(),
@@ -709,14 +1074,28 @@ impl Scheduler {
         };
         {
             let a = self.attachments.get_mut(id).unwrap();
-            a.firings.push(FiringRecord { seq, nonce: nonce.clone(), started_at: now, end: None });
+            a.firings.push(FiringRecord {
+                seq,
+                nonce: nonce.clone(),
+                started_at: now,
+                end: None,
+            });
             a.last_fire_at = Some(now);
         }
         self.inflight.insert(
             id.to_string(),
-            InFlight { seq, seg_subject: seg, seg_holding, quad },
+            InFlight {
+                seq,
+                seg_subject: seg,
+                seg_holding,
+                quad,
+            },
         );
-        self.audit.push(Audit::Fired { id: id.to_string(), seq, nonce });
+        self.audit.push(Audit::Fired {
+            id: id.to_string(),
+            seq,
+            nonce,
+        });
         if crash == Some(Crash::AfterRows) {
             self.crash();
             return Err(Reject::Crashed);
@@ -733,7 +1112,12 @@ impl Scheduler {
         };
         let eid = self.next_event_id;
         self.next_event_id += 1;
-        self.inbox.push(InboxEvent { id: eid, attach: id.to_string(), seq, consumed: false });
+        self.inbox.push(InboxEvent {
+            id: eid,
+            attach: id.to_string(),
+            seq,
+            consumed: false,
+        });
         Ok(eid)
     }
 
@@ -746,18 +1130,33 @@ impl Scheduler {
         };
         let mut end = run.end;
         for (class, n) in &run.effects {
-            let r = self.ledger.grant(
-                &seg,
-                CLASS_POOL,
-                &firing_pool_instance(id, seq, class),
-                Frag::Count(Count::Value(*n)),
-                "eff",
-                Some(seg_holding),
-                now,
-            );
+            let r = self
+                .ledger
+                .grant(
+                    &self
+                        .ledger
+                        .pool::<Count>(&ResourceKey::new(
+                            ClassId::new(CLASS_POOL),
+                            InstanceId::new(&firing_pool_instance(id, seq, class)),
+                        ))
+                        .unwrap(),
+                    GrantRequest {
+                        owner: SubjectId::new(&seg),
+                        claim: Claim::new(Count::Value(*n)).unwrap(),
+                        generation: Generation::new("eff"),
+                        parent: Some(seg_holding)
+                            .map(|id| self.ledger.holding(id).expect("parent exists").handle()),
+                        lease: LeaseRequest::UseClassDefault,
+                        now: Timestamp::try_from(now).unwrap(),
+                    },
+                )
+                .map(|h| h.id());
             match r {
                 Ok(_) => {
-                    *self.cached_outstanding.entry(firing_pool_instance(id, seq, class)).or_insert(0) += n;
+                    *self
+                        .cached_outstanding
+                        .entry(firing_pool_instance(id, seq, class))
+                        .or_insert(0) += n;
                 }
                 Err(_) => {
                     end = End::Truncated;
@@ -784,23 +1183,49 @@ impl Scheduler {
             self.withdraw(id, seq);
         }
         let seg = seg_subject(id, seq);
-        let released = self.ledger.teardown(&seg, now);
+        let released = self
+            .ledger
+            .teardown(&SubjectId::new(&seg), Timestamp::try_from(now).unwrap());
         for h in released {
             if let Some(row) = self.ledger.holding(h) {
-                if row.class_id == CLASS_POOL {
+                if row.class_id.as_str() == CLASS_POOL {
                     if let Frag::Count(Count::Value(n)) = row.frag {
-                        if let Some(c) = self.cached_outstanding.get_mut(&row.instance) {
+                        if let Some(c) = self.cached_outstanding.get_mut(row.instance.as_str()) {
                             *c -= n;
                         }
                     }
                 }
             }
         }
-        let classes: Vec<String> = self.attachments[id].decl.budget_firing.0.keys().cloned().collect();
+        let classes: Vec<String> = self.attachments[id]
+            .decl
+            .budget_firing
+            .0
+            .keys()
+            .cloned()
+            .collect();
         for class in classes {
             let inst = firing_pool_instance(id, seq, &class);
-            if self.ledger.capacity(CLASS_POOL, &inst).is_some() {
-                self.ledger.set_capacity(CLASS_POOL, &inst, Frag::Count(Count::Value(0)));
+            if self
+                .ledger
+                .capacity(&ResourceKey::new(
+                    ClassId::new(CLASS_POOL),
+                    InstanceId::new(&inst),
+                ))
+                .is_some()
+            {
+                self.ledger
+                    .settle_and_zero_pool(
+                        &self
+                            .ledger
+                            .pool::<Count>(&ResourceKey::new(
+                                ClassId::new(CLASS_POOL),
+                                InstanceId::new(&inst),
+                            ))
+                            .unwrap(),
+                        Timestamp::try_from(now).unwrap(),
+                    )
+                    .unwrap();
             }
         }
         let paused = {
@@ -808,7 +1233,12 @@ impl Scheduler {
             if let Some(r) = a.firings.iter_mut().find(|r| r.seq == seq) {
                 r.end = Some(end);
             } else {
-                a.firings.push(FiringRecord { seq, nonce: derive_nonce(&a.h_attach, seq), started_at: now, end: Some(end) });
+                a.firings.push(FiringRecord {
+                    seq,
+                    nonce: derive_nonce(&a.h_attach, seq),
+                    started_at: now,
+                    end: Some(end),
+                });
             }
             if end.counts_as_failure() {
                 a.consecutive_failures += 1;
@@ -820,7 +1250,11 @@ impl Scheduler {
                 false
             }
         };
-        self.audit.push(Audit::Settled { id: id.to_string(), seq, end });
+        self.audit.push(Audit::Settled {
+            id: id.to_string(),
+            seq,
+            end,
+        });
         if paused {
             self.pause(id, Status::PausedFailure);
         }
@@ -829,10 +1263,15 @@ impl Scheduler {
     /// [EMIT-TX] 撤回只及**本次触发自己投递的未消费**事件；已消费的留下（人不能被反通知）。
     fn withdraw(&mut self, id: &str, seq: u64) {
         let before = self.inbox.len();
-        self.inbox.retain(|e| !(e.attach == id && e.seq == seq && !e.consumed));
+        self.inbox
+            .retain(|e| !(e.attach == id && e.seq == seq && !e.consumed));
         let n = (before - self.inbox.len()) as u64;
         if n > 0 {
-            self.audit.push(Audit::Withdrawn { id: id.to_string(), seq, events: n });
+            self.audit.push(Audit::Withdrawn {
+                id: id.to_string(),
+                seq,
+                events: n,
+            });
         }
     }
 
@@ -866,13 +1305,24 @@ impl Scheduler {
             .map(|a| a.decl.id.clone())
             .collect();
         for id in &ids {
-            self.retire(id, Status::Detached, End::Aborted, &format!("revoked:{grant_id}"), now);
+            self.retire(
+                id,
+                Status::Detached,
+                End::Aborted,
+                &format!("revoked:{grant_id}"),
+                now,
+            );
         }
         ids
     }
 
     fn retire(&mut self, id: &str, status: Status, inflight_end: End, why: &str, now: u64) {
-        if self.attachments.get(id).map(|a| a.status.is_terminal()).unwrap_or(true) {
+        if self
+            .attachments
+            .get(id)
+            .map(|a| a.status.is_terminal())
+            .unwrap_or(true)
+        {
             return;
         }
         if let Some(f) = self.inflight.get(id).cloned() {
@@ -882,33 +1332,69 @@ impl Scheduler {
         let seqs: Vec<u64> = self.attachments[id].firings.iter().map(|r| r.seq).collect();
         for seq in seqs {
             let seg = seg_subject(id, seq);
-            if self.ledger.live().any(|h| h.subject == seg) {
+            if self.ledger.live().any(|h| h.subject.as_str() == seg) {
                 self.settle(id, seq, inflight_end, now);
             }
         }
         // 根子树（根、触发器持有、路由）子先于父；②花费行落墓碑；①③容量置 0。
-        self.ledger.teardown(&attach_subject(id), now);
-        self.ledger.teardown(&spent_subject(id), now);
+        self.ledger.teardown(
+            &SubjectId::new(&attach_subject(id)),
+            Timestamp::try_from(now).unwrap(),
+        );
+        self.ledger.teardown(
+            &SubjectId::new(&spent_subject(id)),
+            Timestamp::try_from(now).unwrap(),
+        );
         let classes: Vec<String> = {
             let d = &self.attachments[id].decl;
-            d.budget_firing.0.keys().cloned().chain(std::iter::once(FIRE_CLASS.to_string())).collect()
+            d.budget_firing
+                .0
+                .keys()
+                .cloned()
+                .chain(std::iter::once(FIRE_CLASS.to_string()))
+                .collect()
         };
         for class in classes {
             let inst = pool_instance(id, &class);
-            self.ledger.set_capacity(CLASS_POOL, &inst, Frag::Count(Count::Value(0)));
+            self.ledger
+                .settle_and_zero_pool(
+                    &self
+                        .ledger
+                        .pool::<Count>(&ResourceKey::new(
+                            ClassId::new(CLASS_POOL),
+                            InstanceId::new(&inst),
+                        ))
+                        .unwrap(),
+                    Timestamp::try_from(now).unwrap(),
+                )
+                .unwrap();
             self.cached_outstanding.insert(inst, 0);
         }
         let firing_pools: Vec<String> = self
             .ledger
             .holdings()
             .iter()
-            .filter(|h| h.class_id == CLASS_POOL && h.instance.starts_with(&format!("{id}#")))
-            .map(|h| h.instance.clone())
+            .filter(|h| {
+                h.class_id.as_str() == CLASS_POOL
+                    && h.instance.as_str().starts_with(&format!("{id}#"))
+            })
+            .map(|h| h.instance.to_string())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
         for inst in firing_pools {
-            self.ledger.set_capacity(CLASS_POOL, &inst, Frag::Count(Count::Value(0)));
+            self.ledger
+                .settle_and_zero_pool(
+                    &self
+                        .ledger
+                        .pool::<Count>(&ResourceKey::new(
+                            ClassId::new(CLASS_POOL),
+                            InstanceId::new(&inst),
+                        ))
+                        .unwrap(),
+                    Timestamp::try_from(now).unwrap(),
+                )
+                .unwrap();
             self.cached_outstanding.insert(inst, 0);
         }
         self.queues.remove(id);
@@ -916,7 +1402,10 @@ impl Scheduler {
         a.status = status;
         match status {
             Status::Expired => self.audit.push(Audit::Expired { id: id.to_string() }),
-            _ => self.audit.push(Audit::Detached { id: id.to_string(), why: why.to_string() }),
+            _ => self.audit.push(Audit::Detached {
+                id: id.to_string(),
+                why: why.to_string(),
+            }),
         }
     }
 
@@ -925,7 +1414,12 @@ impl Scheduler {
     // ------------------------------------------------------------------
 
     /// h_table 变 ⇒ 对每个未退役附着重跑准入：不通过 ⇒ Detached；通过 ⇒ Paused 待重签。
-    pub fn table_change(&mut self, new_h_table: &str, admits: &dyn Fn(&Declaration) -> bool, now: u64) {
+    pub fn table_change(
+        &mut self,
+        new_h_table: &str,
+        admits: &dyn Fn(&Declaration) -> bool,
+        now: u64,
+    ) {
         assert!(!self.crashed, "recover() first");
         let ids: Vec<String> = self
             .attachments
@@ -936,7 +1430,10 @@ impl Scheduler {
         for id in ids {
             let ok = admits(&self.attachments[&id].decl);
             if ok {
-                self.audit.push(Audit::TableChanged { id: id.clone(), h_table: new_h_table.to_string() });
+                self.audit.push(Audit::TableChanged {
+                    id: id.clone(),
+                    h_table: new_h_table.to_string(),
+                });
                 self.pause(&id, Status::PausedTableChanged);
             } else {
                 self.retire(&id, Status::Detached, End::Aborted, "table rejected", now);
@@ -993,8 +1490,13 @@ impl Scheduler {
             let seqs: Vec<u64> = self
                 .ledger
                 .live()
-                .filter(|h| h.class_id == CLASS_POOL && h.instance == fire_inst)
-                .filter_map(|h| h.generation.strip_prefix("seq:").and_then(|s| s.parse().ok()))
+                .filter(|h| h.class_id.as_str() == CLASS_POOL && h.instance.as_str() == fire_inst)
+                .filter_map(|h| {
+                    h.generation
+                        .as_str()
+                        .strip_prefix("seq:")
+                        .and_then(|s| s.parse().ok())
+                })
                 .collect();
             for seq in seqs {
                 let seg_inst = seg_instance(&id, seq);
@@ -1002,7 +1504,7 @@ impl Scheduler {
                     .ledger
                     .holdings()
                     .iter()
-                    .find(|h| h.class_id == CLASS_SEG && h.instance == seg_inst)
+                    .find(|h| h.class_id.as_str() == CLASS_SEG && h.instance.as_str() == seg_inst)
                     .cloned();
                 match seg_row {
                     None => {
@@ -1010,13 +1512,20 @@ impl Scheduler {
                         let known = self.attachments[&id].firings.iter().any(|r| r.seq == seq);
                         if !known {
                             let h_attach = self.attachments[&id].h_attach.clone();
-                            self.attachments.get_mut(&id).unwrap().firings.push(FiringRecord {
+                            self.attachments
+                                .get_mut(&id)
+                                .unwrap()
+                                .firings
+                                .push(FiringRecord {
+                                    seq,
+                                    nonce: derive_nonce(&h_attach, seq),
+                                    started_at: now,
+                                    end: Some(End::CompletedEmpty),
+                                });
+                            self.audit.push(Audit::RecoveredEmpty {
+                                id: id.clone(),
                                 seq,
-                                nonce: derive_nonce(&h_attach, seq),
-                                started_at: now,
-                                end: Some(End::CompletedEmpty),
                             });
-                            self.audit.push(Audit::RecoveredEmpty { id: id.clone(), seq });
                         }
                     }
                     Some(row) if row.released_at.is_none() => {
@@ -1045,8 +1554,18 @@ impl Scheduler {
                 if period > 0 && now >= last_tick + period {
                     let elapsed = (now - last_tick) / period;
                     self.attachments.get_mut(&id).unwrap().last_tick = now;
-                    self.enqueue(&id, Event { at: now, integrity_ok: true, missed: elapsed - 1 });
-                    self.audit.push(Audit::Coalesced { id: id.clone(), missed: elapsed - 1 });
+                    self.enqueue(
+                        &id,
+                        Event {
+                            at: now,
+                            integrity_ok: true,
+                            missed: elapsed - 1,
+                        },
+                    );
+                    self.audit.push(Audit::Coalesced {
+                        id: id.clone(),
+                        missed: elapsed - 1,
+                    });
                 }
             }
         }
@@ -1065,9 +1584,13 @@ impl Scheduler {
                 out.insert(inst, 0);
             }
         }
-        for h in self.ledger.live().filter(|h| h.class_id == CLASS_POOL) {
+        for h in self
+            .ledger
+            .live()
+            .filter(|h| h.class_id.as_str() == CLASS_POOL)
+        {
             if let Frag::Count(Count::Value(n)) = h.frag {
-                *out.entry(h.instance.clone()).or_insert(0) += n;
+                *out.entry(h.instance.to_string()).or_insert(0) += n;
             }
         }
         out
@@ -1077,20 +1600,28 @@ impl Scheduler {
         // 演练用：从行与已知实例名收集池实例（Ledger 不暴露容量表的遍历；实例名由本模块命名规则决定）。
         let mut set: BTreeSet<(String, String)> = BTreeSet::new();
         for h in self.ledger.holdings() {
-            set.insert((h.class_id.clone(), h.instance.clone()));
+            set.insert((h.class_id.to_string(), h.instance.to_string()));
         }
         for inst in self.cached_outstanding.keys() {
             set.insert((CLASS_POOL.to_string(), inst.clone()));
         }
         set.into_iter()
-            .filter_map(|(c, i)| self.ledger.capacity(&c, &i).cloned().map(|cap| ((c, i), cap)))
+            .filter_map(|(c, i)| {
+                self.ledger
+                    .capacity(&ResourceKey::new(ClassId::new(&c), InstanceId::new(&i)))
+                    .cloned()
+                    .map(|cap| ((c, i), cap))
+            })
             .collect()
     }
 
     /// 触发池是否已关闭（容量置 0 ⇒ `can_mint` 对任何正值拒）。
     pub fn firing_pool_closed(&self, id: &str, seq: u64, class: &str) -> bool {
         matches!(
-            self.ledger.capacity(CLASS_POOL, &firing_pool_instance(id, seq, class)),
+            self.ledger.capacity(&ResourceKey::new(
+                ClassId::new(CLASS_POOL),
+                InstanceId::new(&firing_pool_instance(id, seq, class))
+            )),
             Some(Frag::Count(Count::Value(0)))
         )
     }
@@ -1098,14 +1629,17 @@ impl Scheduler {
     /// 试铸（不改账本）：对某触发池再要 1 个单位是否会被拒。
     pub fn firing_pool_refuses(&self, id: &str, seq: u64, class: &str) -> bool {
         let inst = firing_pool_instance(id, seq, class);
-        let cap = match self.ledger.capacity(CLASS_POOL, &inst) {
+        let cap = match self.ledger.capacity(&ResourceKey::new(
+            ClassId::new(CLASS_POOL),
+            InstanceId::new(&inst),
+        )) {
             Some(Frag::Count(c)) => *c,
             _ => return true,
         };
         let live: Vec<Count> = self
             .ledger
             .live()
-            .filter(|h| h.class_id == CLASS_POOL && h.instance == inst)
+            .filter(|h| h.class_id.as_str() == CLASS_POOL && h.instance.as_str() == inst)
             .filter_map(|h| match h.frag {
                 Frag::Count(c) => Some(c),
                 _ => None,
@@ -1115,7 +1649,11 @@ impl Scheduler {
     }
 
     pub fn nonces(&self, id: &str) -> Vec<String> {
-        self.attachments[id].firings.iter().map(|r| r.nonce.clone()).collect()
+        self.attachments[id]
+            .firings
+            .iter()
+            .map(|r| r.nonce.clone())
+            .collect()
     }
 
     pub fn status(&self, id: &str) -> Status {
@@ -1131,13 +1669,19 @@ impl Scheduler {
     }
 
     pub fn unconsumed_events(&self, id: &str) -> Vec<u64> {
-        self.inbox.iter().filter(|e| e.attach == id && !e.consumed).map(|e| e.id).collect()
+        self.inbox
+            .iter()
+            .filter(|e| e.attach == id && !e.consumed)
+            .map(|e| e.id)
+            .collect()
     }
 
     /// 全局不变式（每步重算，绝不信缓存）：账本 Auth 不变式；缓存＝折叠；已触发 ≤ n_max；
     /// nonce 唯一；已结账触发的③已关闭；退役附着名下无存活行、①容量为 0。
     pub fn invariants(&self) -> Result<(), String> {
-        self.ledger.invariant().map_err(|e| format!("ledger invariant: {e:?}"))?;
+        self.ledger
+            .invariant()
+            .map_err(|e| format!("ledger invariant: {e:?}"))?;
         let truth = self.recompute_outstanding();
         for (inst, n) in &truth {
             let c = self.cached_outstanding.get(inst).copied().unwrap_or(0);
@@ -1147,13 +1691,20 @@ impl Scheduler {
         }
         for (inst, c) in &self.cached_outstanding {
             if truth.get(inst).copied().unwrap_or(0) != *c {
-                return Err(format!("cache {inst}: cached {c} but truth {:?}", truth.get(inst)));
+                return Err(format!(
+                    "cache {inst}: cached {c} but truth {:?}",
+                    truth.get(inst)
+                ));
             }
         }
         for a in self.attachments.values() {
             let id = &a.decl.id;
             if self.fired_count(id) > a.decl.n_max {
-                return Err(format!("{id}: fired {} > n_max {}", self.fired_count(id), a.decl.n_max));
+                return Err(format!(
+                    "{id}: fired {} > n_max {}",
+                    self.fired_count(id),
+                    a.decl.n_max
+                ));
             }
             let mut seen = BTreeSet::new();
             for r in &a.firings {
@@ -1163,7 +1714,10 @@ impl Scheduler {
                 if r.end.is_some() && self.inflight.get(id).map(|f| f.seq) != Some(r.seq) {
                     for class in a.decl.budget_firing.0.keys() {
                         if !self.firing_pool_refuses(id, r.seq, class) {
-                            return Err(format!("{id}: settled seq {} pool {class} still mints", r.seq));
+                            return Err(format!(
+                                "{id}: settled seq {} pool {class} still mints",
+                                r.seq
+                            ));
                         }
                     }
                 }
@@ -1171,11 +1725,25 @@ impl Scheduler {
             if a.status.is_terminal() {
                 let subj = attach_subject(id);
                 let spent = spent_subject(id);
-                if self.ledger.live().any(|h| h.subject == subj || h.subject == spent || h.subject.starts_with(&format!("{subj}:seg#"))) {
+                if self.ledger.live().any(|h| {
+                    h.subject.as_str() == subj
+                        || h.subject.as_str() == spent
+                        || h.subject.as_str().starts_with(&format!("{subj}:seg#"))
+                }) {
                     return Err(format!("{id}: terminal but live rows remain"));
                 }
-                for class in a.decl.budget_firing.0.keys().chain(std::iter::once(&FIRE_CLASS.to_string())) {
-                    if self.ledger.capacity(CLASS_POOL, &pool_instance(id, class)) != Some(&Frag::Count(Count::Value(0))) {
+                for class in a
+                    .decl
+                    .budget_firing
+                    .0
+                    .keys()
+                    .chain(std::iter::once(&FIRE_CLASS.to_string()))
+                {
+                    if self.ledger.capacity(&ResourceKey::new(
+                        ClassId::new(CLASS_POOL),
+                        InstanceId::new(&pool_instance(id, class)),
+                    )) != Some(&Frag::Count(Count::Value(0)))
+                    {
                         return Err(format!("{id}: terminal but pool {class} not closed"));
                     }
                 }

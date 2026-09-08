@@ -4,7 +4,7 @@
 use rusqlite::Connection;
 use std::path::Path;
 
-pub fn open(root: &Path) -> Result<Connection, rusqlite::Error> {
+pub(crate) fn open(root: &Path) -> Result<Connection, rusqlite::Error> {
     let conn = Connection::open(root.join("kernel.sqlite"))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;

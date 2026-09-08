@@ -18,9 +18,12 @@
 //!     （"可交换性/可中介性是接口选择出来的"，endstate §7.1）。
 
 use crate::coeffect::{Manifest, Mount, Requires};
-use crate::ledger::{AlgebraTag, ClassDecl, Frag, Ledger, RevertGrade};
+use crate::identity::{ClassId, InstanceId};
+use crate::ledger::{AlgebraTag, ClassDecl, Ledger, RevertGrade};
 use crate::protocol::Protocol;
 use crate::ra::{Count, Ex, Frac, GSet, Ranges};
+use crate::registry::Capacity;
+use crate::time::LeaseDuration;
 use crate::verbs::{ConsumeGrade, EmitGrade, VerbEntry, VerbTable};
 
 /// 一个怪物志条目：三张表（账本类声明、真理表、manifest）＋挂载点。
@@ -37,9 +40,10 @@ fn class(l: &mut Ledger, id: &str, algebra: AlgebraTag, lease: Option<u64>, rho:
         class_id: id.into(),
         algebra,
         release_idempotent: true,
-        lease_secs: lease,
+        lease_duration: lease.map(|s: u64| LeaseDuration::try_from(s).unwrap()),
         revert_grade: rho,
-    });
+    })
+    .unwrap();
 }
 
 // ===========================================================================
@@ -72,52 +76,148 @@ pub fn workspace() -> Entry {
     ] {
         class(&mut l, id, alg, lease, RevertGrade::Inverse);
     }
-    class(&mut l, "vcpu", AlgebraTag::Counted, None, RevertGrade::Inverse);
-    class(&mut l, "mem-mib", AlgebraTag::Counted, None, RevertGrade::Inverse);
+    class(
+        &mut l,
+        "vcpu",
+        AlgebraTag::Counted,
+        None,
+        RevertGrade::Inverse,
+    );
+    class(
+        &mut l,
+        "mem-mib",
+        AlgebraTag::Counted,
+        None,
+        RevertGrade::Inverse,
+    );
     class(&mut l, "image", AlgebraTag::Set, None, RevertGrade::Inverse); // 只读镜像：可复制共享
-    l.set_capacity("vcpu", "host", Frag::Count(Count::Value(16)));
-    l.set_capacity("mem-mib", "host", Frag::Count(Count::Value(32768)));
-    l.set_capacity("image", "ubuntu-24.04", Frag::Set(GSet::of(&["ro"])));
-    for (c, i) in [("enclosure", "ws-1"), ("vm", "vm-1"), ("tap", "tap0"), ("rootfs-overlay", "ov-1"),
-                   ("snapshot", "snap-0"), ("mount", "m-1"), ("proc", "shell")] {
-        l.set_capacity(c, i, Frag::Ex(Ex::Token));
+    l.create_pool(
+        &l.registered_class::<Count>(&ClassId::new("vcpu")).unwrap(),
+        InstanceId::new("host"),
+        Capacity::new(Count::Value(16)).unwrap(),
+    )
+    .unwrap();
+    l.create_pool(
+        &l.registered_class::<Count>(&ClassId::new("mem-mib"))
+            .unwrap(),
+        InstanceId::new("host"),
+        Capacity::new(Count::Value(32768)).unwrap(),
+    )
+    .unwrap();
+    l.create_pool(
+        &l.registered_class::<GSet>(&ClassId::new("image")).unwrap(),
+        InstanceId::new("ubuntu-24.04"),
+        Capacity::new(GSet::of(&["ro"])).unwrap(),
+    )
+    .unwrap();
+    for (c, i) in [
+        ("enclosure", "ws-1"),
+        ("vm", "vm-1"),
+        ("tap", "tap0"),
+        ("rootfs-overlay", "ov-1"),
+        ("snapshot", "snap-0"),
+        ("mount", "m-1"),
+        ("proc", "shell"),
+    ] {
+        l.create_pool(
+            &l.registered_class::<Ex>(&ClassId::new(c)).unwrap(),
+            InstanceId::new(i),
+            Capacity::new(Ex::Token).unwrap(),
+        )
+        .unwrap();
     }
 
     let mut t = VerbTable::new();
-    for c in ["enclosure", "vm", "tap", "rootfs-overlay", "snapshot", "mount", "proc"] {
+    for c in [
+        "enclosure",
+        "vm",
+        "tap",
+        "rootfs-overlay",
+        "snapshot",
+        "mount",
+        "proc",
+    ] {
         t.declare_class(c, RevertGrade::Inverse).unwrap();
     }
     let held = || VerbEntry::consuming(ConsumeGrade::Held);
     t.register("vm", "spawn", held()).unwrap();
     t.register("vm", "exec", VerbEntry::transforming()).unwrap(); // [CEFF] 界内变换
-    t.register("vm", "write_file", VerbEntry::transforming()).unwrap();
-    t.register("vm", "pause", VerbEntry::transforming().with_flags(true, false)).unwrap(); // 幂等变换
-    t.register("vm", "resume", VerbEntry::transforming().with_flags(true, false)).unwrap();
-    t.register("vm", "restore", VerbEntry::transforming().with_flags(true, false)).unwrap(); // 幂等：恢复到同一快照
-    t.register("vm", "read_file", VerbEntry::repeatable()).unwrap();
-    t.register("vm", "inspect", VerbEntry::repeatable()).unwrap();
-    t.register("vm", "copy_out", VerbEntry::repeatable()).unwrap(); // 读入：taint 归数据面
+    t.register("vm", "write_file", VerbEntry::transforming())
+        .unwrap();
+    t.register(
+        "vm",
+        "pause",
+        VerbEntry::transforming().with_flags(true, false),
+    )
+    .unwrap(); // 幂等变换
+    t.register(
+        "vm",
+        "resume",
+        VerbEntry::transforming().with_flags(true, false),
+    )
+    .unwrap();
+    t.register(
+        "vm",
+        "restore",
+        VerbEntry::transforming().with_flags(true, false),
+    )
+    .unwrap(); // 幂等：恢复到同一快照
+    t.register("vm", "read_file", VerbEntry::repeatable())
+        .unwrap();
+    t.register("vm", "inspect", VerbEntry::repeatable())
+        .unwrap();
+    t.register("vm", "copy_out", VerbEntry::repeatable())
+        .unwrap(); // 读入：taint 归数据面
     t.register("snapshot", "snapshot", held()).unwrap(); // 快照是一笔占盘的持有
     t.register("mount", "mount", held()).unwrap();
     t.register("tap", "attach", held()).unwrap();
     t.register("proc", "spawn", held()).unwrap();
     // 出网：外部发射、可摊销（一次同意批量出网），必经 egress 代理（policy 的 (verb,target) 范围）。
-    t.register("vm", "net_send", VerbEntry::emitting(EmitGrade::External, true)).unwrap();
+    t.register(
+        "vm",
+        "net_send",
+        VerbEntry::emitting(EmitGrade::External, true),
+    )
+    .unwrap();
     t.check_all().unwrap();
 
-    let mut m = Manifest { driver: "workspace".into(), verbs: Default::default() };
+    let mut m = Manifest {
+        driver: "workspace".into(),
+        verbs: Default::default(),
+    };
     // 按量计价：exec 声明每次最多 5 单位 fuel；写文件每次最多 2；出网每次 1。
-    m.verbs.insert("exec".into(), Requires::from_table_weighted(&t, "vm", "exec", &["ws.exec"], &[], 5).unwrap());
-    m.verbs.insert("write_file".into(), Requires::from_table_weighted(&t, "vm", "write_file", &["ws.fs"], &[], 2).unwrap());
-    m.verbs.insert("read_file".into(), Requires::from_table(&t, "vm", "read_file", &["ws.fs"], &[]).unwrap());
-    m.verbs.insert("net_send".into(), Requires::from_table(&t, "vm", "net_send", &["net.egress"], &["egress-proxy"]).unwrap());
-    m.verbs.insert("copy_out".into(), Requires::from_table(&t, "vm", "copy_out", &["ws.fs"], &["cas"]).unwrap());
+    m.verbs.insert(
+        "exec".into(),
+        Requires::from_table_weighted(&t, "vm", "exec", &["ws.exec"], &[], 5).unwrap(),
+    );
+    m.verbs.insert(
+        "write_file".into(),
+        Requires::from_table_weighted(&t, "vm", "write_file", &["ws.fs"], &[], 2).unwrap(),
+    );
+    m.verbs.insert(
+        "read_file".into(),
+        Requires::from_table(&t, "vm", "read_file", &["ws.fs"], &[]).unwrap(),
+    );
+    m.verbs.insert(
+        "net_send".into(),
+        Requires::from_table(&t, "vm", "net_send", &["net.egress"], &["egress-proxy"]).unwrap(),
+    );
+    m.verbs.insert(
+        "copy_out".into(),
+        Requires::from_table(&t, "vm", "copy_out", &["ws.fs"], &["cas"]).unwrap(),
+    );
     let mount = Mount {
         name: "workspace-slot".into(),
         offers: crate::coeffect::Flat::of(&["ws.exec", "ws.fs", "net.egress"]),
         provides: crate::coeffect::Flat::of(&["egress-proxy", "cas"]),
     };
-    Entry { name: "workspace", ledger: l, table: t, manifest: m, mount }
+    Entry {
+        name: "workspace",
+        ledger: l,
+        table: t,
+        manifest: m,
+        mount,
+    }
 }
 
 // ===========================================================================
@@ -148,42 +248,131 @@ pub fn workspace() -> Entry {
 // （reg_mr 与 grant_remote_access 分开），零处形状缺口。
 pub fn rdma() -> Entry {
     let mut l = Ledger::new();
-    class(&mut l, "device", AlgebraTag::Set, None, RevertGrade::Inverse);
+    class(
+        &mut l,
+        "device",
+        AlgebraTag::Set,
+        None,
+        RevertGrade::Inverse,
+    );
     for id in ["pd", "cq", "qp"] {
-        class(&mut l, id, AlgebraTag::Exclusive, Some(300), RevertGrade::Inverse);
+        class(
+            &mut l,
+            id,
+            AlgebraTag::Exclusive,
+            Some(300),
+            RevertGrade::Inverse,
+        );
     }
-    class(&mut l, "mr", AlgebraTag::Range, Some(300), RevertGrade::Inverse); // 子区间持有
-    class(&mut l, "mr-read", AlgebraTag::Frac, Some(300), RevertGrade::Inverse); // 共享读份额
-    class(&mut l, "memlock-kib", AlgebraTag::Counted, None, RevertGrade::Inverse);
-    l.set_capacity("device", "mlx5_0", Frag::Set(GSet::of(&["open"])));
-    l.set_capacity("pd", "pd-1", Frag::Ex(Ex::Token));
-    l.set_capacity("cq", "cq-1", Frag::Ex(Ex::Token));
-    l.set_capacity("qp", "qp-1", Frag::Ex(Ex::Token));
-    l.set_capacity("mr", "buf-A", Frag::Range(Ranges::of(&[(0, 8192)]))); // 8 KiB 缓冲区
-    l.set_capacity("mr-read", "buf-A", Frag::Frac(Frac::one()));
-    l.set_capacity("memlock-kib", "proc", Frag::Count(Count::Value(65536)));
+    class(
+        &mut l,
+        "mr",
+        AlgebraTag::Range,
+        Some(300),
+        RevertGrade::Inverse,
+    ); // 子区间持有
+    class(
+        &mut l,
+        "mr-read",
+        AlgebraTag::Frac,
+        Some(300),
+        RevertGrade::Inverse,
+    ); // 共享读份额
+    class(
+        &mut l,
+        "memlock-kib",
+        AlgebraTag::Counted,
+        None,
+        RevertGrade::Inverse,
+    );
+    l.create_pool(
+        &l.registered_class::<GSet>(&ClassId::new("device")).unwrap(),
+        InstanceId::new("mlx5_0"),
+        Capacity::new(GSet::of(&["open"])).unwrap(),
+    )
+    .unwrap();
+    l.create_pool(
+        &l.registered_class::<Ex>(&ClassId::new("pd")).unwrap(),
+        InstanceId::new("pd-1"),
+        Capacity::new(Ex::Token).unwrap(),
+    )
+    .unwrap();
+    l.create_pool(
+        &l.registered_class::<Ex>(&ClassId::new("cq")).unwrap(),
+        InstanceId::new("cq-1"),
+        Capacity::new(Ex::Token).unwrap(),
+    )
+    .unwrap();
+    l.create_pool(
+        &l.registered_class::<Ex>(&ClassId::new("qp")).unwrap(),
+        InstanceId::new("qp-1"),
+        Capacity::new(Ex::Token).unwrap(),
+    )
+    .unwrap();
+    l.create_pool(
+        &l.registered_class::<Ranges>(&ClassId::new("mr")).unwrap(),
+        InstanceId::new("buf-A"),
+        Capacity::new(Ranges::of(&[(0, 8192)])).unwrap(),
+    )
+    .unwrap(); // 8 KiB 缓冲区
+    l.create_pool(
+        &l.registered_class::<Frac>(&ClassId::new("mr-read"))
+            .unwrap(),
+        InstanceId::new("buf-A"),
+        Capacity::new(Frac::one()).unwrap(),
+    )
+    .unwrap();
+    l.create_pool(
+        &l.registered_class::<Count>(&ClassId::new("memlock-kib"))
+            .unwrap(),
+        InstanceId::new("proc"),
+        Capacity::new(Count::Value(65536)).unwrap(),
+    )
+    .unwrap();
 
     let mut t = VerbTable::new();
     for c in ["device", "pd", "cq", "qp", "mr", "mr-read"] {
         t.declare_class(c, RevertGrade::Inverse).unwrap();
     }
     let held = || VerbEntry::consuming(ConsumeGrade::Held);
-    t.register("device", "open_device", held().with_flags(false, true)).unwrap();
+    t.register("device", "open_device", held().with_flags(false, true))
+        .unwrap();
     t.register("pd", "alloc_pd", held()).unwrap();
     t.register("cq", "create_cq", held()).unwrap();
-    t.register("cq", "poll_cq", VerbEntry::consuming(ConsumeGrade::External)).unwrap(); // 出队即消耗
+    t.register(
+        "cq",
+        "poll_cq",
+        VerbEntry::consuming(ConsumeGrade::External),
+    )
+    .unwrap(); // 出队即消耗
     t.register("mr", "reg_mr", held()).unwrap(); // 本地注册：持有
     t.register("mr", "bind_mw", held()).unwrap(); // memory window：子区间持有
     // 真正的发射点：把内存暴露给远端。硬清单（不可摊销）——逐次同意；ibverbs 里与 reg_mr 同一
     // 调用，我们的接口拆开——中介点就在这里。
-    t.register("mr", "grant_remote_access", VerbEntry::emitting(EmitGrade::External, false)).unwrap();
+    t.register(
+        "mr",
+        "grant_remote_access",
+        VerbEntry::emitting(EmitGrade::External, false),
+    )
+    .unwrap();
     t.register("qp", "create_qp", held()).unwrap();
     t.register("qp", "init", VerbEntry::transforming()).unwrap(); // 状态迁移：界内变换
     t.register("qp", "rtr", VerbEntry::transforming()).unwrap();
     t.register("qp", "rts", VerbEntry::transforming()).unwrap();
-    t.register("qp", "post_recv", VerbEntry::transforming()).unwrap(); // 往本地队列放缓冲
-    t.register("qp", "post_send", VerbEntry::emitting(EmitGrade::External, true)).unwrap(); // RDMA WRITE 到远端
-    t.register("qp", "rdma_read", VerbEntry::emitting(EmitGrade::External, true)).unwrap(); // 请求出界，数据带 taint 回流
+    t.register("qp", "post_recv", VerbEntry::transforming())
+        .unwrap(); // 往本地队列放缓冲
+    t.register(
+        "qp",
+        "post_send",
+        VerbEntry::emitting(EmitGrade::External, true),
+    )
+    .unwrap(); // RDMA WRITE 到远端
+    t.register(
+        "qp",
+        "rdma_read",
+        VerbEntry::emitting(EmitGrade::External, true),
+    )
+    .unwrap(); // 请求出界，数据带 taint 回流
     t.register("qp", "query", VerbEntry::repeatable()).unwrap();
     // 协议：QP 状态机。post_send/post_recv 只在 rts 合法；query 不在辖域（任何状态可查）。
     let qp_proto = Protocol::new("reset")
@@ -196,18 +385,54 @@ pub fn rdma() -> Entry {
     t.declare_protocol("qp", qp_proto).unwrap();
     t.check_all().unwrap();
 
-    let mut m = Manifest { driver: "rdma".into(), verbs: Default::default() };
+    let mut m = Manifest {
+        driver: "rdma".into(),
+        verbs: Default::default(),
+    };
     // 按量：post_send 声明每次最多 64 KiB（单位 KiB）；rdma_read 同；其余按次。
-    m.verbs.insert("post_send".into(), Requires::from_table_weighted(&t, "qp", "post_send", &["rdma.send"], &["pd", "cq"], 64).unwrap());
-    m.verbs.insert("rdma_read".into(), Requires::from_table_weighted(&t, "qp", "rdma_read", &["rdma.read"], &["pd", "cq"], 64).unwrap());
-    m.verbs.insert("post_recv".into(), Requires::from_table(&t, "qp", "post_recv", &["rdma.local"], &[]).unwrap());
-    m.verbs.insert("grant_remote_access".into(), Requires::from_table(&t, "mr", "grant_remote_access", &["rdma.expose"], &["rkey-broker"]).unwrap());
-    m.verbs.insert("poll_cq".into(), Requires::from_table(&t, "cq", "poll_cq", &["rdma.local"], &[]).unwrap());
-    m.verbs.insert("query".into(), Requires::from_table(&t, "qp", "query", &["rdma.local"], &[]).unwrap());
+    m.verbs.insert(
+        "post_send".into(),
+        Requires::from_table_weighted(&t, "qp", "post_send", &["rdma.send"], &["pd", "cq"], 64)
+            .unwrap(),
+    );
+    m.verbs.insert(
+        "rdma_read".into(),
+        Requires::from_table_weighted(&t, "qp", "rdma_read", &["rdma.read"], &["pd", "cq"], 64)
+            .unwrap(),
+    );
+    m.verbs.insert(
+        "post_recv".into(),
+        Requires::from_table(&t, "qp", "post_recv", &["rdma.local"], &[]).unwrap(),
+    );
+    m.verbs.insert(
+        "grant_remote_access".into(),
+        Requires::from_table(
+            &t,
+            "mr",
+            "grant_remote_access",
+            &["rdma.expose"],
+            &["rkey-broker"],
+        )
+        .unwrap(),
+    );
+    m.verbs.insert(
+        "poll_cq".into(),
+        Requires::from_table(&t, "cq", "poll_cq", &["rdma.local"], &[]).unwrap(),
+    );
+    m.verbs.insert(
+        "query".into(),
+        Requires::from_table(&t, "qp", "query", &["rdma.local"], &[]).unwrap(),
+    );
     let mount = Mount {
         name: "rdma-slot".into(),
         offers: crate::coeffect::Flat::of(&["rdma.send", "rdma.read", "rdma.local", "rdma.expose"]),
         provides: crate::coeffect::Flat::of(&["pd", "cq", "rkey-broker"]),
     };
-    Entry { name: "rdma", ledger: l, table: t, manifest: m, mount }
+    Entry {
+        name: "rdma",
+        ledger: l,
+        table: t,
+        manifest: m,
+        mount,
+    }
 }

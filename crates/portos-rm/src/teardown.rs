@@ -14,7 +14,9 @@
 //!   [ρ]     动作选择由类声明的可逆档决定（theory-spec §2.5）：有逆 → release；
 //!           可补偿 → 记日志的补偿。等价由声明固定，不由执行者挑选。
 
+use crate::identity::{ClassId, Generation, HoldingId, InstanceId, SubjectId};
 use crate::ledger::{Ledger, LiveItem, RevertGrade};
+use crate::time::Timestamp;
 
 /// F2 的世界接口：执行器对基底的动作。演练用 [`MockWorld`]；内核实装用真基底
 /// （kill 进程、撤订阅、关 target……）。执行器只按类声明的 ρ 选动作（[ρ]），
@@ -46,7 +48,7 @@ pub enum JState {
 
 #[derive(Clone, Debug)]
 pub struct JournalEntry {
-    pub holding_id: u64,
+    pub holding_id: HoldingId,
     pub grade: RevertGrade,
     /// [KEY] 去重钥匙：subject/holding 决定，跨崩溃稳定。
     pub idem_key: String,
@@ -65,7 +67,8 @@ impl Journal {
     pub fn entries(&self) -> &[JournalEntry] {
         &self.0
     }
-    fn ensure(&mut self, holding_id: u64, grade: RevertGrade, key: &str) -> usize {        if let Some(i) = self.0.iter().position(|e| e.holding_id == holding_id) {
+    fn ensure(&mut self, holding_id: HoldingId, grade: RevertGrade, key: &str) -> usize {
+        if let Some(i) = self.0.iter().position(|e| e.holding_id == holding_id) {
             return i;
         }
         self.0.push(JournalEntry {
@@ -76,8 +79,11 @@ impl Journal {
         });
         self.0.len() - 1
     }
-    fn state_of(&self, holding_id: u64) -> Option<JState> {
-        self.0.iter().find(|e| e.holding_id == holding_id).map(|e| e.state)
+    fn state_of(&self, holding_id: HoldingId) -> Option<JState> {
+        self.0
+            .iter()
+            .find(|e| e.holding_id == holding_id)
+            .map(|e| e.state)
     }
 }
 
@@ -88,15 +94,15 @@ impl Journal {
 #[derive(Default)]
 pub struct MockWorld {
     /// 已在世界侧释放的 (class, instance, generation)。
-    released: std::collections::BTreeSet<(String, String, String)>,
+    released: std::collections::BTreeSet<(ClassId, InstanceId, Generation)>,
     /// 凭钥匙去重的补偿效果集：world 侧"恰好一次"的事实来源。
     compensated_keys: std::collections::BTreeSet<String>,
     /// 观察序列：每个成功动作按序记 holding_id（供次序断言）。
-    pub action_order: Vec<u64>,
+    pub action_order: Vec<HoldingId>,
     /// 补偿请求计数（含被去重的重试）——区分"请求次数"与"生效次数"。
     pub compensate_requests: u64,
     /// 注入故障：对该 holding 的前 n 次动作返回失败。
-    pub fail_holding: Option<(u64, u32)>,
+    pub fail_holding: Option<(HoldingId, u32)>,
     /// F6 [CEFF]：类 restore（把持有恢复到段起点检查点）——按钥匙去重，与补偿同款。
     restored_keys: std::collections::BTreeSet<String>,
     /// F6：restore 请求计数（含被去重的重试）。
@@ -104,7 +110,7 @@ pub struct MockWorld {
 }
 
 impl MockWorld {
-    fn maybe_fail(&mut self, hid: u64) -> bool {
+    fn maybe_fail(&mut self, hid: HoldingId) -> bool {
         if let Some((fh, n)) = &mut self.fail_holding {
             if *fh == hid && *n > 0 {
                 *n -= 1;
@@ -122,7 +128,7 @@ impl MockWorld {
     pub fn restored(&self) -> Vec<String> {
         self.restored_keys.iter().cloned().collect()
     }
-    pub fn effects_fingerprint(&self) -> (Vec<(String, String, String)>, Vec<String>) {
+    pub fn effects_fingerprint(&self) -> (Vec<(ClassId, InstanceId, Generation)>, Vec<String>) {
         (
             self.released.iter().cloned().collect(),
             self.compensated_keys.iter().cloned().collect(),
@@ -136,7 +142,11 @@ impl World for MockWorld {
         if self.maybe_fail(item.id) {
             return Err(());
         }
-        let k = (item.class_id.clone(), item.instance.clone(), item.generation.clone());
+        let k = (
+            item.class_id.clone(),
+            item.instance.clone(),
+            item.generation.clone(),
+        );
         if self.released.insert(k) {
             self.action_order.push(item.id);
         }
@@ -163,17 +173,17 @@ impl World for MockWorld {
 // 规划器：[TREE] 约束图只含 ownership 边；波次 = 按"子树深度"由深到浅分层。
 // 同一波内没有 parent 次序约束；还须由 World 的独立性契约满足 [T43] 的前提。
 // ---------------------------------------------------------------------------
-pub fn plan_waves(ledger: &Ledger, subject: &str) -> Vec<Vec<u64>> {
+pub fn plan_waves(ledger: &Ledger, subject: &str) -> Vec<Vec<HoldingId>> {
     // [B15] 规划对象是主体持有的 ownership 闭包（含跨主体后代），不是主体本人的行。
-    plan_waves_over(&ledger.live_closure(subject))
+    plan_waves_over(&ledger.live_closure(&SubjectId::new(subject)))
 }
 
 /// 波次规划的共享核：对任意存活集（主体的闭包、某持有的子树）按"集内深度"分层。
-fn plan_waves_over(items: &[LiveItem]) -> Vec<Vec<u64>> {
+fn plan_waves_over(items: &[LiveItem]) -> Vec<Vec<HoldingId>> {
     if items.is_empty() {
         return Vec::new();
     }
-    let depth_of = |id: u64| -> usize {
+    let depth_of = |id: HoldingId| -> usize {
         let mut d = 0;
         let mut cur = items.iter().find(|it| it.id == id).and_then(|it| it.parent);
         while let Some(p) = cur {
@@ -204,20 +214,28 @@ pub struct Orchestrator<W: World = MockWorld> {
 
 #[derive(PartialEq, Eq, Debug)]
 pub enum RunOutcome {
-    Completed { failed: Vec<u64> },
+    Completed { failed: Vec<HoldingId> },
     Crashed,
 }
 
 impl Orchestrator<MockWorld> {
     pub fn new(ledger: Ledger) -> Self {
-        Self { ledger, journal: Journal::default(), world: MockWorld::default() }
+        Self {
+            ledger,
+            journal: Journal::default(),
+            world: MockWorld::default(),
+        }
     }
 }
 
 impl<W: World> Orchestrator<W> {
     /// 实装入口：账本＋真基底世界（内核的 kill/撤订阅…）。
     pub fn with_world(ledger: Ledger, world: W) -> Self {
-        Self { ledger, journal: Journal::default(), world }
+        Self {
+            ledger,
+            journal: Journal::default(),
+            world,
+        }
     }
 
     /// [CRASH] 唯一清理通道。`order_seed` 决定波内执行序；满足 World 的独立性契约时，
@@ -229,7 +247,15 @@ impl<W: World> Orchestrator<W> {
         order_seed: u64,
         crash_at_step: Option<u64>,
     ) -> RunOutcome {
-        teardown_with(&mut self.ledger, &mut self.journal, &mut self.world, subject, order_seed, crash_at_step, 0)
+        teardown_with(
+            &mut self.ledger,
+            &mut self.journal,
+            &mut self.world,
+            subject,
+            order_seed,
+            crash_at_step,
+            Timestamp::ZERO,
+        )
     }
 
     /// 崩溃后恢复 = 原样再调 teardown（无专用恢复代码路径 —— [CRASH] 单路径的另一半）：
@@ -255,9 +281,18 @@ pub fn teardown_with<W: World>(
     subject: &str,
     order_seed: u64,
     crash_at_step: Option<u64>,
-    now: u64,
+    now: Timestamp,
 ) -> RunOutcome {
-    run(ledger, journal, world, &|l| l.live_closure(subject), subject, order_seed, crash_at_step, now)
+    run(
+        ledger,
+        journal,
+        world,
+        &|l| l.live_closure(&SubjectId::new(subject)),
+        subject,
+        order_seed,
+        crash_at_step,
+        now,
+    )
 }
 
 /// 子树形态（WP-03 撤销级联）：清理域是以 `root` 为根的 ownership 子树（含跨主体
@@ -268,13 +303,22 @@ pub fn teardown_subtree_with<W: World>(
     ledger: &mut Ledger,
     journal: &mut Journal,
     world: &mut W,
-    root: u64,
+    root: HoldingId,
     key_scope: &str,
     order_seed: u64,
     crash_at_step: Option<u64>,
-    now: u64,
+    now: Timestamp,
 ) -> RunOutcome {
-    run(ledger, journal, world, &|l| l.live_subtree(root), key_scope, order_seed, crash_at_step, now)
+    run(
+        ledger,
+        journal,
+        world,
+        &|l| l.live_subtree(root),
+        key_scope,
+        order_seed,
+        crash_at_step,
+        now,
+    )
 }
 
 /// 执行器内核：`scope` 给出当前存活集（每次从账本现状重算——计划无状态，
@@ -288,7 +332,7 @@ fn run<W: World>(
     key_scope: &str,
     order_seed: u64,
     crash_at_step: Option<u64>,
-    now: u64,
+    now: Timestamp,
 ) -> RunOutcome {
     let mut step: u64 = 0;
     let mut failed = Vec::new();
@@ -303,14 +347,19 @@ fn run<W: World>(
             return RunOutcome::Completed { failed };
         }
         passes += 1;
-        assert!(passes <= 4096, "teardown failed to make progress — planner/guard bug");
+        assert!(
+            passes <= 4096,
+            "teardown failed to make progress — planner/guard bug"
+        );
         let mut progressed = false;
         for wave in waves {
             let mut order = wave.clone();
             // [T43] 波内洗牌；任意次序等效依赖 World 的独立性契约，MockWorld 测试覆盖其特例。
             let mut s = order_seed.wrapping_add(order.len() as u64);
             for i in (1..order.len()).rev() {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 order.swap(i, (s >> 33) as usize % (i + 1));
             }
             for hid in order {
@@ -356,7 +405,7 @@ fn run<W: World>(
                 }
                 if ok {
                     // 账本侧收尾（F1 的 release：幂等、落墓碑）。守卫已保证不会越序。
-                    match ledger.release(hid, &item.generation, now) {
+                    match ledger.release(&item.handle(), now) {
                         Ok(()) => {}
                         Err(e) => panic!("ledger release invariant broken: {e:?}"),
                     }

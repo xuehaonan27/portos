@@ -68,16 +68,24 @@
 //! its `World` takes host locks; no host path takes a host lock and then the
 //! ledger.
 
+use crate::ledger::ExclusiveRequest;
 use crate::ledger::{
     CLASS_FILE_LOCK, CLASS_PLUGIN, CLASS_PORT, CLASS_PROCESS, CLASS_SUBSCRIPTION, kill_pid,
     proc_alive, proc_start_time,
 };
 use crate::{Kernel, KernelError};
+use portos_proto::resource::{
+    HoldRequest, HoldingRef, ReleaseRequest, ReleaseResponse, RenewRequest, RenewResponse,
+};
 use portos_proto::{Label, chunk, frame};
 use portos_rm::coeffect::{Flat, Manifest, Mount, Requires, admit_mount};
+use portos_rm::identity::{
+    AccountId, ClassId, Generation, HoldingHandle, HoldingId, InstanceId, ResourceKey, SubjectId,
+};
 use portos_rm::ledger::{LiveItem, RevertGrade};
 use portos_rm::protocol::Protocol;
 use portos_rm::teardown::{RunOutcome, World};
+use portos_rm::time::{LeaseDuration, LeaseRequest, Timestamp};
 use portos_rm::verbs::{ConsumeGrade, EmitGrade, Kind, VerbEntry, VerbTable};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -105,7 +113,7 @@ struct PluginHandle {
     sock_path: PathBuf,
     /// The plugin's `kernel/plugin` holding (F1) and its generation (the
     /// spawn token): the stable denotation of this incarnation.
-    holding: u64,
+    holding: HoldingHandle,
     generation: String,
     pid: u32,
     /// Position ceiling (F5 effect row) when spawned into a slot: the verbs
@@ -138,7 +146,7 @@ struct Sub {
     topic: String,
     target: SubTarget,
     /// The `kernel/subscription` holding backing this subscription.
-    holding: u64,
+    holding: HoldingHandle,
 }
 
 /// A routed verb: which plugin serves it, plus the model-facing metadata the
@@ -199,7 +207,11 @@ impl Host {
             sweeper_handle: Mutex::new(None),
         });
         let plans = crate::plans::PlanService::new(kernel.clone(), inner.clone());
-        Ok(Host { kernel, inner, plans })
+        Ok(Host {
+            kernel,
+            inner,
+            plans,
+        })
     }
 
     /// Spawn `bin args…` with `envs` added, wait for both hellos, register
@@ -224,7 +236,16 @@ impl Host {
         envs: &[(&str, &str)],
         slot: Option<&Slot>,
     ) -> Result<String, KernelError> {
-        spawn_plugin(&self.kernel, &self.inner, &self.plans, bin, args, envs, slot, None)
+        spawn_plugin(
+            &self.kernel,
+            &self.inner,
+            &self.plans,
+            bin,
+            args,
+            envs,
+            slot,
+            None,
+        )
     }
 }
 
@@ -245,7 +266,7 @@ fn spawn_plugin(
     args: &[&str],
     envs: &[(&str, &str)],
     slot: Option<&Slot>,
-    parent: Option<(&str, u64)>,
+    parent: Option<(&str, HoldingHandle)>,
 ) -> Result<String, KernelError> {
     let idx = inner.next_spawn.fetch_add(1, Ordering::SeqCst);
     let sock_path = inner
@@ -268,18 +289,19 @@ fn spawn_plugin(
     // The serve connection comes first and declares which extra channels
     // follow ("client" always; "events" optionally). Bad token or an
     // undeclared/duplicate role is fatal for the spawn.
-    let accept_hello = |child: &mut std::process::Child| -> Result<(UnixStream, Value), KernelError> {
-        let mut stream = accept_with_deadline(&listener, child, SPAWN_DEADLINE_MS)?;
-        let hello = frame::read_frame(&mut stream)
-            .map_err(|e| KernelError::Corrupt(format!("hello: {e}")))?;
-        if hello["hello"]["token"].as_str() != Some(token.as_str()) {
-            let _ = frame::write_frame(&mut stream, &json!({"err": "bad token"}));
-            return Err(KernelError::Denied("plugin hello: bad token".into()));
-        }
-        frame::write_frame(&mut stream, &json!({"ok": {}}))
-            .map_err(|e| KernelError::Corrupt(format!("hello ack: {e}")))?;
-        Ok((stream, hello["hello"].clone()))
-    };
+    let accept_hello =
+        |child: &mut std::process::Child| -> Result<(UnixStream, Value), KernelError> {
+            let mut stream = accept_with_deadline(&listener, child, SPAWN_DEADLINE_MS)?;
+            let hello = frame::read_frame(&mut stream)
+                .map_err(|e| KernelError::Corrupt(format!("hello: {e}")))?;
+            if hello["hello"]["token"].as_str() != Some(token.as_str()) {
+                let _ = frame::write_frame(&mut stream, &json!({"err": "bad token"}));
+                return Err(KernelError::Denied("plugin hello: bad token".into()));
+            }
+            frame::write_frame(&mut stream, &json!({"ok": {}}))
+                .map_err(|e| KernelError::Corrupt(format!("hello ack: {e}")))?;
+            Ok((stream, hello["hello"].clone()))
+        };
 
     let (serve_stream, hello) = match accept_hello(&mut child) {
         Ok((stream, h)) if h["role"] == "serve" => (stream, h),
@@ -378,23 +400,34 @@ fn spawn_plugin(
     // ---- F1: the instance is a holding. Ledger first, host locks after.
     let now = crate::db::now_unix();
     let subject = format!("plugin:{name}");
-    let holding = match parent {
+    let holding = match &parent {
         Some((parent_name, parent_holding)) => kernel
             .ledger
             .hold_exclusive_child(
-                &subject,
-                CLASS_PLUGIN,
-                &name,
-                &token,
-                &format!("plugin:{parent_name}"),
-                parent_holding,
-                now,
+                ExclusiveRequest {
+                    owner: SubjectId::new(&subject),
+                    resource: ResourceKey::new(ClassId::new(CLASS_PLUGIN), InstanceId::new(&name)),
+                    generation: Generation::new(&token),
+                    parent: Some(parent_holding.clone()),
+                    lease: LeaseRequest::UseClassDefault,
+                },
+                SubjectId::new(&format!("plugin:{parent_name}")),
+                Timestamp::try_from(now).map_err(crate::ledger::map_err)?,
             )
             .map_err(|e| {
                 let _ = child.kill();
                 KernelError::Denied(format!("plugin {name}: spawn under parent refused: {e}"))
             })?,
-        None => match kernel.ledger.hold_exclusive(&subject, CLASS_PLUGIN, &name, &token, None, now) {
+        None => match kernel.ledger.hold_exclusive(
+            ExclusiveRequest {
+                owner: SubjectId::new(&subject),
+                resource: ResourceKey::new(ClassId::new(CLASS_PLUGIN), InstanceId::new(&name)),
+                generation: Generation::new(&token),
+                parent: None,
+                lease: LeaseRequest::UseClassDefault,
+            },
+            Timestamp::try_from(now).map_err(crate::ledger::map_err)?,
+        ) {
             Ok(id) => id,
             Err(_) => {
                 let _ = child.kill();
@@ -411,7 +444,10 @@ fn spawn_plugin(
         let mut routes = inner.routes.lock().unwrap();
         if let Some(v) = verbs.iter().find(|v| routes.contains_key(*v)) {
             let _ = child.kill();
-            let _ = kernel.ledger.release(holding, &token, now);
+            let _ = kernel.ledger.release(
+                &holding,
+                Timestamp::try_from(now).expect("system timestamp in range"),
+            );
             return Err(KernelError::Denied(format!("verb already routed: {v}")));
         }
         let (events_tx, events_rx) = sync_channel::<Value>(EVENT_QUEUE);
@@ -421,7 +457,7 @@ fn spawn_plugin(
             events: events.map(Mutex::new),
             events_tx,
             sock_path: sock_path.clone(),
-            holding,
+            holding: holding.clone(),
             generation: token.clone(),
             pid,
             offers,
@@ -458,12 +494,18 @@ fn spawn_plugin(
         }
         plugins.insert(name.clone(), handle.clone());
         spawn_event_pump(handle.clone(), events_rx);
-        spawn_client_loop(kernel.clone(), inner.clone(), plans.clone(), name.clone(), client_stream);
+        spawn_client_loop(
+            kernel.clone(),
+            inner.clone(),
+            plans.clone(),
+            name.clone(),
+            client_stream,
+        );
     }
 
     let _ = kernel.audit.lock().unwrap().append(json!({
         "event": "plugin.spawned", "plugin": name, "verbs": verbs,
-        "holding": holding, "pid": pid, "parent": parent.map(|(p, _)| p),
+        "holding": holding.id().get(), "pid": pid, "parent": parent.as_ref().map(|(p, _)| p),
     }));
     Ok(name)
 }
@@ -483,7 +525,12 @@ fn routed_families(inner: &HostInner) -> Vec<String> {
 impl Host {
     /// OS pid of a running plugin (tests kill plugins with it).
     pub fn pid(&self, plugin: &str) -> Option<u32> {
-        self.inner.plugins.lock().unwrap().get(plugin).map(|h| h.pid)
+        self.inner
+            .plugins
+            .lock()
+            .unwrap()
+            .get(plugin)
+            .map(|h| h.pid)
     }
 
     /// The plugin serving a verb, if any — used by the CLI to find a driver
@@ -508,7 +555,9 @@ impl Host {
     /// how many caps the cascade newly revoked.
     pub fn revoke_capability(&self, cap_id: &str) -> Result<u64, KernelError> {
         let now = crate::db::now_unix();
-        let mut world = HostWorld { inner: self.inner.clone() };
+        let mut world = HostWorld {
+            inner: self.inner.clone(),
+        };
         let n = self.kernel.caps.revoke(cap_id, &mut world, now)?;
         let _ = self.kernel.audit.lock().unwrap().append(json!({
             "event": "cap.revoked", "cap": cap_id, "cascade": n,
@@ -547,13 +596,17 @@ impl Host {
     /// Subscribe an in-process consumer (the CLI / model-facing loop) to a
     /// topic (exact or trailing-`*` prefix pattern). The subscription is a
     /// `kernel/subscription` holding of the kernel itself.
-    pub fn subscribe_local(&self, topic: &str) -> (u64, Receiver<Value>) {
+    pub fn subscribe_local(&self, topic: &str) -> Result<(u64, Receiver<Value>), KernelError> {
         subscribe_with_subject(&self.kernel, &self.inner, "kernel", topic)
     }
 
     /// Subscribe an arbitrary kernel-side subject (e.g. a plan run's
     /// segment) to a topic: the holding lands under that subject.
-    pub fn subscribe_for(&self, subject: &str, topic: &str) -> (u64, Receiver<Value>) {
+    pub fn subscribe_for(
+        &self,
+        subject: &str,
+        topic: &str,
+    ) -> Result<(u64, Receiver<Value>), KernelError> {
         subscribe_with_subject(&self.kernel, &self.inner, subject, topic)
     }
 
@@ -565,11 +618,14 @@ impl Host {
             let subs = self.inner.subs.lock().unwrap();
             subs.iter()
                 .find(|s| s.id == sub_id && matches!(s.target, SubTarget::Local(_)))
-                .map(|s| s.holding)
+                .map(|s| s.holding.clone())
         };
         match holding {
             Some(h) => {
-                let _ = self.kernel.ledger.release(h, "sub", crate::db::now_unix());
+                let _ = self.kernel.ledger.release(
+                    &h,
+                    Timestamp::try_from(crate::db::now_unix()).expect("system timestamp in range"),
+                );
                 self.inner.subs.lock().unwrap().retain(|s| s.id != sub_id);
                 true
             }
@@ -587,8 +643,8 @@ impl Host {
     /// trusted plugin's self-reported log (e.g. the egress broker's
     /// `egress::log`) becomes tamper-evident: the plugin emits, the kernel
     /// subscribes and appends.
-    pub fn audit_topic(&self, topic: &str) {
-        let (_id, rx) = self.subscribe_local(topic);
+    pub fn audit_topic(&self, topic: &str) -> Result<(), KernelError> {
+        let (_id, rx) = self.subscribe_local(topic)?;
         let kernel = self.kernel.clone();
         std::thread::spawn(move || {
             for ev in rx {
@@ -599,6 +655,7 @@ impl Host {
                 }));
             }
         });
+        Ok(())
     }
 
     /// (context_bytes, data_bytes) moved through plugin channels so far.
@@ -655,8 +712,13 @@ impl Host {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
                 let now = crate::db::now_unix();
-                let mut world = HostWorld { inner: inner.clone() };
-                match kernel.ledger.sweep_with_world(&mut world, now) {
+                let mut world = HostWorld {
+                    inner: inner.clone(),
+                };
+                match kernel.ledger.sweep_with_world(
+                    &mut world,
+                    Timestamp::try_from(now).expect("system timestamp in range"),
+                ) {
                     Ok(report) if !report.released.is_empty() || !report.failed.is_empty() => {
                         let mut classes: BTreeMap<String, usize> = BTreeMap::new();
                         for (_, class, _) in &report.released {
@@ -724,8 +786,8 @@ fn call_on(handle: &PluginHandle, verb: &str, args: Value) -> Result<Value, Kern
     };
     frame::write_frame(&mut *s, &json!({"op": "call", "verb": verb, "args": args}))
         .map_err(|e| KernelError::Corrupt(format!("call write: {e}")))?;
-    let resp = frame::read_frame(&mut *s)
-        .map_err(|e| KernelError::Corrupt(format!("call read: {e}")))?;
+    let resp =
+        frame::read_frame(&mut *s).map_err(|e| KernelError::Corrupt(format!("call read: {e}")))?;
     if let Some(err) = resp.get("err").and_then(|e| e.as_str()) {
         return Err(KernelError::Denied(format!("plugin error: {err}")));
     }
@@ -737,7 +799,11 @@ fn call_on(handle: &PluginHandle, verb: &str, args: Value) -> Result<Value, Kern
 
 fn str_array(v: &Value) -> Vec<String> {
     v.as_array()
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -759,7 +825,9 @@ fn build_verb_table(
             "external" => RevertGrade::External,
             other => return Err(format!("unknown holding_rho {other}")),
         };
-        table.declare_class(name, rho).map_err(|e| format!("{e:?}"))?;
+        table
+            .declare_class(name, rho)
+            .map_err(|e| format!("{e:?}"))?;
     }
     for v in verbs {
         let meta = &tools_meta[v.as_str()];
@@ -782,7 +850,10 @@ fn kind_from_meta(meta: &Value) -> Result<Option<VerbEntry>, String> {
     let Some(kind) = meta.get("kind").and_then(|k| k.as_str()) else {
         return Ok(None);
     };
-    let compensate = meta.get("compensate_with").and_then(|c| c.as_str()).map(str::to_string);
+    let compensate = meta
+        .get("compensate_with")
+        .and_then(|c| c.as_str())
+        .map(str::to_string);
     let mut entry = match kind {
         "repeatable" => VerbEntry::repeatable(),
         "repeatable_shared" => VerbEntry::repeatable_shared(),
@@ -810,7 +881,10 @@ fn kind_from_meta(meta: &Value) -> Result<Option<VerbEntry>, String> {
                 },
                 Some(other) => return Err(format!("unknown emitting world {other}")),
             };
-            let amortizable = meta.get("amortizable").and_then(|a| a.as_bool()).unwrap_or(true);
+            let amortizable = meta
+                .get("amortizable")
+                .and_then(|a| a.as_bool())
+                .unwrap_or(true);
             VerbEntry::emitting(world, amortizable)
         }
         other => return Err(format!("unknown verb kind {other}")),
@@ -847,7 +921,11 @@ fn protocol_from_json(v: Option<&Value>) -> Result<Option<Protocol>, String> {
         .and_then(|i| i.as_str())
         .ok_or("protocol needs an initial state")?;
     let mut p = Protocol::new(initial);
-    for t in v.get("transitions").and_then(|t| t.as_array()).unwrap_or(&Vec::new()) {
+    for t in v
+        .get("transitions")
+        .and_then(|t| t.as_array())
+        .unwrap_or(&Vec::new())
+    {
         let (Some(from), Some(verb), Some(to)) = (
             t.get(0).and_then(|x| x.as_str()),
             t.get(1).and_then(|x| x.as_str()),
@@ -891,7 +969,7 @@ impl World for HostWorld {
     fn release(&mut self, item: &LiveItem) -> Result<(), ()> {
         match item.class_id.as_str() {
             CLASS_SUBSCRIPTION => {
-                let id: u64 = item.instance.parse().unwrap_or(0);
+                let id: u64 = item.instance.as_str().parse().unwrap_or(0);
                 self.inner.subs.lock().unwrap().retain(|s| s.id != id);
                 Ok(())
             }
@@ -902,21 +980,25 @@ impl World for HostWorld {
                 let handle = {
                     let mut plugins = self.inner.plugins.lock().unwrap();
                     let same = plugins
-                        .get(&item.instance)
-                        .map(|h| h.generation == item.generation)
+                        .get(item.instance.as_str())
+                        .map(|h| h.generation == item.generation.as_str())
                         .unwrap_or(false);
-                    if same { plugins.remove(&item.instance) } else { None }
+                    if same {
+                        plugins.remove(item.instance.as_str())
+                    } else {
+                        None
+                    }
                 };
                 if let Some(h) = handle {
                     kill_and_reap(&h);
-                    cleanup_plugin(&self.inner, &item.instance);
+                    cleanup_plugin(&self.inner, item.instance.as_str());
                 }
                 Ok(())
             }
             CLASS_PROCESS => {
                 // Kill only the exact witnessed incarnation — generation is
                 // "<pid>:<start time>", so a recycled pid is never hit.
-                let mut parts = item.generation.split(':');
+                let mut parts = item.generation.as_str().split(':');
                 let pid: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
                 let start: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
                 if proc_alive(pid, start) {
@@ -925,7 +1007,7 @@ impl World for HostWorld {
                 Ok(())
             }
             CLASS_PORT => Ok(()), // nothing physical to release; reconcile bind-probes
-            CLASS_FILE_LOCK => match std::fs::remove_file(&item.instance) {
+            CLASS_FILE_LOCK => match std::fs::remove_file(item.instance.as_str()) {
                 Ok(()) => Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 Err(_) => Err(()),
@@ -951,8 +1033,14 @@ fn kill_and_reap(h: &PluginHandle) {
 fn reclaim(kernel: &Arc<Kernel>, inner: &Arc<HostInner>, name: &str, reason: &str) -> usize {
     let subject = format!("plugin:{name}");
     let now = crate::db::now_unix();
-    let mut world = HostWorld { inner: inner.clone() };
-    let (outcome, released) = match kernel.ledger.teardown(&subject, &mut world, now) {
+    let mut world = HostWorld {
+        inner: inner.clone(),
+    };
+    let (outcome, released) = match kernel.ledger.teardown(
+        &SubjectId::new(&subject),
+        &mut world,
+        Timestamp::try_from(now).expect("system timestamp in range"),
+    ) {
         Ok(x) => x,
         Err(e) => {
             let _ = kernel.audit.lock().unwrap().append(json!({
@@ -975,7 +1063,7 @@ fn reclaim(kernel: &Arc<Kernel>, inner: &Arc<HostInner>, name: &str, reason: &st
     if released > 0 || !failed.is_empty() {
         let _ = kernel.audit.lock().unwrap().append(json!({
             "event": "plugin.reclaimed", "plugin": name, "reason": reason,
-            "released": released, "failed": failed,
+            "released": released, "failed": failed.iter().map(|id| id.get()).collect::<Vec<_>>(),
         }));
     }
     released
@@ -1009,7 +1097,10 @@ pub(crate) fn invoke_as(
     let family = verb.split("::").next().unwrap_or(verb);
     let short = verb.rsplit("::").next().unwrap_or(verb);
     let resource = format!("driver:{family}");
-    if let Err(e) = kernel.caps.find_and_exercise(subject, &resource, short, now) {
+    if let Err(e) = kernel
+        .caps
+        .find_and_exercise(subject, &resource, short, now)
+    {
         let _ = kernel.audit.lock().unwrap().append(json!({
             "event": "invoke.denied", "from": subject, "verb": verb,
             "reason": e.to_string(),
@@ -1059,9 +1150,13 @@ pub(crate) fn kernel_schemas(inner: &HostInner) -> crate::plancheck::VerbSchemas
 pub(crate) fn target_of(inner: &HostInner, verb: &str, args: &Value) -> String {
     let spec = {
         let routes = inner.routes.lock().unwrap();
-        routes.get(verb).and_then(|e| e.target.as_ref().map(|t| (t.arg.clone(), t.kind.clone())))
+        routes
+            .get(verb)
+            .and_then(|e| e.target.as_ref().map(|t| (t.arg.clone(), t.kind.clone())))
     };
-    let Some((arg, kind)) = spec else { return "*".into() };
+    let Some((arg, kind)) = spec else {
+        return "*".into();
+    };
     let raw = args[&arg].as_str().unwrap_or("*");
     match kind.as_str() {
         "origin" => origin_of(raw).unwrap_or_else(|| raw.to_string()),
@@ -1096,42 +1191,56 @@ pub(crate) fn subscribe_with_subject(
     inner: &Arc<HostInner>,
     subject: &str,
     topic: &str,
-) -> (u64, Receiver<Value>) {
+) -> Result<(u64, Receiver<Value>), KernelError> {
     let (tx, rx) = sync_channel::<Value>(EVENT_QUEUE);
     let id = inner.next_sub.fetch_add(1, Ordering::SeqCst);
-    let holding = kernel
-        .ledger
-        .hold_exclusive(subject, CLASS_SUBSCRIPTION, &id.to_string(), "sub", None, crate::db::now_unix())
-        .unwrap_or(u64::MAX);
+    let holding = kernel.ledger.hold_exclusive(
+        ExclusiveRequest {
+            owner: SubjectId::new(subject),
+            resource: ResourceKey::new(
+                ClassId::new(CLASS_SUBSCRIPTION),
+                InstanceId::new(&id.to_string()),
+            ),
+            generation: Generation::new("sub"),
+            parent: None,
+            lease: LeaseRequest::UseClassDefault,
+        },
+        Timestamp::try_from(crate::db::now_unix()).map_err(crate::ledger::map_err)?,
+    )?;
     inner.subs.lock().unwrap().push(Sub {
         id,
         topic: topic.to_string(),
         target: SubTarget::Local(tx),
         holding,
     });
-    (id, rx)
+    Ok((id, rx))
 }
 
 /// Deliver an event to every matching subscriber. Overflow policy: a local
 /// subscriber is dropped; a plugin subscriber's whole connection is cut
 /// (m0 §3 — never let a slow consumer wedge the kernel).
-pub(crate) fn dispatch_event(kernel: &Arc<Kernel>, inner: &Arc<HostInner>, topic: &str, data: Value) -> usize {
+pub(crate) fn dispatch_event(
+    kernel: &Arc<Kernel>,
+    inner: &Arc<HostInner>,
+    topic: &str,
+    data: Value,
+) -> usize {
     enum Target {
-        Local(u64, u64, SyncSender<Value>),
-        Plugin(u64, u64, String),
+        Local(u64, HoldingHandle, SyncSender<Value>),
+        Plugin(u64, HoldingHandle, String),
     }
     let targets: Vec<Target> = {
         let subs = inner.subs.lock().unwrap();
         subs.iter()
             .filter(|s| topic_matches(&s.topic, topic))
             .map(|s| match &s.target {
-                SubTarget::Local(tx) => Target::Local(s.id, s.holding, tx.clone()),
-                SubTarget::Plugin(name) => Target::Plugin(s.id, s.holding, name.clone()),
+                SubTarget::Local(tx) => Target::Local(s.id, s.holding.clone(), tx.clone()),
+                SubTarget::Plugin(name) => Target::Plugin(s.id, s.holding.clone(), name.clone()),
             })
             .collect()
     };
     let mut delivered = 0usize;
-    let mut drop_subs: Vec<(u64, u64)> = Vec::new();
+    let mut drop_subs: Vec<(u64, HoldingHandle)> = Vec::new();
     let mut kill_plugins: Vec<String> = Vec::new();
     for t in targets {
         match t {
@@ -1181,7 +1290,10 @@ pub(crate) fn dispatch_event(kernel: &Arc<Kernel>, inner: &Arc<HostInner>, topic
         inner.subs.lock().unwrap().retain(|s| !ids.contains(&s.id));
         let now = crate::db::now_unix();
         for (_, holding) in drop_subs {
-            let _ = kernel.ledger.release(holding, "sub", now);
+            let _ = kernel.ledger.release(
+                &holding,
+                Timestamp::try_from(now).expect("system timestamp in range"),
+            );
         }
     }
     for name in kill_plugins {
@@ -1281,77 +1393,82 @@ fn op_hold(
     req: &Value,
     now: u64,
 ) -> Result<Value, KernelError> {
-    let class = req["class"].as_str().unwrap_or("");
-    let instance = req["instance"].as_str().unwrap_or("").to_string();
-    let mut substrate = req.get("substrate").cloned().unwrap_or(Value::Null);
-    let lease_secs = req["lease_secs"].as_u64();
+    let request: HoldRequest = serde_json::from_value(req.clone())
+        .map_err(|e| KernelError::Denied(format!("hold request: {e}")))?;
+    let class = request.class.as_str();
+    let instance = request.instance;
+    let mut substrate = request.substrate;
+    let lease = request
+        .lease_secs
+        .map(LeaseDuration::try_from)
+        .transpose()
+        .map_err(crate::ledger::map_err)?
+        .map(LeaseRequest::For)
+        .unwrap_or_default();
+    let now = Timestamp::try_from(now).map_err(crate::ledger::map_err)?;
+    if instance.is_empty() {
+        return Err(KernelError::Denied("hold: instance required".into()));
+    }
+    let positive_pid = |v: &Value| {
+        v.as_u64()
+            .and_then(|n| i32::try_from(n).ok())
+            .filter(|p| *p > 0)
+            .map(|p| p as u32)
+            .ok_or_else(|| {
+                KernelError::Denied("substrate pid must be a positive process ID".into())
+            })
+    };
     let generation = match class {
         CLASS_PROCESS => {
-            let pid = substrate["pid"].as_u64().map(|p| p as u32).unwrap_or(0);
-            match pid > 0 {
-                true => match proc_start_time(pid) {
-                    Some(start) => {
-                        substrate = json!({"pid": pid, "start": start});
-                        format!("{pid}:{start}")
-                    }
-                    None => return hold_denied(kernel, name, class, "process not found"),
-                },
-                false => return hold_denied(kernel, name, class, "substrate.pid required"),
-            }
+            let pid = positive_pid(&substrate["pid"])?;
+            let start = proc_start_time(pid)
+                .ok_or_else(|| KernelError::Denied("hold: process not found".into()))?;
+            substrate = json!({"pid":pid,"start":start});
+            Generation::new(format!("{pid}:{start}"))
         }
         CLASS_FILE_LOCK => {
-            // Record the owner's start time when we can read it, so a
-            // later reconcile checks the exact incarnation, not a recycled pid.
-            if let Some(p) = substrate["owner_pid"].as_u64() {
-                if let Some(s) = proc_start_time(p as u32) {
-                    substrate["owner_start"] = json!(s);
+            if let Some(raw) = substrate.get("owner_pid") {
+                let pid = positive_pid(raw)?;
+                if let Some(start) = proc_start_time(pid) {
+                    substrate["owner_start"] = json!(start);
                 }
             }
-            rand_token()
+            Generation::new(rand_token())
         }
-        _ => rand_token(),
+        _ => Generation::new(rand_token()),
     };
-    if instance.is_empty() {
-        return hold_denied(kernel, name, class, "instance required");
+    let parent = inner
+        .plugins
+        .lock()
+        .unwrap()
+        .get(name)
+        .map(|h| h.holding.clone());
+    let handle = kernel.ledger.hold_substrate(ExclusiveRequest {
+        owner: SubjectId::new(format!("plugin:{name}")), resource: ResourceKey::new(ClassId::new(class), InstanceId::new(&instance)),
+        generation, parent, lease,
+    }, &substrate, now).map_err(|e| {
+        let _ = kernel.audit.lock().unwrap().append(json!({"event":"hold.denied","from":name,"class":class,"instance":instance,"reason":e.to_string()}));
+        e
+    })?;
+    let reference = HoldingRef {
+        id: handle.id().get(),
+        generation: handle.generation().to_string(),
+    };
+    let _ = kernel.audit.lock().unwrap().append(json!({"event":"substrate.held","plugin":name,"class":class,"instance":instance,"holding":reference.id,"generation":reference.generation,"lease_secs":request.lease_secs}));
+    Ok(json!({"ok":reference}))
+}
+
+fn domain_handle(reference: &HoldingRef) -> Result<HoldingHandle, KernelError> {
+    if reference.generation.is_empty() {
+        return Err(KernelError::Denied("empty generation".into()));
     }
-    let parent = inner.plugins.lock().unwrap().get(name).map(|h| h.holding);
-    let id = kernel
-        .ledger
-        .hold_substrate(
-            &format!("plugin:{name}"),
-            class,
-            &instance,
-            &generation,
-            parent,
-            &substrate,
-            lease_secs,
-            now,
-        )
-        .map_err(|e| {
-            let _ = kernel.audit.lock().unwrap().append(json!({
-                "event": "hold.denied", "from": name, "class": class,
-                "instance": instance, "reason": e.to_string(),
-            }));
-            e
-        })?;
-    let _ = kernel.audit.lock().unwrap().append(json!({
-        "event": "substrate.held", "plugin": name, "class": class,
-        "instance": instance, "holding": id, "generation": generation,
-        "lease_secs": lease_secs,
-    }));
-    Ok(json!({"ok": {"id": id, "generation": generation}}))
+    Ok(HoldingHandle::new(
+        HoldingId::try_from(reference.id).map_err(crate::ledger::map_err)?,
+        Generation::new(&reference.generation),
+    ))
 }
 
-fn hold_denied(kernel: &Arc<Kernel>, name: &str, class: &str, reason: &str) -> Result<Value, KernelError> {
-    let _ = kernel.audit.lock().unwrap().append(json!({
-        "event": "hold.denied", "from": name, "class": class, "reason": reason,
-    }));
-    Err(KernelError::Denied(format!("hold: {reason}")))
-}
-
-/// `release {id, generation}`: a plugin releases only its own rows. The world
-/// side runs first (kill the witnessed process, remove the lock file — all
-/// idempotent), then the tombstone.
+// M2 will replace the synchronous world call with a committed cleanup obligation.
 fn op_release(
     kernel: &Arc<Kernel>,
     inner: &Arc<HostInner>,
@@ -1359,71 +1476,73 @@ fn op_release(
     req: &Value,
     now: u64,
 ) -> Result<Value, KernelError> {
-    let id = req["id"].as_u64().unwrap_or(0);
-    let generation = req["generation"].as_str().unwrap_or("").to_string();
-    let denied = |kernel: &Arc<Kernel>, reason: &str| {
-        let _ = kernel.audit.lock().unwrap().append(json!({
-            "event": "release.denied", "from": name, "holding": id, "reason": reason,
-        }));
-        Err(KernelError::Denied(format!("release: {reason}")))
-    };
-    let Some(h) = kernel.ledger.holding(id) else {
-        return denied(kernel, "unknown holding");
-    };
-    if h.subject != format!("plugin:{name}") || h.released_at.is_some() {
-        return denied(kernel, "not your holding");
+    let request: ReleaseRequest = serde_json::from_value(req.clone())
+        .map_err(|e| KernelError::Denied(format!("release request: {e}")))?;
+    let handle = domain_handle(&request.holding)?;
+    let now = Timestamp::try_from(now).map_err(crate::ledger::map_err)?;
+    let subject = SubjectId::new(format!("plugin:{name}"));
+    let h = kernel
+        .ledger
+        .holding(handle.id())?
+        .ok_or_else(|| KernelError::Denied("release: unknown holding".into()))?;
+    if h.subject != subject || h.released_at.is_some() {
+        return Err(KernelError::Denied("release: not your holding".into()));
     }
-    if h.generation != generation {
-        return denied(kernel, "stale generation");
+    if &h.generation != handle.generation() {
+        return Err(KernelError::Denied("release: stale generation".into()));
     }
-    let mut world = HostWorld { inner: inner.clone() };
+    let mut world = HostWorld {
+        inner: inner.clone(),
+    };
     let item = LiveItem {
         id: h.id,
         parent: h.parent,
         class_id: h.class_id.clone(),
         instance: h.instance.clone(),
         generation: h.generation.clone(),
-        grade: RevertGrade::Inverse, // all holdable built-ins are inverse-grade
+        grade: RevertGrade::Inverse,
     };
     let _ = world.release(&item);
-    kernel.ledger.release(id, &generation, now)?;
-    let _ = kernel.audit.lock().unwrap().append(json!({
-        "event": "substrate.released", "plugin": name, "holding": id,
-        "class": h.class_id, "instance": h.instance,
-    }));
-    Ok(json!({"ok": {"released": true}}))
+    kernel.ledger.transaction(|tx| {
+        let current = tx
+            .holding(handle.id())
+            .ok_or_else(|| KernelError::Denied("release: unknown holding".into()))?;
+        if current.subject != subject {
+            return Err(KernelError::Denied("release: owner changed".into()));
+        }
+        tx.release(&handle, now)
+    })?;
+    let _ = kernel.audit.lock().unwrap().append(json!({"event":"substrate.released","plugin":name,"holding":handle.id().get(),"class":h.class_id.as_str(),"instance":h.instance.as_str()}));
+    Ok(json!({"ok":ReleaseResponse { released:true }}))
 }
 
-/// `renew {id, generation, lease_secs?}`: heartbeat for a leased holding.
 fn op_renew(kernel: &Arc<Kernel>, name: &str, req: &Value, now: u64) -> Result<Value, KernelError> {
-    let id = req["id"].as_u64().unwrap_or(0);
-    let generation = req["generation"].as_str().unwrap_or("").to_string();
-    let lease_secs = req["lease_secs"].as_u64();
-    let owned = kernel
-        .ledger
-        .holding(id)
-        .map(|h| h.subject == format!("plugin:{name}") && h.released_at.is_none())
-        .unwrap_or(false);
-    if !owned {
-        let _ = kernel.audit.lock().unwrap().append(json!({
-            "event": "renew.denied", "from": name, "holding": id,
-        }));
-        return Err(KernelError::Denied("renew: not your holding".into()));
-    }
+    let request: RenewRequest = serde_json::from_value(req.clone())
+        .map_err(|e| KernelError::Denied(format!("renew request: {e}")))?;
+    let handle = domain_handle(&request.holding)?;
+    let now = Timestamp::try_from(now).map_err(crate::ledger::map_err)?;
+    let lease = request
+        .lease_secs
+        .map(LeaseDuration::try_from)
+        .transpose()
+        .map_err(crate::ledger::map_err)?
+        .map(LeaseRequest::For)
+        .unwrap_or_default();
     let expires = kernel
         .ledger
-        .renew(id, &generation, lease_secs, now)
-        .map_err(|e| {
-            let _ = kernel.audit.lock().unwrap().append(json!({
-                "event": "renew.denied", "from": name, "holding": id, "reason": e.to_string(),
-            }));
-            e
-        })?;
-    let _ = kernel.audit.lock().unwrap().append(json!({
-        "event": "substrate.renewed", "plugin": name, "holding": id,
-        "lease_expires_at": expires,
-    }));
-    Ok(json!({"ok": {"lease_expires_at": expires}}))
+        .transaction(|tx| {
+            let h = tx
+                .holding(handle.id())
+                .ok_or_else(|| KernelError::Denied("renew: unknown holding".into()))?;
+            if h.subject.as_str() != format!("plugin:{name}") {
+                return Err(KernelError::Denied("renew: not your holding".into()));
+            }
+            tx.renew(&handle, lease, now)
+        })?
+        .expires_at()
+        .map(Timestamp::get);
+    let _ = kernel.audit.lock().unwrap().append(json!({"event":"substrate.renewed","plugin":name,"holding":handle.id().get(),"lease_expires_at":expires}));
+    Ok(json!({"ok":RenewResponse { lease_expires_at:expires }}))
 }
 
 fn handle_client_op(
@@ -1452,7 +1571,12 @@ fn handle_client_op(
                 .lock()
                 .unwrap()
                 .get(name)
-                .map(|h| h.offers.as_ref().map(|o| o.0.contains(verb)).unwrap_or(true))
+                .map(|h| {
+                    h.offers
+                        .as_ref()
+                        .map(|o| o.0.contains(verb))
+                        .unwrap_or(true)
+                })
                 .unwrap_or(true);
             if !in_row {
                 let _ = kernel.audit.lock().unwrap().append(json!({
@@ -1463,7 +1587,10 @@ fn handle_client_op(
                     "verb outside the slot row: {verb}"
                 )));
             }
-            let cap = match kernel.caps.find_and_exercise(&subject, &resource, short, now) {
+            let cap = match kernel
+                .caps
+                .find_and_exercise(&subject, &resource, short, now)
+            {
                 Ok(id) => id,
                 Err(e) => {
                     let _ = kernel.audit.lock().unwrap().append(json!({
@@ -1520,15 +1647,23 @@ fn handle_client_op(
                 let Some(family) = cap.resource.strip_prefix("driver:") else {
                     continue;
                 };
-                let holding = kernel.ledger.cap_holding(&cap.cap_id).map(|h| h.id).unwrap_or(0);
+                let Some(holding) = kernel
+                    .ledger
+                    .cap_holding(&AccountId::new(&cap.cap_id))?
+                    .map(|h| h.id.get())
+                else {
+                    continue;
+                };
                 for short in &cap.verbs {
                     let verb = format!("{family}::{short}");
                     // Balance = capacity − fold of spend rows (F1), a snapshot.
-                    let this = kernel.caps.counts_left(cap, short);
+                    let this = kernel.caps.counts_left(cap, short)?;
                     merged
                         .entry(verb)
                         .and_modify(|acc| {
-                            if key(this, cap.constraints.expires_at) > key(acc.counts, acc.expires_at) {
+                            if key(this, cap.constraints.expires_at)
+                                > key(acc.counts, acc.expires_at)
+                            {
                                 *acc = Best {
                                     counts: this,
                                     expires_at: cap.constraints.expires_at,
@@ -1587,25 +1722,35 @@ fn handle_client_op(
             let id = inner.next_sub.fetch_add(1, Ordering::SeqCst);
             // A standing inbound channel is a holding, child of the plugin's
             // own holding: teardown unsubscribes before it kills.
-            let parent = inner.plugins.lock().unwrap().get(name).map(|h| h.holding);
+            let parent = inner
+                .plugins
+                .lock()
+                .unwrap()
+                .get(name)
+                .map(|h| h.holding.clone());
             let subject = format!("plugin:{name}");
             let holding = kernel.ledger.hold_exclusive(
-                &subject,
-                CLASS_SUBSCRIPTION,
-                &id.to_string(),
-                "sub",
-                parent,
-                now,
+                ExclusiveRequest {
+                    owner: SubjectId::new(&subject),
+                    resource: ResourceKey::new(
+                        ClassId::new(CLASS_SUBSCRIPTION),
+                        InstanceId::new(&id.to_string()),
+                    ),
+                    generation: Generation::new("sub"),
+                    parent: parent,
+                    lease: LeaseRequest::UseClassDefault,
+                },
+                Timestamp::try_from(now).map_err(crate::ledger::map_err)?,
             )?;
             inner.subs.lock().unwrap().push(Sub {
                 id,
                 topic: topic.clone(),
                 target: SubTarget::Plugin(name.to_string()),
-                holding,
+                holding: holding.clone(),
             });
             let _ = kernel.audit.lock().unwrap().append(json!({
                 "event": "events.subscribed", "plugin": name, "topic": topic, "sub": id,
-                "holding": holding,
+                "holding": holding.id().get(),
             }));
             Ok(json!({"ok": {"sub": id}}))
         }
@@ -1618,11 +1763,14 @@ fn handle_client_op(
                 let subs = inner.subs.lock().unwrap();
                 subs.iter()
                     .find(|s| s.id == id && matches!(&s.target, SubTarget::Plugin(n) if n == name))
-                    .map(|s| s.holding)
+                    .map(|s| s.holding.clone())
             };
             let removed = match holding {
                 Some(h) => {
-                    let _ = kernel.ledger.release(h, "sub", now);
+                    let _ = kernel.ledger.release(
+                        &h,
+                        Timestamp::try_from(now).expect("system timestamp in range"),
+                    );
                     inner.subs.lock().unwrap().retain(|s| s.id != id);
                     true
                 }
@@ -1639,7 +1787,11 @@ fn handle_client_op(
             // the child down first (F2 closure).
             let subject = format!("plugin:{name}");
             let bin = req["bin"].as_str().unwrap_or("").to_string();
-            if let Err(e) = kernel.caps.find_and_exercise(&subject, "kernel:spawn", "spawn_child", now) {
+            if let Err(e) =
+                kernel
+                    .caps
+                    .find_and_exercise(&subject, "kernel:spawn", "spawn_child", now)
+            {
                 let _ = kernel.audit.lock().unwrap().append(json!({
                     "event": "spawn_child.denied", "from": name, "bin": bin,
                     "reason": e.to_string(),
@@ -1651,7 +1803,7 @@ fn handle_client_op(
                 .lock()
                 .unwrap()
                 .get(name)
-                .map(|h| h.holding)
+                .map(|h| h.holding.clone())
                 .ok_or_else(|| KernelError::NotFound(format!("parent plugin gone: {name}")))?;
             let args: Vec<String> = str_array(&req["args"]);
             let envs: Vec<(String, String)> = req["env"]
@@ -1809,6 +1961,9 @@ fn rand_token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ledger::ExclusiveRequest;
+    use portos_rm::identity::{ClassId, Generation, InstanceId, ResourceKey, SubjectId};
+    use portos_rm::time::{LeaseRequest, Timestamp};
 
     fn host(tag: &str) -> (Host, std::path::PathBuf) {
         let root = std::env::temp_dir().join(format!("portos-host-{}-{}", tag, std::process::id()));
@@ -1825,15 +1980,28 @@ mod tests {
     #[test]
     fn unsubscribe_local_releases_the_subscription_holding() {
         let (host, root) = host("unsub");
-        let (id, _rx) = host.subscribe_local("t::*");
-        assert_eq!(host.kernel.ledger.counts(CLASS_SUBSCRIPTION), (1, 0));
+        let (id, _rx) = host.subscribe_local("t::*").unwrap();
+        assert_eq!(
+            host.kernel
+                .ledger
+                .counts(&ClassId::new(CLASS_SUBSCRIPTION))
+                .unwrap(),
+            (1, 0)
+        );
         assert!(host.unsubscribe_local(id));
         assert_eq!(
-            host.kernel.ledger.counts(CLASS_SUBSCRIPTION),
+            host.kernel
+                .ledger
+                .counts(&ClassId::new(CLASS_SUBSCRIPTION))
+                .unwrap(),
             (0, 1),
             "holding tombstoned"
         );
-        assert_eq!(host.emit("t::x", json!({})), 0, "no delivery after unsubscribe");
+        assert_eq!(
+            host.emit("t::x", json!({})),
+            0,
+            "no delivery after unsubscribe"
+        );
         assert!(!host.unsubscribe_local(id), "second drop is a no-op");
         host.kernel.ledger.invariant().unwrap();
         drop(host);
@@ -1853,24 +2021,41 @@ mod tests {
             .kernel
             .ledger
             .hold_substrate(
-                "kernel",
-                CLASS_FILE_LOCK,
-                lock.to_str().unwrap(),
-                "g1",
-                None,
+                ExclusiveRequest {
+                    owner: SubjectId::new("kernel"),
+                    resource: ResourceKey::new(
+                        ClassId::new(CLASS_FILE_LOCK),
+                        InstanceId::new(lock.to_str().unwrap()),
+                    ),
+                    generation: Generation::new("g1"),
+                    parent: None,
+                    lease: Some(1)
+                        .map(|s: u64| LeaseDuration::try_from(s).unwrap())
+                        .map(LeaseRequest::For)
+                        .unwrap_or_default(),
+                },
                 &json!({}),
-                Some(1),
-                now,
+                Timestamp::try_from(now).unwrap(),
             )
+            .map(|h| h.id())
             .unwrap();
         host.start_sweeper(std::time::Duration::from_millis(100));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while lock.exists() {
-            assert!(std::time::Instant::now() < deadline, "sweeper never expired the lock");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sweeper never expired the lock"
+            );
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert!(
-            host.kernel.ledger.holding(id).unwrap().released_at.is_some(),
+            host.kernel
+                .ledger
+                .holding(id)
+                .unwrap()
+                .unwrap()
+                .released_at
+                .is_some(),
             "holding tombstoned by the sweep"
         );
         host.kernel.ledger.invariant().unwrap();
@@ -1882,5 +2067,75 @@ mod tests {
             "the sweep is audited (never silent)"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn resource_messages_reject_missing_identity_and_bad_numbers_without_mutation() {
+        let (host, root) = host("resource-codec");
+        let held=op_hold(&host.kernel,&host.inner,"test",&json!({"op":"hold","class":CLASS_PORT,"instance":"tcp:4567","substrate":{},"lease_secs":5}),100).unwrap();
+        let reference: HoldingRef = serde_json::from_value(held["ok"].clone()).unwrap();
+        assert_eq!(
+            reference.id, 0,
+            "missing id used to target this real holding"
+        );
+        let id = HoldingId::try_from(reference.id).unwrap();
+        let before = host.kernel.ledger.holding(id).unwrap().unwrap();
+        for bad in [
+            json!({"generation":reference.generation}),
+            json!({"id":reference.id}),
+            json!({"id":reference.id,"generation":""}),
+            json!({"id":u64::MAX,"generation":reference.generation}),
+        ] {
+            assert!(op_release(&host.kernel, &host.inner, "test", &bad, 101).is_err());
+            assert_eq!(host.kernel.ledger.holding(id).unwrap().unwrap(), before);
+        }
+        for lease in [json!(-1), json!("5"), json!(u64::MAX)] {
+            let bad =
+                json!({"id":reference.id,"generation":reference.generation,"lease_secs":lease});
+            assert!(op_renew(&host.kernel, "test", &bad, 101).is_err());
+            assert_eq!(host.kernel.ledger.holding(id).unwrap().unwrap(), before);
+        }
+        for bad in [
+            json!({"class":CLASS_PORT,"substrate":{}}),
+            json!({"class":CLASS_PORT,"instance":"tcp:4568"}),
+            json!({"class":CLASS_PROCESS,"instance":"x","substrate":{"pid":u64::MAX}}),
+        ] {
+            assert!(op_hold(&host.kernel, &host.inner, "test", &bad, 101).is_err());
+            assert_eq!(
+                host.kernel
+                    .ledger
+                    .live_snapshot(&SubjectId::new("plugin:test"))
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        let heartbeat = op_renew(
+            &host.kernel,
+            "test",
+            &serde_json::to_value(&reference).unwrap(),
+            101,
+        )
+        .unwrap();
+        assert_eq!(heartbeat["ok"]["lease_expires_at"], 105);
+        let released = op_release(
+            &host.kernel,
+            &host.inner,
+            "test",
+            &serde_json::to_value(reference).unwrap(),
+            102,
+        )
+        .unwrap();
+        assert_eq!(released, json!({"ok":{"released":true}}));
+        assert!(
+            host.kernel
+                .ledger
+                .holding(id)
+                .unwrap()
+                .unwrap()
+                .released_at
+                .is_some()
+        );
+        drop(host);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

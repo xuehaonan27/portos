@@ -62,7 +62,12 @@ impl KernelClient {
     /// caller's `kernel:spawn` capability; the child's holding becomes a
     /// child of this plugin's own holding, so reclaiming this plugin tears
     /// the child down first. Returns the child's plugin name.
-    pub fn spawn_child(&self, bin: &str, args: &[&str], env: &[(&str, &str)]) -> Result<String, String> {
+    pub fn spawn_child(
+        &self,
+        bin: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> Result<String, String> {
         let env: serde_json::Map<String, Value> =
             env.iter().map(|(k, v)| (k.to_string(), json!(v))).collect();
         let ok = self.request(&json!({
@@ -93,32 +98,42 @@ impl KernelClient {
         instance: &str,
         substrate: Value,
         lease_secs: Option<u64>,
-    ) -> Result<(u64, String), String> {
-        let mut req = json!({"op": "hold", "class": class, "instance": instance, "substrate": substrate});
-        if let Some(s) = lease_secs {
-            req["lease_secs"] = json!(s);
-        }
-        let ok = self.request(&req)?;
-        let id = ok["id"].as_u64().ok_or_else(|| "no holding id".to_string())?;
-        let generation = ok["generation"].as_str().unwrap_or("").to_string();
-        Ok((id, generation))
+    ) -> Result<portos_proto::resource::HoldingRef, String> {
+        use portos_proto::resource::{HoldRequest, ResourceRequest};
+        let request = ResourceRequest::Hold(HoldRequest {
+            class: class.into(),
+            instance: instance.into(),
+            substrate,
+            lease_secs,
+        });
+        let ok = self.request(&serde_json::to_value(request).map_err(|e| e.to_string())?)?;
+        serde_json::from_value(ok).map_err(|e| format!("invalid hold response: {e}"))
     }
 
-    /// Give a holding back: the world side runs kernel-side (kill the
-    /// witnessed process, remove the lock file), then the row tombstones.
-    pub fn release(&self, id: u64, generation: &str) -> Result<bool, String> {
-        let ok = self.request(&json!({"op": "release", "id": id, "generation": generation}))?;
-        Ok(ok["released"].as_bool().unwrap_or(false))
+    pub fn release(
+        &self,
+        holding: &portos_proto::resource::HoldingRef,
+    ) -> Result<portos_proto::resource::ReleaseResponse, String> {
+        use portos_proto::resource::{ReleaseRequest, ResourceRequest};
+        let request = ResourceRequest::Release(ReleaseRequest {
+            holding: holding.clone(),
+        });
+        let ok = self.request(&serde_json::to_value(request).map_err(|e| e.to_string())?)?;
+        serde_json::from_value(ok).map_err(|e| format!("invalid release response: {e}"))
     }
 
-    /// Heartbeat a leased holding. With `lease_secs`, extend from now.
-    pub fn renew(&self, id: u64, generation: &str, lease_secs: Option<u64>) -> Result<(), String> {
-        let mut req = json!({"op": "renew", "id": id, "generation": generation});
-        if let Some(s) = lease_secs {
-            req["lease_secs"] = json!(s);
-        }
-        self.request(&req)?;
-        Ok(())
+    pub fn renew(
+        &self,
+        holding: &portos_proto::resource::HoldingRef,
+        lease_secs: Option<u64>,
+    ) -> Result<portos_proto::resource::RenewResponse, String> {
+        use portos_proto::resource::{RenewRequest, ResourceRequest};
+        let request = ResourceRequest::Renew(RenewRequest {
+            holding: holding.clone(),
+            lease_secs,
+        });
+        let ok = self.request(&serde_json::to_value(request).map_err(|e| e.to_string())?)?;
+        serde_json::from_value(ok).map_err(|e| format!("invalid renew response: {e}"))
     }
 
     /// What this plugin may invoke right now: live grants joined with the
@@ -185,12 +200,7 @@ fn expect_ok(resp: Value) -> Result<Value, String> {
 /// `on_event` receives subscribed events **on a dedicated thread** fed by the
 /// events channel, so events keep flowing while a call handler is blocked —
 /// which is what lets a handler await an event stream mid-call.
-pub fn serve<F, G>(
-    name: &str,
-    verbs: &[&str],
-    on_call: F,
-    on_event: G,
-) -> std::io::Result<()>
+pub fn serve<F, G>(name: &str, verbs: &[&str], on_call: F, on_event: G) -> std::io::Result<()>
 where
     F: FnMut(&str, &Value, &std::sync::Arc<KernelClient>) -> Result<Value, String>,
     G: FnMut(&str, &Value) + Send + 'static,
@@ -213,7 +223,11 @@ where
     F: FnMut(&str, &Value, &std::sync::Arc<KernelClient>) -> Result<Value, String>,
     G: FnMut(&str, &Value) + Send + 'static,
 {
-    let extra = if tools_meta.is_null() { Value::Null } else { json!({"tools": tools_meta}) };
+    let extra = if tools_meta.is_null() {
+        Value::Null
+    } else {
+        json!({"tools": tools_meta})
+    };
     serve_hello(name, verbs, extra, on_call, on_event)
 }
 
@@ -240,8 +254,9 @@ where
     F: FnMut(&str, &Value, &std::sync::Arc<KernelClient>) -> Result<Value, String>,
     G: FnMut(&str, &Value) + Send + 'static,
 {
-    let sock = std::env::var("PORTOS_PLUGIN_SOCK")
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "PORTOS_PLUGIN_SOCK unset"))?;
+    let sock = std::env::var("PORTOS_PLUGIN_SOCK").map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "PORTOS_PLUGIN_SOCK unset")
+    })?;
     let token = std::env::var("PORTOS_PLUGIN_TOKEN").unwrap_or_default();
 
     let serve_stream = UnixStream::connect(&sock)?;

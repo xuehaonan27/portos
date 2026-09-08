@@ -6,6 +6,7 @@ pub mod chunk;
 pub mod frame;
 pub mod label;
 pub mod plan;
+pub mod resource;
 
 /// Wire ABI version, sent in every hello. ABI v2 (decisions-v1.md D23–D25,
 /// D29): two connections per plugin (serve + client roles), plugin→kernel

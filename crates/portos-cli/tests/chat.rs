@@ -5,6 +5,7 @@
 //! driver → tool_result → final streamed text. Hermetic; skips when node or
 //! the browser driver's node_modules are absent.
 
+use portos_rm::identity::{ClassId, SubjectId};
 use portos_kernel::Kernel;
 use portos_kernel::host::Host;
 use portos_kernel::ledger::{CLASS_FILE_LOCK, CLASS_PROCESS};
@@ -540,24 +541,22 @@ fn browser_close_releases_process_and_profile_lock_holdings() {
             .unwrap_or(false)
     };
     let chromium_pid_of = |kernel: &Kernel| -> u32 {
-        kernel
-            .ledger
-            .live_snapshot("plugin:portos-browser")
+        kernel.ledger.live_snapshot(&SubjectId::new("plugin:portos-browser")).unwrap()
             .iter()
-            .find(|i| i.class_id == CLASS_PROCESS)
-            .and_then(|i| i.generation.split(':').next().and_then(|p| p.parse().ok()))
+            .find(|i| i.class_id.as_str() == CLASS_PROCESS)
+            .and_then(|i| i.generation.as_str().split(':').next().and_then(|p| p.parse().ok()))
             .expect("a kernel/process row for Chromium")
     };
 
     // The browser comes up on navigate: the process holding appears.
     let url = format!("file://{}", fixture.display());
     host.call(&name, "browser::navigate", json!({"url": url})).unwrap();
-    assert_eq!(kernel.ledger.counts(CLASS_PROCESS), (1, 0), "Chromium process held");
+    assert_eq!(kernel.ledger.counts(&ClassId::new(CLASS_PROCESS)).unwrap(), (1, 0), "Chromium process held");
     let lock_exists = ["SingletonLock", "DevToolsActivePort"]
         .iter()
         .any(|f| profile.join(f).exists());
     assert_eq!(
-        kernel.ledger.counts(CLASS_FILE_LOCK).0,
+        kernel.ledger.counts(&ClassId::new(CLASS_FILE_LOCK)).unwrap().0,
         if lock_exists { 1 } else { 0 },
         "the profile lock is held iff Chromium wrote one"
     );
@@ -566,9 +565,9 @@ fn browser_close_releases_process_and_profile_lock_holdings() {
 
     // Graceful close: the driver closes Chromium, then releases the rows.
     host.call(&name, "browser::close", json!({})).unwrap();
-    assert_eq!(kernel.ledger.counts(CLASS_PROCESS), (0, 1), "process holding released");
+    assert_eq!(kernel.ledger.counts(&ClassId::new(CLASS_PROCESS)).unwrap(), (0, 1), "process holding released");
     assert_eq!(
-        kernel.ledger.counts(CLASS_FILE_LOCK).0,
+        kernel.ledger.counts(&ClassId::new(CLASS_FILE_LOCK)).unwrap().0,
         0,
         "lock holding released"
     );
@@ -581,12 +580,12 @@ fn browser_close_releases_process_and_profile_lock_holdings() {
     // Reopen, then kill -9 the plugin: the crash-only teardown kills the
     // exact witnessed Chromium incarnation.
     host.call(&name, "browser::navigate", json!({"url": url})).unwrap();
-    assert_eq!(kernel.ledger.counts(CLASS_PROCESS).0, 1, "reopened: held again");
+    assert_eq!(kernel.ledger.counts(&ClassId::new(CLASS_PROCESS)).unwrap().0, 1, "reopened: held again");
     let cpid2 = chromium_pid_of(&kernel);
     let ppid = host.pid(&name).expect("plugin pid");
     std::process::Command::new("kill").args(["-9", &ppid.to_string()]).status().unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while kernel.ledger.counts(CLASS_PROCESS).0 > 0 {
+    while kernel.ledger.counts(&ClassId::new(CLASS_PROCESS)).unwrap().0 > 0 {
         assert!(std::time::Instant::now() < deadline, "process holding never reclaimed");
         std::thread::sleep(std::time::Duration::from_millis(20));
     }

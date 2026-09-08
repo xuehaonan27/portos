@@ -13,4 +13,5 @@ portos-sdk = { path = "../portos-sdk" }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+portos-rm = { path = "../portos-rm", default-features = false }
 portos-kernel = { path = "../portos-kernel" }

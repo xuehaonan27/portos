@@ -117,9 +117,10 @@ impl Count {
 impl Ra for Count {
     fn op(&self, other: &Self) -> Self {
         match (self, other) {
-            (Count::Value(a), Count::Value(b)) => {
-                a.checked_add(*b).map(Count::Value).unwrap_or(Count::Invalid)
-            }
+            (Count::Value(a), Count::Value(b)) => a
+                .checked_add(*b)
+                .map(Count::Value)
+                .unwrap_or(Count::Invalid),
             _ => Count::Invalid,
         }
     }
@@ -179,28 +180,45 @@ impl Ra for GSet {
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Ranges {
     /// 规范化：按起点排序、两两不相交、相邻已合并。
-    pub spans: Vec<(u64, u64)>,
+    spans: Vec<(u64, u64)>,
     /// ⊥：合成时发生重叠。
-    pub bot: bool,
+    bot: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RangeInputError {
+    Malformed,
+    Overlap,
 }
 
 impl Ranges {
     pub fn of(spans: &[(u64, u64)]) -> Self {
-        // 构造时若重叠即 ⊥（与 op 一致）。
-        let mut r = Ranges::default();
-        for s in spans {
-            r = r.op(&Ranges { spans: vec![*s], bot: false });
+        Self::try_of(spans).unwrap_or_else(|_| Self::bot())
+    }
+    /// Decode raw intervals without discarding reversed or empty spans.
+    pub fn try_of(spans: &[(u64, u64)]) -> Result<Self, RangeInputError> {
+        if spans.iter().any(|(a, b)| a >= b) {
+            return Err(RangeInputError::Malformed);
         }
-        r
+        let spans = Self::normalize(spans.to_vec()).map_err(|_| RangeInputError::Overlap)?;
+        Ok(Self { spans, bot: false })
+    }
+    pub fn spans(&self) -> &[(u64, u64)] {
+        &self.spans
+    }
+    pub fn is_bot(&self) -> bool {
+        self.bot
     }
     pub fn empty() -> Self {
         Ranges::default()
     }
     pub fn bot() -> Self {
-        Ranges { spans: Vec::new(), bot: true }
+        Ranges {
+            spans: Vec::new(),
+            bot: true,
+        }
     }
     fn normalize(mut v: Vec<(u64, u64)>) -> Result<Vec<(u64, u64)>, ()> {
-        v.retain(|(a, b)| a < b); // 空区间不占位
         v.sort_unstable();
         let mut out: Vec<(u64, u64)> = Vec::with_capacity(v.len());
         for (a, b) in v {
@@ -219,7 +237,9 @@ impl Ranges {
     }
     /// 覆盖判定：self 的每个点都在 other 中。
     fn covered_by(&self, other: &Ranges) -> bool {
-        self.spans.iter().all(|(a, b)| other.spans.iter().any(|(c, d)| c <= a && b <= d))
+        self.spans
+            .iter()
+            .all(|(a, b)| other.spans.iter().any(|(c, d)| c <= a && b <= d))
     }
 }
 
@@ -310,7 +330,11 @@ impl Ra for Frac {
         self.0.is_some()
     }
     fn pcore(&self) -> Option<Self> {
-        if self.valid() { None } else { Some(Frac::invalid()) }
+        if self.valid() {
+            None
+        } else {
+            Some(Frac::invalid())
+        }
     }
     fn included_in(&self, b: &Self) -> bool {
         match (&self.0, &b.0) {
@@ -360,6 +384,5 @@ pub fn law_core_mono<A: Ra>(a: &A, b: &A) -> bool {
 ///   a ⤳ b  ⟺  ∀f ∈ M?. ✓(a·f) ⇒ ✓(b·f)
 /// Always checks the empty frame as well. Passing a finite sample is not a proof.
 pub fn fpu_holds<A: Ra>(a: &A, b: &A, frames: &[A]) -> bool {
-    (!a.valid() || b.valid())
-        && frames.iter().all(|f| !a.op(f).valid() || b.op(f).valid())
+    (!a.valid() || b.valid()) && frames.iter().all(|f| !a.op(f).valid() || b.op(f).valid())
 }

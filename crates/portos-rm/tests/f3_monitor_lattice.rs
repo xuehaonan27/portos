@@ -227,7 +227,7 @@ fn check(m: &Monitor, archs: &[Arch], mode: Mode, ending: Ending, w: &mut Witnes
         .orch
         .ledger
         .live()
-        .filter(|h| h.class_id == "budget")
+        .filter(|h| h.class_id.as_str() == "budget")
         .map(|h| match &h.frag {
             portos_rm::ledger::Frag::Count(portos_rm::ra::Count::Value(n)) => *n,
             _ => 0,

@@ -204,7 +204,7 @@ fn agentic_loop_end_to_end_with_tool_call() {
 
     let started = host.call(&modeld, "model::start", json!({})).unwrap();
     let sid = started["session"].as_str().unwrap().to_string();
-    let (_sub, rx) = host.subscribe_local(&format!("model::session::{sid}"));
+    let (_sub, rx) = host.subscribe_local(&format!("model::session::{sid}")).unwrap();
 
     let out = host
         .call(

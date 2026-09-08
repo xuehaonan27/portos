@@ -47,7 +47,7 @@ pub fn run(root: &str) -> Result<(), Box<dyn std::error::Error>> {
     let kernel = Arc::new(Kernel::open(&root)?);
     let host = Host::new(kernel.clone(), &root.join("sock"))?;
     host.start_sweeper(std::time::Duration::from_secs(1)); // WP-02 lease sweeper
-    host.audit_topic("egress::log");
+    host.audit_topic("egress::log")?;
 
     ensure_templates(&root)?;
     warn_if_provider_host_unlisted(&root);
@@ -80,7 +80,7 @@ pub fn run(root: &str) -> Result<(), Box<dyn std::error::Error>> {
         .as_str()
         .ok_or("model driver returned no session id")?
         .to_string();
-    let (_sub, rx) = host.subscribe_local(&format!("model::session::{sid}"));
+    let (_sub, rx) = host.subscribe_local(&format!("model::session::{sid}"))?;
     let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || {
         // The builtin renderer — one subscriber among possibly several

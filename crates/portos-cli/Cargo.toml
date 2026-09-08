@@ -12,3 +12,6 @@ serde_json = { workspace = true }
 portos-kernel = { path = "../portos-kernel" }
 portos-proto = { path = "../portos-proto" }
 portos-signer = { path = "../../plugins/signer" }
+
+[dev-dependencies]
+portos-rm = { path = "../portos-rm", default-features = false }
