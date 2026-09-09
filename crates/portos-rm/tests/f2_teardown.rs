@@ -5,7 +5,7 @@ use portos_rm::ledger::GrantRequest;
 use portos_rm::ledger::*;
 use portos_rm::ra::Ex;
 use portos_rm::registry::{Capacity, Claim};
-use portos_rm::teardown::*;
+use portos_rm::test_support::teardown::*;
 use portos_rm::time::{LeaseDuration, LeaseRequest, Timestamp};
 
 /// 浏览器场景账本：隔离域 ⊃ {chromium ⊃ 3 页面, cdp-proxy, 端口, 工作区, 预约(可补偿)}。
@@ -317,7 +317,7 @@ fn failed_branch_does_not_wedge() {
         _ => panic!("should complete with one failed branch"),
     }
     // 端口的父（隔离域）被 TeardownOrder 保守挡下 —— 失败不越级殃及，也不越序强拆。
-    assert!(o.ledger.live_count() >= 2);
+    assert!(o.ledger.occupying().count() >= 2);
     let r = o.resume("drv", 7);
     assert!(matches!(r, RunOutcome::Completed { failed } if failed.is_empty()));
     assert_eq!(o.ledger.live_count(), 0);

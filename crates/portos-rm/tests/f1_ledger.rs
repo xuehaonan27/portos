@@ -3,6 +3,8 @@
 //! [C1]=行式生命周期记账；[C2]=中央容量检查与 FPU 的区别；
 //! [GEN]=世代化句柄；[CRASH]=crash-only 单路径；[T]=租约/对账。
 
+use portos_rm::test_support::Lcg;
+use portos_rm::test_support::teardown::LedgerDrill;
 use portos_rm::auth::{auth_valid, can_mint, compose};
 use portos_rm::identity::{
     ClassId, Generation, HoldingHandle, HoldingId, InstanceId, ResourceKey, SubjectId,
@@ -826,7 +828,7 @@ fn sweep_cascades_to_parent_bound_children() {
         Vec::<HoldingId>::new(),
         "父到期但子未到期：父保守存活"
     );
-    assert_eq!(l.live_count(), 2);
+    assert_eq!(l.occupying().count(), 2);
     assert_eq!(
         l.sweep(Timestamp::try_from(71u64).unwrap()),
         vec![port, proc_]

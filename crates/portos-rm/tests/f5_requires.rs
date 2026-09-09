@@ -6,6 +6,8 @@
 //! 措辞纪律：合同内的法则（Definition 1）与实例附加性质（交换、单调、join）分开断言、分开标注，
 //! 后者的失败不算合同失败——但它们是我们实例的真实性质，记录在案供实装依赖时查证。
 
+use portos_rm::identity::{ClassId, VerbId};
+use portos_rm::test_support::declarations::Declarations;
 use portos_rm::auth::{auth_valid, can_mint};
 use portos_rm::coeffect::*;
 use portos_rm::ra::{Count, Ra};
@@ -366,12 +368,13 @@ fn budget_is_per_effect_class_not_a_total() {
 /// 先读后谋（effect-plan §6.2）的类型层依据：读循环一千次不抬高同意面上的任何数字。
 #[test]
 fn repeatable_verbs_cost_zero_via_truth_table() {
-    let mut t = VerbTable::new();
+    let mut t = Declarations::new();
     t.register("page", "snapshot", VerbEntry::repeatable()).unwrap();
     t.register("page", "click", VerbEntry::emitting(EmitGrade::External, true)).unwrap();
+    let t = t.check_all().unwrap();
     let lookup = |h: &str, v: &str| -> Requires {
         let caps: &[&str] = if v == "click" { &["input"] } else { &["dom.read"] };
-        Requires::from_table(&t, h, v, caps, &[]).unwrap()
+        Requires::from_table(&t, &ClassId::new(h), &VerbId::new(v), caps, &[]).unwrap()
     };
     let reads = Plan::loop_(1000, Plan::verb("page", "snapshot"));
     let clicks = Plan::loop_(1000, Plan::verb("page", "click"));

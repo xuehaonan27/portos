@@ -29,6 +29,8 @@ use codec::{corrupt, persist};
 #[cfg(test)]
 mod m2_tests;
 #[cfg(test)]
+mod m3_tests;
+#[cfg(test)]
 mod tests;
 
 pub const CLASS_CAP_COUNT: &str = "kernel/cap-count";
@@ -472,16 +474,29 @@ impl LedgerTxn<'_> {
         owner: &SubjectId,
         capacity: Capacity<Count>,
     ) -> Result<PoolRef<Count>, KernelError> {
-        let key = ResourceKey::new(
-            ClassId::new(CLASS_CAP_COUNT),
-            InstanceId::new(format!("{account}/{effect}")),
-        );
         let existing: Option<(String,String,String)> = self.sql.query_row("SELECT owner,class_id,instance FROM resource_accounts WHERE account_id=?1 AND effect_class=?2", params![account.as_str(), effect.as_str()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
-        if existing.as_ref().is_some_and(|(o, c, i)| {
-            o != owner.as_str() || c != key.class().as_str() || i != key.instance().as_str()
-        }) {
-            return Err(corrupt("account binding changed"));
-        }
+        let key = if let Some((bound_owner, class, instance)) = existing {
+            if bound_owner != owner.as_str() || class != CLASS_CAP_COUNT {
+                return Err(corrupt("account binding changed"));
+            }
+            ResourceKey::new(ClassId::new(class), InstanceId::new(instance))
+        } else {
+            // Pool identity is allocated independently of account/effect spelling.
+            // Existing roots retain their stored keys, including legacy names.
+            let mut next = 0u64;
+            loop {
+                let key = ResourceKey::new(
+                    ClassId::new(CLASS_CAP_COUNT),
+                    InstanceId::new(format!("account:{next}")),
+                );
+                if self.ledger.capacity(&key).is_none() {
+                    break key;
+                }
+                next = next
+                    .checked_add(1)
+                    .ok_or_else(|| corrupt("account pool identities exhausted"))?;
+            }
+        };
         let class = self.registered_class::<Count>(key.class())?;
         if self
             .ledger

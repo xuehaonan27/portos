@@ -307,7 +307,7 @@ mod tests {
     use crate::ledger::CLASS_SUBSCRIPTION;
     use crate::ledger::ExclusiveRequest;
     use portos_rm::identity::{ClassId, Generation, InstanceId, ResourceKey, SubjectId};
-    use portos_rm::teardown::MockWorld;
+    use portos_rm::test_support::teardown::MockWorld;
     use portos_rm::time::{LeaseRequest, Timestamp};
     use std::collections::BTreeMap;
 

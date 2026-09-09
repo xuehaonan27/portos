@@ -5,12 +5,17 @@ edition.workspace = true
 description = "PortOS resource-management laws (可运行的法则表): F1 ledger · F2 teardown · F3 monitor · F4 verb table · F5 requires · F6 protocol/bestiary"
 
 [features]
-default = ["plan-shapes", "attach"]
+default = ["plan-shapes"]
 # 计划形状与分析 API；D41 已解除 D31 隔离，内核显式开启此 feature。
 plan-shapes = []
 # F8 附着演练（attachments-v0.md v0.5 的行形）；内核未开启，法则测试默认开启。
-attach = []
+attach = ["test-support"]
+# Simulation and mutable fixtures; never enabled by a normal kernel dependency.
+test-support = []
 
 [dependencies]
 num-bigint = "0.4"
 num-rational = "0.4"
+
+[dev-dependencies]
+portos-rm = { path = ".", features = ["test-support", "attach", "plan-shapes"] }

@@ -48,13 +48,13 @@
 //! sink 越界不在三态商量之列——规划前提崩塌，fail-stop（或按声明降档/改写）。
 
 use crate::identity::{
-    ClassId, Generation, HoldingHandle, HoldingId, InstanceId, ResourceKey, SubjectId,
+    AccountId, ClassId, Generation, HoldingHandle, HoldingId, InstanceId, SubjectId,
 };
 use crate::ledger::GrantRequest;
 use crate::ledger::{AlgebraTag, ClassDecl, Frag, Ledger, LedgerError, RevertGrade};
 use crate::ra::Count;
 use crate::registry::{Capacity, Claim, PoolRef, RuntimeAlgebra};
-use crate::teardown::{Orchestrator, RunOutcome};
+use crate::test_support::teardown::{Orchestrator, RunOutcome, teardown_handles};
 use crate::time::{LeaseRequest, Timestamp};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -105,6 +105,16 @@ pub struct Policy {
 }
 
 impl Policy {
+    pub fn from_checked(policy: &crate::verbs::HandlerPolicy) -> Self {
+        Self {
+            handler: policy.class().to_string(),
+            staged_verbs: policy.withhold.clone(),
+            degrade: policy.degrade.clone(),
+            contained: policy.contained.clone(),
+            protocol: policy.protocol.clone(),
+            ..Self::default()
+        }
+    }
     pub fn allow(&mut self, verb: &str, target: &str) {
         self.allow.insert((verb.into(), target.into()));
     }
@@ -271,6 +281,15 @@ pub enum MonOutcome {
 // 监督器本体：一台带 suppression 缓冲的 edit automaton（[RENEW] 档），
 // 复用 F1 账本做预算闸（[GATE]）、F2 编排器做段回滚（[PREFIX]）。
 // ---------------------------------------------------------------------------
+struct BudgetAccount {
+    pool: PoolRef<Count>,
+    spender: SubjectId,
+}
+struct Segment {
+    subject: SubjectId,
+    holdings: BTreeMap<HoldingId, HoldingHandle>,
+}
+
 pub struct Monitor {
     pub policy: Policy,
     pub mode: Mode,
@@ -283,12 +302,14 @@ pub struct Monitor {
     cursor: usize,
     consent: Option<Consent>,
     /// 当前扣费预算池（consent 或增量同意的 nonce——同意即铸造，池随 nonce 走）。
-    active_pool: String,
+    active_account: Option<AccountId>,
+    accounts: BTreeMap<AccountId, BudgetAccount>,
+    segment: Segment,
     used_nonces: BTreeSet<String>,
     /// [SUPPR] 扣发缓冲。演练中在内存：崩溃＝缓冲尽失＝退化的 abort——
     /// 压制的失败方向是"不发射"，对 w-effect 恰是安全侧（偏离申报）。
     buffer: Vec<WAction>,
-    fiber: String,
+    fiber: SubjectId,
     /// F6 [PROTO]：协议自动机当前状态（只随真实发射推进；替身/压制不推进）。
     proto_state: Option<String>,
     /// F6 [CEFF]：本段内被界内变换触及的目标（持有实例），回滚时逐个 restore。
@@ -319,7 +340,12 @@ impl Monitor {
             plan: Vec::new(),
             cursor: 0,
             consent: None,
-            active_pool: String::new(),
+            active_account: None,
+            accounts: BTreeMap::new(),
+            segment: Segment {
+                subject: SubjectId::new(format!("{fiber}:seg")),
+                holdings: BTreeMap::new(),
+            },
             used_nonces: BTreeSet::new(),
             buffer: Vec::new(),
             fiber: fiber.into(),
@@ -344,7 +370,7 @@ impl Monitor {
 
     /// 段主体：本计划获取侧持有的记账主体，与花费行分开——回滚段＝teardown 此主体。
     pub fn seg_subject(&self) -> String {
-        format!("{}:seg", self.fiber)
+        self.segment.subject.to_string()
     }
 
     /// 四元组合法性（[WYS] 的可判定内核：三个相等/序比较，O(1)）。
@@ -363,7 +389,8 @@ impl Monitor {
 
     /// [GATE] 同意即铸造：为 nonce 立预算池（● 容量行）。
     fn mint_pool(&mut self, c: &Consent) {
-        self.orch
+        let pool = self
+            .orch
             .ledger
             .create_pool(
                 &self
@@ -375,8 +402,16 @@ impl Monitor {
                 Capacity::new(Count::Value(c.budget)).unwrap(),
             )
             .unwrap();
+        let account = AccountId::new(&c.nonce);
+        self.accounts.insert(
+            account.clone(),
+            BudgetAccount {
+                pool,
+                spender: SubjectId::new(format!("{}:spent", self.fiber)),
+            },
+        );
         self.used_nonces.insert(c.nonce.clone());
-        self.active_pool = c.nonce.clone();
+        self.active_account = Some(account);
     }
 
     /// 段是否仍在悬置（缓冲待批或超界待增批）——都押着段内持有，都受原同意 ttl 封顶（[B12]）。
@@ -406,41 +441,50 @@ impl Monitor {
         self.consent = Some(consent);
         self.plan = plan;
         self.cursor = 0;
-        self.proto_state = self.policy.protocol.as_ref().map(|p| p.initial.clone());
+        self.proto_state = self
+            .policy
+            .protocol
+            .as_ref()
+            .map(|p| p.initial().to_string());
         self.state = MonState::Running;
         Ok(())
     }
 
     /// [GATE] 花费＝碎片行的 mint：完整账本检查拒绝透支。
     fn spend(&mut self, cost: u64, now: u64) -> Result<(), LedgerError> {
-        let pool = self.active_pool.clone();
-        let spender = format!("{}:spent", self.fiber);
+        if cost == 0 {
+            return Ok(());
+        }
+        let account = self
+            .active_account
+            .as_ref()
+            .and_then(|id| self.accounts.get(id))
+            .ok_or(LedgerError::UnknownPool)?;
         self.orch
             .ledger
             .grant(
-                &self.orch.ledger.pool::<Count>(&ResourceKey::new(
-                    ClassId::new("budget"),
-                    InstanceId::new(&pool),
-                ))?,
+                &account.pool,
                 GrantRequest {
-                    owner: SubjectId::new(&spender),
-                    claim: Claim::new(Count::Value(cost)).unwrap(),
+                    owner: account.spender.clone(),
+                    claim: Claim::new(Count::Value(cost))?,
                     generation: Generation::new("consent"),
                     parent: None,
                     lease: LeaseRequest::UseClassDefault,
                     now: Timestamp::try_from(now)?,
                 },
             )
-            .map(|h| h.id())
             .map(|_| ())
     }
 
     /// 某预算池的已花费合成值（逐行折叠——行为真相，合计只是重算）。
     pub fn pool_spent(&self, nonce: &str) -> u64 {
+        let Some(account) = self.accounts.get(&AccountId::new(nonce)) else {
+            return 0;
+        };
         self.orch
             .ledger
             .active()
-            .filter(|h| h.class_id.as_str() == "budget" && h.instance.as_str() == nonce)
+            .filter(|h| &h.key() == account.pool.id().key())
             .map(|h| match &h.frag {
                 Frag::Count(Count::Value(n)) => *n,
                 _ => 0,
@@ -456,17 +500,22 @@ impl Monitor {
         claim: Claim<A>,
         now: Timestamp,
     ) -> Result<HoldingHandle, LedgerError> {
-        self.orch.ledger.grant(
+        if matches!(self.state, MonState::Done(_)) {
+            return Err(LedgerError::ForgedHandle);
+        }
+        let holding = self.orch.ledger.grant(
             pool,
             GrantRequest {
-                owner: SubjectId::new(self.seg_subject()),
+                owner: self.segment.subject.clone(),
                 claim,
                 generation,
                 parent: None,
                 lease: LeaseRequest::UseClassDefault,
                 now,
             },
-        )
+        )?;
+        self.segment.holdings.insert(holding.id(), holding.clone());
+        Ok(holding)
     }
 
     /// 逐动作步进：m0 的"逐效应四连"（sink 复检、预算闸、执行、记 trace）
@@ -682,11 +731,18 @@ impl Monitor {
         ) {
             return Err(PromoteError::SegmentClosed);
         }
+        let Some(member) = self.segment.holdings.get(&holding.id()) else {
+            return Err(PromoteError::Ledger(LedgerError::ForgedHandle));
+        };
+        if member != holding {
+            return Err(PromoteError::Ledger(LedgerError::StaleGeneration));
+        }
         let seg = self.seg_subject();
         self.orch
             .ledger
-            .transfer(holding, &SubjectId::new(&seg), SubjectId::new(&self.fiber))
+            .transfer(holding, &SubjectId::new(&seg), self.fiber.clone())
             .map_err(PromoteError::Ledger)?;
+        self.segment.holdings.remove(&holding.id());
         self.trace.push(Ev::Promoted {
             holding: holding.id(),
         });
@@ -696,24 +752,19 @@ impl Monitor {
     /// [SEG-TX] commit：段内剩余持有全部转授给 fiber（一笔一转，碎片不变、聚合值不变，parent 依赖保持）；
     /// 界内变换的触及清单作废（不 restore）；状态 Done(Completed)。
     fn finish_commit(&mut self) {
-        let seg = self.seg_subject();
-        let items: Vec<(HoldingId, Generation)> = self
-            .orch
-            .ledger
-            .live_snapshot(&SubjectId::new(&seg))
-            .into_iter()
-            .map(|it| (it.id, it.generation))
-            .collect();
-        for (id, generation) in &items {
-            match self.orch.ledger.transfer(
-                &HoldingHandle::new(*id, generation.clone()),
-                &SubjectId::new(&seg),
-                SubjectId::new(&self.fiber),
-            ) {
-                Ok(()) => {}
-                Err(e) => panic!("segment commit invariant broken: {e:?}"),
-            }
+        let items: Vec<_> = self.segment.holdings.values().cloned().collect();
+        for h in &items {
+            let row = self.orch.ledger.holding(h.id()).expect("segment holding");
+            assert_eq!(row.handle(), *h);
+            assert!(row.state.is_active() && row.subject == self.segment.subject);
         }
+        for h in &items {
+            self.orch
+                .ledger
+                .transfer(h, &self.segment.subject, self.fiber.clone())
+                .expect("checked segment transfer");
+        }
+        self.segment.holdings.clear();
         self.touched.clear();
         if !items.is_empty() {
             self.trace.push(Ev::SegmentCommitted {
@@ -794,7 +845,7 @@ impl Monitor {
     /// 经 F2 teardown 收回（有逆档释放、可补偿档按钥匙补偿）。
     /// [SEG-TX] 由 `finish_abort`／`expire` 在一切非 commit 终态**自动**调用；公开只为幂等性法则
     /// （重复调用不重复 restore、不重复释放）。
-    pub fn rollback_segment(&mut self, _now: u64) {
+    pub fn rollback_segment(&mut self, now: u64) {
         // F6 [CEFF]：先把界内变换触及的持有恢复到段起点检查点——类 restore，
         // 钥匙 = handler:target:seg，跨重试去重 ⇒ 恰好一次（与 F2 补偿同款承重）。
         let touched: Vec<String> = std::mem::take(&mut self.touched).into_iter().collect();
@@ -809,13 +860,28 @@ impl Monitor {
                 self.trace.push(Ev::Restored { target: t });
             }
         }
-        let subj = self.seg_subject();
-        let n = self.orch.ledger.live_snapshot(&SubjectId::new(&subj)).len();
+        let handles: Vec<_> = self.segment.holdings.values().cloned().collect();
+        let n = handles
+            .iter()
+            .filter(|h| {
+                self.orch
+                    .ledger
+                    .holding(h.id())
+                    .is_some_and(|r| r.state.occupies())
+            })
+            .count();
         if n == 0 {
             return;
         }
-        match self.orch.teardown(&subj, 1, None) {
+        match teardown_handles(
+            &mut self.orch.ledger,
+            &mut self.orch.journal,
+            &mut self.orch.world,
+            &handles,
+            Timestamp::try_from(now).unwrap(),
+        ) {
             RunOutcome::Completed { failed } if failed.is_empty() => {
+                self.segment.holdings.clear();
                 self.trace.push(Ev::SegmentRolledBack { holdings: n });
             }
             other => panic!("segment rollback did not converge: {other:?}"),

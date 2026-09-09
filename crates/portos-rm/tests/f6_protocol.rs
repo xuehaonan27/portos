@@ -4,16 +4,16 @@
 
 use portos_rm::coeffect::Plan;
 use portos_rm::ledger::Ledger;
-use portos_rm::monitor::*;
+use portos_rm::test_support::monitor::*;
 use portos_rm::protocol::*;
 
 /// QP 状态机：reset→init→rtr→rts；post_send 只在 rts；query 不在辖域。
 fn qp() -> Protocol {
-    Protocol::new("reset")
+    ProtocolDraft::new("reset")
         .transition("reset", "init", "init")
         .transition("init", "rtr", "rtr")
         .transition("rtr", "rts", "rts")
-        .transition("rts", "post_send", "rts")
+        .transition("rts", "post_send", "rts").check().unwrap()
 }
 
 fn all_sequences(alphabet: &[&str], max_len: usize) -> Vec<Vec<String>> {
@@ -123,9 +123,9 @@ fn static_reachability_equals_path_enumeration_on_all_small_plans() {
 #[test]
 fn world_order_projection_is_sound_and_exact_without_branches() {
     // 协议：先授远端访问（硬清单，扣发）再 post_send。
-    let p = Protocol::new("closed")
+    let p = ProtocolDraft::new("closed")
         .transition("closed", "grant", "open")
-        .transition("open", "post_send", "open");
+        .transition("open", "post_send", "open").check().unwrap();
     let withhold: std::collections::BTreeSet<String> = ["grant".to_string()].into_iter().collect();
 
     // 最小反例：计划序 grant;post_send 合法；世界序 post_send;grant（grant 殿后）违规。
@@ -207,9 +207,9 @@ fn protocol_precisely_enforced_by_truncation_tier_in_monitor() {
 #[test]
 fn withhold_reorder_is_caught_at_step_or_at_approval() {
     // 情形一：grant（扣发）在后放、post_send 即时——post_send 在 closed 状态无转移 ⇒ step 处 fail-stop。
-    let p = Protocol::new("closed")
+    let p = ProtocolDraft::new("closed")
         .transition("closed", "grant", "open")
-        .transition("open", "post_send", "open");
+        .transition("open", "post_send", "open").check().unwrap();
     let mut pol = Policy::default();
     pol.allow("grant", "buf");
     pol.allow("post_send", "peer");
@@ -224,10 +224,10 @@ fn withhold_reorder_is_caught_at_step_or_at_approval() {
     // 情形二：即时动词把状态推到终态，批准整批在终态无转移 ⇒ approve 整批拒。
     // 协议：s0 -grant-> s1 -close-> closed；s0 -close-> closed。计划序 grant;close 合法；
     // 世界序 close;grant——close 即时（s0→closed 合法），grant 在批准时从 closed 出发无转移。
-    let p2 = Protocol::new("s0")
+    let p2 = ProtocolDraft::new("s0")
         .transition("s0", "grant", "s1")
         .transition("s1", "close", "closed")
-        .transition("s0", "close", "closed");
+        .transition("s0", "close", "closed").check().unwrap();
     let mut pol = Policy::default();
     pol.allow("grant", "buf");
     pol.allow("close", "buf");

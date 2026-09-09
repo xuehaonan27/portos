@@ -50,7 +50,7 @@
 //! SegmentAborted{expired:false}（事务形状：run 未达 commit 点即 abort）。
 
 use portos_rm::ledger::Ledger;
-use portos_rm::monitor::*;
+use portos_rm::test_support::monitor::*;
 
 const H: &str = "blake3:lattice-plan";
 const NOW: u64 = 10;

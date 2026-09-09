@@ -2,9 +2,9 @@
 //!
 //! 一句话：附着＝已入册计划 × 触发器 × standing 同意 × 主体；每次触发＝一个段（裁定四：段＝事务），
 //! 三种账本行（附着池 ●／触发碎片 ◯／触发池 ●）用 F1 的行式记账与每实例容量承载，结账只用
-//! F1/F2 已有的词（终态＝段 teardown、容量置 0、花费行永不释放）。本模块是确定性模拟：没有
-//! 计划语言（D31 隔离区不动——一次触发"做了什么"由测试给的 [`Run`] 脚本代替解释器），没有时钟
-//! （`now` 由调用者推进），崩溃以"丢掉易失状态、从账本行恢复"表达。
+//! 受控清理与结算（终态＝段 cleanup、容量置 0、附着存续期花费不退款）。本模块是确定性模拟：没有
+//! 计划语言（一次触发"做了什么"由测试给的 [`Run`] 脚本代替解释器），没有时钟
+//! （`now` 由调用者推进），崩溃以丢掉易失状态、保留账本及显式关联表表达。
 //!
 //! 理论标签（对照附着卷 §11 拟决与 §13.3 墓碑；等级：【文献✓】被引原文核实／【推导】我方映射／
 //! 【设计】自家文档决定）：
@@ -16,7 +16,8 @@
 //!           ③下无存活碎片，置 0 是平凡的 frame-preserving update），②为 `attach/<id>:spent` 下的
 //!           花费行在附着存续期保留；不退余额是满额计费政策【设计】。
 //!   [Q14]   ②③同一事务；恢复规则：有②无③的 seq 按"已触发、空跑"计（占 n_max，宁紧勿漏）【设计】。
-//!   [SEQ]   seq_i 从账本行读（fire 碎片行数＋1，行的 generation 记 seq）；nonce_i＝H(h_attach‖seq_i)
+//!   [SEQ]   seq_i 从关联的 fire 池行数取下一值；恢复读 FiringKey→行／池关联，不解码 generation。
+//!           nonce_i＝H(h_attach‖seq_i)
 //!           可预测但无妨——它是防重放记账不是秘密（Q10）【推导，锚 F1 行式记账契约】。
 //!   [EMIT-TX] 用户裁定 2026-09-06：触发 fail-stop 撤回**本次触发自己投递的未消费**事件；已消费的
 //!           不可撤（人不能被反通知）；撤回跨主体但有界、可审计【设计，锚裁定四】。
@@ -31,18 +32,20 @@
 //! 法则见 tests/f8_attach.rs（每个测试名＝它执行的定理/纪律）。
 
 use crate::identity::{
-    ClassId, Generation, HoldingHandle, HoldingId, InstanceId, ResourceKey, SubjectId,
+    AttachmentId, ClassId, EffectClass, Generation, HoldingHandle, HoldingId, InstanceId,
+    ResourceKey, SubjectId,
 };
 use crate::ledger::GrantRequest;
 use crate::ledger::{AlgebraTag, ClassDecl, Frag, Ledger, LedgerError, RevertGrade};
 use crate::ra::{Count, Ex};
-use crate::registry::{Capacity, Claim};
+use crate::registry::{Capacity, Claim, PoolRef};
+use crate::test_support::teardown::{AccountingWorld, Journal, LedgerDrill, teardown_handles};
 use crate::time::{LeaseDuration, LeaseRequest, Timestamp};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// [Q12] 内核加入的合成效应类：每次触发花费 1，池容量＝n_max。
 pub const FIRE_CLASS: &str = "attach::fire";
-/// 预算池类（Count）：实例 `<id>/<class>`＝附着池①，`<id>#<seq>/<class>`＝触发池③。
+/// Count pools have opaque instance IDs; attachment/firing maps retain their owners.
 pub const CLASS_POOL: &str = "attach/pool";
 /// 触发段类（Ex，租约 None）：实例 `<id>#<seq>`，主体 `attach/<id>:seg#<seq>`。
 pub const CLASS_SEG: &str = "attach/segment";
@@ -377,7 +380,32 @@ pub enum AttachError {
     Ledger(LedgerError),
 }
 
-/// 调度器：账本＋附着表＋收件箱＋审计为持久状态；队列与在途段为易失状态（崩溃即丢）。
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct FiringKey {
+    attachment: AttachmentId,
+    sequence: u64,
+}
+impl FiringKey {
+    fn new(id: &str, sequence: u64) -> Self {
+        Self {
+            attachment: AttachmentId::new(id),
+            sequence,
+        }
+    }
+}
+struct AttachmentResources {
+    root: HoldingHandle,
+    pools: BTreeMap<EffectClass, PoolRef<Count>>,
+}
+struct FiringResources {
+    fire: HoldingHandle,
+    spent: Vec<HoldingHandle>,
+    segment: Option<HoldingHandle>,
+    pools: BTreeMap<EffectClass, PoolRef<Count>>,
+}
+
+/// Simulated durable state includes the ledger, attachment/firing associations,
+/// inbox and audit. Queues and in-flight cursors are volatile.
 pub struct Scheduler {
     pub ledger: Ledger,
     pub attachments: BTreeMap<String, AttachState>,
@@ -389,6 +417,9 @@ pub struct Scheduler {
     pub transactional: bool,
     pub crashed: bool,
     next_event_id: u64,
+    next_pool: u64,
+    resources: BTreeMap<AttachmentId, AttachmentResources>,
+    firing_resources: BTreeMap<FiringKey, FiringResources>,
     queues: BTreeMap<String, VecDeque<Event>>,
     inflight: BTreeMap<String, InFlight>,
 }
@@ -401,12 +432,6 @@ fn attach_subject(id: &str) -> String {
 }
 fn seg_subject(id: &str, seq: u64) -> String {
     format!("attach/{id}:seg#{seq}")
-}
-fn pool_instance(id: &str, class: &str) -> String {
-    format!("{id}/{class}")
-}
-fn firing_pool_instance(id: &str, seq: u64, class: &str) -> String {
-    format!("{id}#{seq}/{class}")
 }
 fn seg_instance(id: &str, seq: u64) -> String {
     format!("{id}#{seq}")
@@ -512,9 +537,66 @@ impl Scheduler {
             transactional,
             crashed: false,
             next_event_id: 1,
+            next_pool: 0,
+            resources: BTreeMap::new(),
+            firing_resources: BTreeMap::new(),
             queues: BTreeMap::new(),
             inflight: BTreeMap::new(),
         }
+    }
+
+    fn create_budget_pool(&mut self, capacity: u64) -> PoolRef<Count> {
+        loop {
+            let instance = InstanceId::new(format!("attach-budget:{}", self.next_pool));
+            self.next_pool = self
+                .next_pool
+                .checked_add(1)
+                .expect("drill pool IDs exhausted");
+            if self
+                .ledger
+                .capacity(&ResourceKey::new(
+                    ClassId::new(CLASS_POOL),
+                    instance.clone(),
+                ))
+                .is_some()
+            {
+                continue;
+            }
+            let pool = self
+                .ledger
+                .create_pool(
+                    &self
+                        .ledger
+                        .registered_class::<Count>(&ClassId::new(CLASS_POOL))
+                        .unwrap(),
+                    instance,
+                    Capacity::new(Count::Value(capacity)).unwrap(),
+                )
+                .unwrap();
+            self.cached_outstanding
+                .insert(pool.id().key().instance().to_string(), 0);
+            return pool;
+        }
+    }
+    fn total_pool(&self, id: &str, class: &str) -> &PoolRef<Count> {
+        &self.resources[&AttachmentId::new(id)].pools[&EffectClass::new(class)]
+    }
+    fn firing_pool(&self, id: &str, seq: u64, class: &str) -> Option<&PoolRef<Count>> {
+        self.firing_resources
+            .get(&FiringKey::new(id, seq))?
+            .pools
+            .get(&EffectClass::new(class))
+    }
+    pub fn total_spent(&self, id: &str, class: &str) -> u64 {
+        let key = self.total_pool(id, class).id().key();
+        self.ledger
+            .occupying()
+            .filter(|h| &h.key() == key)
+            .map(|h| match h.frag {
+                Frag::Count(Count::Value(n)) => n,
+                _ => unreachable!("typed Count pool"),
+            })
+            .sum()
     }
 
     fn user_root(&self) -> HoldingId {
@@ -539,22 +621,13 @@ impl Scheduler {
             .budget_firing
             .scale(decl.n_max)
             .ok_or(AttachError::BudgetOverflow)?;
+        let mut pools = BTreeMap::new();
         for (class, cap) in total
             .0
             .iter()
             .chain(std::iter::once((&FIRE_CLASS.to_string(), &decl.n_max)))
         {
-            self.ledger
-                .create_pool(
-                    &self
-                        .ledger
-                        .registered_class::<Count>(&ClassId::new(CLASS_POOL))
-                        .unwrap(),
-                    InstanceId::new(&pool_instance(&id, class)),
-                    Capacity::new(Count::Value(*cap)).unwrap(),
-                )
-                .unwrap();
-            self.cached_outstanding.insert(pool_instance(&id, class), 0);
+            pools.insert(EffectClass::new(class), self.create_budget_pool(*cap));
         }
         // 根持有：类＝声明含 T（租约＝ttl）。
         self.ledger
@@ -603,6 +676,13 @@ impl Scheduler {
             )
             .map(|h| h.id())
             .map_err(AttachError::Ledger)?;
+        self.resources.insert(
+            AttachmentId::new(&id),
+            AttachmentResources {
+                root: self.ledger.holding(root).unwrap().handle(),
+                pools,
+            },
+        );
         // 触发器持有（租约 None、随根走）。
         match &decl.trigger {
             Trigger::Topic { topic } => {
@@ -875,11 +955,11 @@ impl Scheduler {
 
     /// [Q12] 已触发次数＝存活 fire 碎片行数（含恢复为空跑的）。
     pub fn fired_count(&self, id: &str) -> u64 {
-        let inst = pool_instance(id, FIRE_CLASS);
-        self.ledger
-            .active()
-            .filter(|h| h.class_id.as_str() == CLASS_POOL && h.instance.as_str() == inst)
-            .count() as u64
+        let Some(resources) = self.resources.get(&AttachmentId::new(id)) else {
+            return 0;
+        };
+        let key = resources.pools[&EffectClass::new(FIRE_CLASS)].id().key();
+        self.ledger.active().filter(|h| &h.key() == key).count() as u64
     }
 
     /// 一次触发＝`begin`（消费事件、前置条件、读 seq、铸②、同事务铸③＋段持有、派生四元组）
@@ -941,13 +1021,7 @@ impl Scheduler {
         let fire_row = match self
             .ledger
             .grant(
-                &self
-                    .ledger
-                    .pool::<Count>(&ResourceKey::new(
-                        ClassId::new(CLASS_POOL),
-                        InstanceId::new(&pool_instance(id, FIRE_CLASS)),
-                    ))
-                    .unwrap(),
+                &self.total_pool(id, FIRE_CLASS).clone(),
                 GrantRequest {
                     owner: SubjectId::new(&spent),
                     claim: Claim::new(Count::Value(1)).unwrap(),
@@ -966,10 +1040,23 @@ impl Scheduler {
         let budget = self.attachments[id].decl.budget_firing.clone();
         let mut spend_rows = vec![fire_row];
         for (class, n) in budget.0.iter().filter(|(_, n)| **n > 0) {
-            let h = self.ledger.grant(&self.ledger.pool::<Count>(&ResourceKey::new(ClassId::new(CLASS_POOL), InstanceId::new(&pool_instance(id, class)))).unwrap(), GrantRequest { owner: SubjectId::new(&spent), claim: Claim::new(Count::Value(*n)).unwrap(), generation: Generation::new(&generation), parent: None, lease: LeaseRequest::UseClassDefault, now: Timestamp::try_from(now).unwrap() }).map(|h| h.id())
+            let h = self.ledger.grant(&self.total_pool(id, class).clone(), GrantRequest { owner: SubjectId::new(&spent), claim: Claim::new(Count::Value(*n)).unwrap(), generation: Generation::new(&generation), parent: None, lease: LeaseRequest::UseClassDefault, now: Timestamp::try_from(now).unwrap() }).map(|h| h.id())
                 .expect("B_total = scale(n_max, B_firing): a class pool cannot run out before the fire pool");
             spend_rows.push(h);
         }
+        let firing_key = FiringKey::new(id, seq);
+        self.firing_resources.insert(
+            firing_key.clone(),
+            FiringResources {
+                fire: self.ledger.holding(fire_row).unwrap().handle(),
+                spent: spend_rows
+                    .iter()
+                    .map(|id| self.ledger.holding(*id).unwrap().handle())
+                    .collect(),
+                segment: None,
+                pools: BTreeMap::new(),
+            },
+        );
         if crash == Some(Crash::BetweenRows) {
             // [Q14] 崩在②③之间。
             if self.transactional {
@@ -982,17 +1069,24 @@ impl Scheduler {
                         )
                         .unwrap();
                 }
+                self.firing_resources.remove(&firing_key);
             } else {
                 // 逐行写入：②留在盘上，③没有——第三态，交给恢复规则。
                 for (class, n) in budget.0.iter().filter(|(_, n)| **n > 0) {
                     *self
                         .cached_outstanding
-                        .entry(pool_instance(id, class))
+                        .entry(self.total_pool(id, class).id().key().instance().to_string())
                         .or_insert(0) += n;
                 }
                 *self
                     .cached_outstanding
-                    .entry(pool_instance(id, FIRE_CLASS))
+                    .entry(
+                        self.total_pool(id, FIRE_CLASS)
+                            .id()
+                            .key()
+                            .instance()
+                            .to_string(),
+                    )
                     .or_insert(0) += 1;
             }
             self.crash();
@@ -1001,27 +1095,27 @@ impl Scheduler {
         for (class, n) in budget.0.iter().filter(|(_, n)| **n > 0) {
             *self
                 .cached_outstanding
-                .entry(pool_instance(id, class))
+                .entry(self.total_pool(id, class).id().key().instance().to_string())
                 .or_insert(0) += n;
         }
         *self
             .cached_outstanding
-            .entry(pool_instance(id, FIRE_CLASS))
+            .entry(
+                self.total_pool(id, FIRE_CLASS)
+                    .id()
+                    .key()
+                    .instance()
+                    .to_string(),
+            )
             .or_insert(0) += 1;
-        // ---- ③ 触发池（容量＝②的值）＋ 段持有：与②同一事务 ----
+        // ③ and the durable association are created with the same simulated commit.
         for (class, n) in budget.0.iter().filter(|(_, n)| **n > 0) {
-            self.ledger
-                .create_pool(
-                    &self
-                        .ledger
-                        .registered_class::<Count>(&ClassId::new(CLASS_POOL))
-                        .unwrap(),
-                    InstanceId::new(&firing_pool_instance(id, seq, class)),
-                    Capacity::new(Count::Value(*n)).unwrap(),
-                )
-                .unwrap();
-            self.cached_outstanding
-                .insert(firing_pool_instance(id, seq, class), 0);
+            let pool = self.create_budget_pool(*n);
+            self.firing_resources
+                .get_mut(&firing_key)
+                .unwrap()
+                .pools
+                .insert(EffectClass::new(class), pool);
         }
         let h_attach = self.attachments[id].h_attach.clone();
         let nonce = derive_nonce(&h_attach, seq);
@@ -1061,6 +1155,8 @@ impl Scheduler {
             )
             .map(|h| h.id())
             .expect("segment row");
+        self.firing_resources.get_mut(&firing_key).unwrap().segment =
+            Some(self.ledger.holding(seg_holding).unwrap().handle());
         // ---- 派生四元组：ttl_i = min(now + run_cap, 根租约到期) ----
         let lease_end = self
             .ledger
@@ -1136,12 +1232,9 @@ impl Scheduler {
                 .ledger
                 .grant(
                     &self
-                        .ledger
-                        .pool::<Count>(&ResourceKey::new(
-                            ClassId::new(CLASS_POOL),
-                            InstanceId::new(&firing_pool_instance(id, seq, class)),
-                        ))
-                        .unwrap(),
+                        .firing_pool(id, seq, class)
+                        .expect("admitted effect pool")
+                        .clone(),
                     GrantRequest {
                         owner: SubjectId::new(&seg),
                         claim: Claim::new(Count::Value(*n)).unwrap(),
@@ -1157,7 +1250,14 @@ impl Scheduler {
                 Ok(_) => {
                     *self
                         .cached_outstanding
-                        .entry(firing_pool_instance(id, seq, class))
+                        .entry(
+                            self.firing_pool(id, seq, class)
+                                .unwrap()
+                                .id()
+                                .key()
+                                .instance()
+                                .to_string(),
+                        )
                         .or_insert(0) += n;
                 }
                 Err(_) => {
@@ -1184,52 +1284,30 @@ impl Scheduler {
         if !matches!(end, End::Completed | End::CompletedEmpty) {
             self.withdraw(id, seq);
         }
-        let seg = seg_subject(id, seq);
-        let released = self
-            .ledger
-            .teardown(&SubjectId::new(&seg), Timestamp::try_from(now).unwrap());
-        for h in released {
-            if let Some(row) = self.ledger.holding(h) {
-                if row.class_id.as_str() == CLASS_POOL {
-                    if let Frag::Count(Count::Value(n)) = row.frag {
-                        if let Some(c) = self.cached_outstanding.get_mut(row.instance.as_str()) {
-                            *c -= n;
-                        }
-                    }
-                }
-            }
+        if let Some(segment) = self
+            .firing_resources
+            .get(&FiringKey::new(id, seq))
+            .and_then(|r| r.segment.clone())
+        {
+            teardown_handles(
+                &mut self.ledger,
+                &mut Journal::default(),
+                &mut AccountingWorld,
+                &[segment],
+                Timestamp::try_from(now).unwrap(),
+            );
         }
-        let classes: Vec<String> = self.attachments[id]
-            .decl
-            .budget_firing
-            .0
-            .keys()
-            .cloned()
-            .collect();
-        for class in classes {
-            let inst = firing_pool_instance(id, seq, &class);
-            if self
-                .ledger
-                .capacity(&ResourceKey::new(
-                    ClassId::new(CLASS_POOL),
-                    InstanceId::new(&inst),
-                ))
-                .is_some()
-            {
-                self.ledger
-                    .settle_and_zero_pool(
-                        &self
-                            .ledger
-                            .pool::<Count>(&ResourceKey::new(
-                                ClassId::new(CLASS_POOL),
-                                InstanceId::new(&inst),
-                            ))
-                            .unwrap(),
-                        Timestamp::try_from(now).unwrap(),
-                    )
-                    .unwrap();
-            }
+        let pools: Vec<_> = self
+            .firing_resources
+            .get(&FiringKey::new(id, seq))
+            .map(|r| r.pools.values().cloned().collect())
+            .unwrap_or_default();
+        for pool in pools {
+            self.ledger
+                .settle_and_zero_pool(&pool, Timestamp::try_from(now).unwrap())
+                .unwrap();
         }
+        self.cached_outstanding = self.recompute_outstanding();
         let paused = {
             let a = self.attachments.get_mut(id).unwrap();
             if let Some(r) = a.firings.iter_mut().find(|r| r.seq == seq) {
@@ -1333,72 +1411,41 @@ impl Scheduler {
         // 段主体若仍有行（崩溃遗留），一并拆。
         let seqs: Vec<u64> = self.attachments[id].firings.iter().map(|r| r.seq).collect();
         for seq in seqs {
-            let seg = seg_subject(id, seq);
-            if self.ledger.active().any(|h| h.subject.as_str() == seg) {
+            let pending = self
+                .firing_resources
+                .get(&FiringKey::new(id, seq))
+                .and_then(|r| r.segment.as_ref())
+                .and_then(|h| self.ledger.holding(h.id()))
+                .is_some_and(|h| h.state.occupies());
+            if pending {
                 self.settle(id, seq, inflight_end, now);
             }
         }
-        // 根子树（根、触发器持有、路由）子先于父；②花费行落墓碑；①③容量置 0。
-        self.ledger.teardown(
-            &SubjectId::new(&attach_subject(id)),
+        let root = self.resources[&AttachmentId::new(id)].root.clone();
+        teardown_handles(
+            &mut self.ledger,
+            &mut Journal::default(),
+            &mut AccountingWorld,
+            &[root],
             Timestamp::try_from(now).unwrap(),
         );
-        self.ledger.teardown(
-            &SubjectId::new(&spent_subject(id)),
-            Timestamp::try_from(now).unwrap(),
-        );
-        let classes: Vec<String> = {
-            let d = &self.attachments[id].decl;
-            d.budget_firing
-                .0
-                .keys()
-                .cloned()
-                .chain(std::iter::once(FIRE_CLASS.to_string()))
-                .collect()
-        };
-        for class in classes {
-            let inst = pool_instance(id, &class);
-            self.ledger
-                .settle_and_zero_pool(
-                    &self
-                        .ledger
-                        .pool::<Count>(&ResourceKey::new(
-                            ClassId::new(CLASS_POOL),
-                            InstanceId::new(&inst),
-                        ))
-                        .unwrap(),
-                    Timestamp::try_from(now).unwrap(),
-                )
-                .unwrap();
-            self.cached_outstanding.insert(inst, 0);
-        }
-        let firing_pools: Vec<String> = self
-            .ledger
-            .holdings()
-            .iter()
-            .filter(|h| {
-                h.class_id.as_str() == CLASS_POOL
-                    && h.instance.as_str().starts_with(&format!("{id}#"))
-            })
-            .map(|h| h.instance.to_string())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
+        let mut pools: Vec<_> = self.resources[&AttachmentId::new(id)]
+            .pools
+            .values()
+            .cloned()
             .collect();
-        for inst in firing_pools {
+        pools.extend(
+            self.firing_resources
+                .iter()
+                .filter(|(key, _)| key.attachment == AttachmentId::new(id))
+                .flat_map(|(_, r)| r.pools.values().cloned()),
+        );
+        for pool in pools {
             self.ledger
-                .settle_and_zero_pool(
-                    &self
-                        .ledger
-                        .pool::<Count>(&ResourceKey::new(
-                            ClassId::new(CLASS_POOL),
-                            InstanceId::new(&inst),
-                        ))
-                        .unwrap(),
-                    Timestamp::try_from(now).unwrap(),
-                )
+                .settle_and_zero_pool(&pool, Timestamp::try_from(now).unwrap())
                 .unwrap();
-            self.cached_outstanding.insert(inst, 0);
         }
+        self.cached_outstanding = self.recompute_outstanding();
         self.queues.remove(id);
         let a = self.attachments.get_mut(id).unwrap();
         a.status = status;
@@ -1488,25 +1535,23 @@ impl Scheduler {
         self.audit.push(Audit::Recovered);
         let ids: Vec<String> = self.attachments.keys().cloned().collect();
         for id in ids {
-            let fire_inst = pool_instance(&id, FIRE_CLASS);
-            let seqs: Vec<u64> = self
-                .ledger
-                .active()
-                .filter(|h| h.class_id.as_str() == CLASS_POOL && h.instance.as_str() == fire_inst)
-                .filter_map(|h| {
-                    h.generation
-                        .as_str()
-                        .strip_prefix("seq:")
-                        .and_then(|s| s.parse().ok())
+            let seqs: Vec<_> = self
+                .firing_resources
+                .iter()
+                .filter(|(k, r)| {
+                    k.attachment == AttachmentId::new(&id)
+                        && self
+                            .ledger
+                            .holding(r.fire.id())
+                            .is_some_and(|h| h.state.is_active())
                 })
+                .map(|(k, _)| k.sequence)
                 .collect();
             for seq in seqs {
-                let seg_inst = seg_instance(&id, seq);
-                let seg_row = self
-                    .ledger
-                    .holdings()
-                    .iter()
-                    .find(|h| h.class_id.as_str() == CLASS_SEG && h.instance.as_str() == seg_inst)
+                let seg_row = self.firing_resources[&FiringKey::new(&id, seq)]
+                    .segment
+                    .as_ref()
+                    .and_then(|h| self.ledger.holding(h.id()))
                     .cloned();
                 match seg_row {
                     None => {
@@ -1599,55 +1644,42 @@ impl Scheduler {
     }
 
     fn ledger_capacities(&self) -> Vec<((String, String), Frag)> {
-        // 演练用：从行与已知实例名收集池实例（Ledger 不暴露容量表的遍历；实例名由本模块命名规则决定）。
-        let mut set: BTreeSet<(String, String)> = BTreeSet::new();
-        for h in self.ledger.holdings() {
-            set.insert((h.class_id.to_string(), h.instance.to_string()));
-        }
-        for inst in self.cached_outstanding.keys() {
-            set.insert((CLASS_POOL.to_string(), inst.clone()));
-        }
-        set.into_iter()
-            .filter_map(|(c, i)| {
-                self.ledger
-                    .capacity(&ResourceKey::new(ClassId::new(&c), InstanceId::new(&i)))
-                    .cloned()
-                    .map(|cap| ((c, i), cap))
+        self.ledger
+            .snapshot()
+            .pools
+            .into_iter()
+            .map(|p| {
+                (
+                    (p.key.class().to_string(), p.key.instance().to_string()),
+                    p.capacity,
+                )
             })
             .collect()
     }
 
     /// 触发池是否已关闭（容量置 0 ⇒ `can_mint` 对任何正值拒）。
     pub fn firing_pool_closed(&self, id: &str, seq: u64, class: &str) -> bool {
-        matches!(
-            self.ledger.capacity(&ResourceKey::new(
-                ClassId::new(CLASS_POOL),
-                InstanceId::new(&firing_pool_instance(id, seq, class))
-            )),
-            Some(Frag::Count(Count::Value(0)))
-        )
+        self.firing_pool(id, seq, class).is_some_and(|pool| {
+            self.ledger.capacity(pool.id().key()) == Some(&Frag::Count(Count::Value(0)))
+        })
     }
-
-    /// 试铸（不改账本）：对某触发池再要 1 个单位是否会被拒。
     pub fn firing_pool_refuses(&self, id: &str, seq: u64, class: &str) -> bool {
-        let inst = firing_pool_instance(id, seq, class);
-        let cap = match self.ledger.capacity(&ResourceKey::new(
-            ClassId::new(CLASS_POOL),
-            InstanceId::new(&inst),
-        )) {
-            Some(Frag::Count(c)) => *c,
-            _ => return true,
+        let Some(pool) = self.firing_pool(id, seq, class) else {
+            return true;
         };
-        let live: Vec<Count> = self
+        let Some(Frag::Count(cap)) = self.ledger.capacity(pool.id().key()) else {
+            return true;
+        };
+        let live: Vec<_> = self
             .ledger
-            .active()
-            .filter(|h| h.class_id.as_str() == CLASS_POOL && h.instance.as_str() == inst)
+            .occupying()
+            .filter(|h| &h.key() == pool.id().key())
             .filter_map(|h| match h.frag {
                 Frag::Count(c) => Some(c),
                 _ => None,
             })
             .collect();
-        !crate::auth::can_mint(&cap, &live, &Count::Value(1))
+        !crate::auth::can_mint(cap, &live, &Count::Value(1))
     }
 
     pub fn nonces(&self, id: &str) -> Vec<String> {
@@ -1725,28 +1757,26 @@ impl Scheduler {
                 }
             }
             if a.status.is_terminal() {
-                let subj = attach_subject(id);
-                let spent = spent_subject(id);
-                if self.ledger.active().any(|h| {
-                    h.subject.as_str() == subj
-                        || h.subject.as_str() == spent
-                        || h.subject.as_str().starts_with(&format!("{subj}:seg#"))
-                }) {
-                    return Err(format!("{id}: terminal but live rows remain"));
-                }
-                for class in a
-                    .decl
-                    .budget_firing
-                    .0
-                    .keys()
-                    .chain(std::iter::once(&FIRE_CLASS.to_string()))
+                let resources = &self.resources[&AttachmentId::new(id)];
+                let mut handles = vec![resources.root.clone()];
+                for (_, r) in self
+                    .firing_resources
+                    .iter()
+                    .filter(|(k, _)| k.attachment == AttachmentId::new(id))
                 {
-                    if self.ledger.capacity(&ResourceKey::new(
-                        ClassId::new(CLASS_POOL),
-                        InstanceId::new(&pool_instance(id, class)),
-                    )) != Some(&Frag::Count(Count::Value(0)))
+                    handles.extend(r.spent.clone());
+                    handles.extend(r.segment.clone());
+                }
+                if handles
+                    .iter()
+                    .any(|h| !self.ledger.occupying_subtree(h.id()).is_empty())
+                {
+                    return Err(format!("{id}: terminal but associated rows remain"));
+                }
+                for pool in resources.pools.values() {
+                    if self.ledger.capacity(pool.id().key()) != Some(&Frag::Count(Count::Value(0)))
                     {
-                        return Err(format!("{id}: terminal but pool {class} not closed"));
+                        return Err(format!("{id}: terminal but associated pool is not closed"));
                     }
                 }
             }

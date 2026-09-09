@@ -48,7 +48,7 @@ fn consuming_request_can_declare_idempotent_retries() {
     let reserve = VerbEntry::consuming(ConsumeGrade::Held).with_flags(true, false);
     assert!(reserve.check_coherent().is_ok());
     assert!(reserve.bears_budget());
-    assert!(reserve.blind_replay_safe());
+    assert!(reserve.declares_idempotence());
 }
 
 fn check_ra_laws<A: Ra>(elems: &[A]) {

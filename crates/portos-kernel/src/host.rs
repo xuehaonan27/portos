@@ -83,11 +83,14 @@ use portos_rm::cleanup::*;
 use portos_rm::coeffect::{Flat, Manifest, Mount, Requires, admit_mount};
 use portos_rm::identity::{
     AccountId, ClassId, Generation, HoldingHandle, HoldingId, InstanceId, ResourceKey, SubjectId,
+    VerbId,
 };
 use portos_rm::ledger::RevertGrade;
-use portos_rm::protocol::Protocol;
+use portos_rm::protocol::{Protocol, ProtocolDraft};
 use portos_rm::time::{LeaseDuration, LeaseRequest, Timestamp};
-use portos_rm::verbs::{ConsumeGrade, EmitGrade, Kind, VerbEntry, VerbTable};
+use portos_rm::verbs::{
+    CheckedVerb, ClassDeclarationDraft, ConsumeGrade, EmitGrade, Kind, VerbEntry, VerbTable,
+};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
@@ -157,10 +160,7 @@ struct RouteEntry {
     plugin: String,
     description: String,
     schema: Value,
-    kind: Option<&'static str>,
-    budgeted: Option<bool>,
-    /// F3 hard list: emitting ∧ non-amortizable — plan runs withhold it.
-    withhold: bool,
+    character: Option<CheckedVerb>,
     /// Sink-target extraction (WP-06): which arg is the target, and how to
     /// read it ("origin" normalizes to scheme://host[:port]).
     target: Option<TargetSpec>,
@@ -352,8 +352,13 @@ fn spawn_plugin(
             return Err(e);
         }
     };
-    let name = hello["name"].as_str().unwrap_or("?").to_string();
-    let verbs: Vec<String> = str_array(&hello["verbs"]);
+    let (name, verbs) = match declaration_identity(&hello) {
+        Ok(identity) => identity,
+        Err(e) => {
+            let _ = child.kill();
+            return Err(KernelError::Denied(format!("plugin hello: {e}")));
+        }
+    };
     // Optional per-verb tool metadata (description + schema + kind +
     // requires): joined into `grants`, checked by the F4/F5 laws below.
     let tools_meta = hello["tools"].clone();
@@ -412,7 +417,11 @@ fn spawn_plugin(
             )));
         }
     };
-    let protocol = table.derive_handler_policy(&name).protocol;
+    let protocol = table
+        .derive_handler_policy(&ClassId::new(&name))
+        .expect("checked class")
+        .protocol
+        .clone();
 
     // ---- F5: slot admission — every verb's requires must fit the row.
     if let Some(slot) = slot {
@@ -503,7 +512,7 @@ fn spawn_plugin(
         });
         for v in &verbs {
             let meta = &tools_meta[v.as_str()];
-            let entry = table.lookup(&name, v).ok();
+            let entry = table.lookup(&ClassId::new(&name), &VerbId::new(v)).ok();
             let target = meta.get("target").and_then(|t| {
                 Some(TargetSpec {
                     arg: t["arg"].as_str()?.to_string(),
@@ -520,10 +529,7 @@ fn spawn_plugin(
                     } else {
                         json!({"type": "object"})
                     },
-                    kind: entry.map(kind_label),
-                    budgeted: entry.map(|e| e.bears_budget()),
-                    withhold: entry.map(kind_label) == Some("emitting")
-                        && meta.get("amortizable").and_then(|a| a.as_bool()) == Some(false),
+                    character: entry.cloned(),
                     target,
                 },
             );
@@ -826,7 +832,7 @@ fn call_on(handle: &PluginHandle, verb: &str, args: Value) -> Result<Value, Kern
                 .lock()
                 .unwrap()
                 .clone()
-                .unwrap_or_else(|| p.initial.clone());
+                .unwrap_or_else(|| p.initial().to_string());
             match p.step(&cur, verb) {
                 Ok(n) => Some(n),
                 Err(v) => {
@@ -862,6 +868,34 @@ fn str_array(v: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Decode declaration names before constructing domain values.
+fn declaration_identity(hello: &Value) -> Result<(String, Vec<String>), String> {
+    let name = hello
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or("name must be a nonempty string")?;
+    let verbs = hello
+        .get("verbs")
+        .and_then(Value::as_array)
+        .ok_or("verbs must be an array")?;
+    let mut names = std::collections::BTreeSet::new();
+    let verbs = verbs
+        .iter()
+        .map(|v| {
+            let v = v
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .ok_or("verbs must contain nonempty strings")?;
+            if !names.insert(v) {
+                return Err("duplicate advertised verb");
+            }
+            Ok(v.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((name.to_string(), verbs))
+}
+
 /// The plugin's F4 truth table from its hello: class = the plugin (one
 /// handler, one table — D1), verbs keyed by their full `family::verb` name.
 /// Verbs without a declared `kind` are simply not in the table (no
@@ -872,49 +906,77 @@ fn build_verb_table(
     tools_meta: &Value,
     hello: &Value,
 ) -> Result<VerbTable, String> {
-    let mut table = VerbTable::new();
-    if let Some(rho) = hello.get("holding_rho").and_then(|r| r.as_str()) {
-        let rho = match rho {
+    if !tools_meta.is_null() && !tools_meta.is_object() {
+        return Err("tools must be an object".into());
+    }
+    let mut draft = ClassDeclarationDraft::new(ClassId::new(name));
+    if let Some(rho) = optional_str(hello, "holding_rho")? {
+        draft.holding_grade = Some(match rho {
             "inverse" => RevertGrade::Inverse,
             "compensable" => RevertGrade::Compensable,
             "external" => RevertGrade::External,
-            other => return Err(format!("unknown holding_rho {other}")),
-        };
-        table
-            .declare_class(name, rho)
-            .map_err(|e| format!("{e:?}"))?;
+            _ => return Err(format!("unknown holding_rho: {rho}")),
+        });
     }
+    let mut seen = std::collections::BTreeSet::new();
     for v in verbs {
-        let meta = &tools_meta[v.as_str()];
-        if let Some(entry) = kind_from_meta(meta)? {
-            table
-                .register(name, v, entry)
-                .map_err(|e| format!("{v}: {e:?}"))?;
+        if v.is_empty() || !seen.insert(v) {
+            return Err("empty or duplicate advertised verb".into());
+        }
+        if let Some(entry) = kind_from_meta(&tools_meta[v.as_str()])? {
+            draft.verbs.push((VerbId::new(v), entry));
         }
     }
-    if let Some(proto) = protocol_from_json(hello.get("protocol"))? {
-        table
-            .declare_protocol(name, proto)
-            .map_err(|e| format!("protocol: {e:?}"))?;
-    }
-    table.check_all().map_err(|e| format!("{e:?}"))?;
+    draft.protocol = protocol_from_json(hello.get("protocol"))?;
+    let checked = draft.check().map_err(|e| format!("{e:?}"))?;
+    let mut table = VerbTable::new();
+    table.insert(checked).map_err(|e| format!("{e:?}"))?;
     Ok(table)
 }
 
+fn optional_str<'a>(v: &'a Value, key: &str) -> Result<Option<&'a str>, String> {
+    v.get(key)
+        .map(|x| x.as_str().ok_or_else(|| format!("{key} must be a string")))
+        .transpose()
+}
+fn optional_bool(v: &Value, key: &str) -> Result<Option<bool>, String> {
+    v.get(key)
+        .map(|x| {
+            x.as_bool()
+                .ok_or_else(|| format!("{key} must be a boolean"))
+        })
+        .transpose()
+}
+
 fn kind_from_meta(meta: &Value) -> Result<Option<VerbEntry>, String> {
-    let Some(kind) = meta.get("kind").and_then(|k| k.as_str()) else {
+    if !meta.is_null() && !meta.is_object() {
+        return Err("verb metadata must be an object".into());
+    }
+    let Some(kind) = optional_str(meta, "kind")? else {
+        if [
+            "world",
+            "compensate_with",
+            "amortizable",
+            "idempotent",
+            "commutes",
+            "degrade",
+        ]
+        .iter()
+        .any(|k| meta.get(k).is_some())
+        {
+            return Err("verb character fields require kind".into());
+        }
         return Ok(None);
     };
-    let compensate = meta
-        .get("compensate_with")
-        .and_then(|c| c.as_str())
-        .map(str::to_string);
+    let compensate = optional_str(meta, "compensate_with")?.map(VerbId::new);
+    let world = optional_str(meta, "world")?;
+    let amortizable = optional_bool(meta, "amortizable")?.unwrap_or(true);
     let mut entry = match kind {
         "repeatable" => VerbEntry::repeatable(),
         "repeatable_shared" => VerbEntry::repeatable_shared(),
         "transforming" => VerbEntry::transforming(),
         "consuming" => {
-            let world = match meta.get("world").and_then(|w| w.as_str()) {
+            let world = match world {
                 None | Some("held") => ConsumeGrade::Held,
                 Some("compensable") => ConsumeGrade::Compensable {
                     compensate_with: compensate
@@ -927,7 +989,7 @@ fn kind_from_meta(meta: &Value) -> Result<Option<VerbEntry>, String> {
             VerbEntry::consuming(world)
         }
         "emitting" => {
-            let world = match meta.get("world").and_then(|w| w.as_str()) {
+            let world = match world {
                 None | Some("external") => EmitGrade::External,
                 Some("compensable") => EmitGrade::Compensable {
                     compensate_with: compensate
@@ -936,28 +998,24 @@ fn kind_from_meta(meta: &Value) -> Result<Option<VerbEntry>, String> {
                 },
                 Some(other) => return Err(format!("unknown emitting world {other}")),
             };
-            let amortizable = meta
-                .get("amortizable")
-                .and_then(|a| a.as_bool())
-                .unwrap_or(true);
             VerbEntry::emitting(world, amortizable)
         }
         other => return Err(format!("unknown verb kind {other}")),
     };
-    if let Some(b) = meta.get("idempotent").and_then(|b| b.as_bool()) {
+    if let Some(b) = optional_bool(meta, "idempotent")? {
         entry.idempotent = b;
     }
-    if let Some(b) = meta.get("commutes").and_then(|b| b.as_bool()) {
+    if let Some(b) = optional_bool(meta, "commutes")? {
         entry.commutes = b;
     }
-    if let Some(d) = meta.get("degrade").and_then(|d| d.as_str()) {
+    if let Some(d) = optional_str(meta, "degrade")? {
         entry = entry.degrades_to(d);
     }
     Ok(Some(entry))
 }
 
-fn kind_label(e: &VerbEntry) -> &'static str {
-    match e.kind {
+fn kind_label(e: &CheckedVerb) -> &'static str {
+    match e.kind() {
         Kind::Repeatable => "repeatable",
         Kind::Transforming => "transforming",
         Kind::Consuming { .. } => "consuming",
@@ -975,12 +1033,15 @@ fn protocol_from_json(v: Option<&Value>) -> Result<Option<Protocol>, String> {
         .get("initial")
         .and_then(|i| i.as_str())
         .ok_or("protocol needs an initial state")?;
-    let mut p = Protocol::new(initial);
+    let mut p = ProtocolDraft::new(initial);
     for t in v
         .get("transitions")
         .and_then(|t| t.as_array())
-        .unwrap_or(&Vec::new())
+        .ok_or("protocol transitions must be an array")?
     {
+        if t.as_array().is_none_or(|a| a.len() != 3) {
+            return Err("protocol transition must have exactly three names".into());
+        }
         let (Some(from), Some(verb), Some(to)) = (
             t.get(0).and_then(|x| x.as_str()),
             t.get(1).and_then(|x| x.as_str()),
@@ -990,7 +1051,7 @@ fn protocol_from_json(v: Option<&Value>) -> Result<Option<Protocol>, String> {
         };
         p = p.transition(from, verb, to);
     }
-    Ok(Some(p))
+    Ok(Some(p.check().map_err(|e| format!("protocol: {e:?}"))?))
 }
 
 /// The plugin's F5 manifest from its hello: per verb, the caps it needs to
@@ -1014,7 +1075,7 @@ fn manifest_from_meta(name: &str, verbs: &[String], tools_meta: &Value) -> Manif
     m
 }
 
-/// The host as the F2 `World`: the physical inverses of the kernel's
+/// The host cleanup executor: physical cleanup of the kernel's
 /// built-in holdings. Called after a durable claim, without storage locks.
 pub(crate) struct HostWorld {
     pub(crate) inner: Arc<HostInner>,
@@ -1207,11 +1268,11 @@ pub(crate) fn kernel_schemas(inner: &HostInner) -> crate::plancheck::VerbSchemas
     let routes = inner.routes.lock().unwrap();
     let mut s = crate::plancheck::VerbSchemas::default();
     for (verb, e) in routes.iter() {
-        match e.kind {
-            Some("repeatable") | Some("repeatable_shared") => {
+        match e.character.as_ref().map(CheckedVerb::kind) {
+            Some(Kind::Repeatable) => {
                 s.observe.insert(verb.clone(), Label::public_trusted());
             }
-            Some("emitting") => {
+            Some(Kind::Emitting { .. }) => {
                 s.external_effects.insert(verb.clone(), true);
             }
             _ => {}
@@ -1255,7 +1316,7 @@ pub(crate) fn withholds(inner: &HostInner, verb: &str) -> bool {
         .lock()
         .unwrap()
         .get(verb)
-        .map(|e| e.withhold)
+        .map(|e| e.character.as_ref().is_some_and(CheckedVerb::withhold))
         .unwrap_or(false)
 }
 
@@ -1810,7 +1871,14 @@ fn handle_client_op(
                 .map(|(verb, best)| {
                     let (description, schema, kind, budgeted) = routes
                         .get(&verb)
-                        .map(|e| (e.description.clone(), e.schema.clone(), e.kind, e.budgeted))
+                        .map(|e| {
+                            (
+                                e.description.clone(),
+                                e.schema.clone(),
+                                e.character.as_ref().map(kind_label),
+                                e.character.as_ref().map(CheckedVerb::bears_budget),
+                            )
+                        })
                         .unwrap_or_else(|| (String::new(), json!({"type": "object"}), None, None));
                     let mut g = json!({
                         "verb": verb, "description": description, "schema": schema,
@@ -2346,5 +2414,72 @@ mod tests {
         drop(first);
         drop(second);
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod m3_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_character_fields_are_not_defaulted() {
+        for meta in [
+            json!({"kind": 1}),
+            json!({"kind": "emitting", "amortizable": "false"}),
+            json!({"kind": "consuming", "world": false}),
+            json!({"kind": "repeatable", "idempotent": "true"}),
+            json!({"kind": "repeatable", "commutes": 1}),
+            json!({"kind": "repeatable", "degrade": 0}),
+            json!({"kind": "emitting", "compensate_with": false}),
+            json!({"commutes": true}),
+        ] {
+            assert!(kind_from_meta(&meta).is_err(), "{meta}");
+        }
+        for hello in [
+            json!({"name": "p", "verbs": ["v", 1]}),
+            json!({"name": "p", "verbs": ["v", "v"]}),
+            json!({"name": "p"}),
+        ] {
+            assert!(declaration_identity(&hello).is_err());
+        }
+    }
+
+    #[test]
+    fn checked_character_preserves_legacy_defaults_and_hard_list() {
+        let verbs = vec!["emit".into(), "send".into(), "legacy".into()];
+        let table = build_verb_table(
+            "p",
+            &verbs,
+            &json!({
+                "emit": {"kind": "emitting"}, "send": {"kind": "emitting", "amortizable": false},
+            }),
+            &json!({}),
+        )
+        .unwrap();
+        let class = table.class(&ClassId::new("p")).unwrap();
+        assert!(!class.lookup(&VerbId::new("emit")).unwrap().withhold());
+        assert!(class.lookup(&VerbId::new("send")).unwrap().withhold());
+        assert!(class.lookup(&VerbId::new("legacy")).is_err());
+        assert!(build_verb_table("p", &verbs, &json!({}), &json!({"holding_rho": 1})).is_err());
+    }
+
+    #[test]
+    fn invalid_protocols_and_dangling_relations_cannot_be_published() {
+        for protocol in [
+            json!({"initial": "s", "transitions": false}),
+            json!({"initial": "s", "transitions": [["s", "read", "s", "extra"]]}),
+            json!({"initial": "s", "transitions": [["s", "read", "s"], ["s", "read", "other"]]}),
+        ] {
+            assert!(protocol_from_json(Some(&protocol)).is_err());
+        }
+        assert!(
+            build_verb_table(
+                "p",
+                &["read".into()],
+                &json!({"read": {"kind": "repeatable", "degrade": "unknown"}}),
+                &json!({})
+            )
+            .is_err()
+        );
     }
 }

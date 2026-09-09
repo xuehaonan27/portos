@@ -18,11 +18,13 @@
 //!     （"可交换性/可中介性是接口选择出来的"，endstate §7.1）。
 
 use crate::coeffect::{Manifest, Mount, Requires};
+use crate::identity::VerbId;
 use crate::identity::{ClassId, InstanceId};
 use crate::ledger::{AlgebraTag, ClassDecl, Ledger, RevertGrade};
-use crate::protocol::Protocol;
+use crate::protocol::ProtocolDraft;
 use crate::ra::{Count, Ex, Frac, GSet, Ranges};
 use crate::registry::Capacity;
+use crate::test_support::declarations::Declarations;
 use crate::time::LeaseDuration;
 use crate::verbs::{ConsumeGrade, EmitGrade, VerbEntry, VerbTable};
 
@@ -128,7 +130,7 @@ pub fn workspace() -> Entry {
         .unwrap();
     }
 
-    let mut t = VerbTable::new();
+    let mut t = Declarations::new();
     for c in [
         "enclosure",
         "vm",
@@ -180,7 +182,7 @@ pub fn workspace() -> Entry {
         VerbEntry::emitting(EmitGrade::External, true),
     )
     .unwrap();
-    t.check_all().unwrap();
+    let t = t.check_all().unwrap();
 
     let mut m = Manifest {
         driver: "workspace".into(),
@@ -189,23 +191,60 @@ pub fn workspace() -> Entry {
     // 按量计价：exec 声明每次最多 5 单位 fuel；写文件每次最多 2；出网每次 1。
     m.verbs.insert(
         "exec".into(),
-        Requires::from_table_weighted(&t, "vm", "exec", &["ws.exec"], &[], 5).unwrap(),
+        Requires::from_table_weighted(
+            &t,
+            &ClassId::new("vm"),
+            &VerbId::new("exec"),
+            &["ws.exec"],
+            &[],
+            5,
+        )
+        .unwrap(),
     );
     m.verbs.insert(
         "write_file".into(),
-        Requires::from_table_weighted(&t, "vm", "write_file", &["ws.fs"], &[], 2).unwrap(),
+        Requires::from_table_weighted(
+            &t,
+            &ClassId::new("vm"),
+            &VerbId::new("write_file"),
+            &["ws.fs"],
+            &[],
+            2,
+        )
+        .unwrap(),
     );
     m.verbs.insert(
         "read_file".into(),
-        Requires::from_table(&t, "vm", "read_file", &["ws.fs"], &[]).unwrap(),
+        Requires::from_table(
+            &t,
+            &ClassId::new("vm"),
+            &VerbId::new("read_file"),
+            &["ws.fs"],
+            &[],
+        )
+        .unwrap(),
     );
     m.verbs.insert(
         "net_send".into(),
-        Requires::from_table(&t, "vm", "net_send", &["net.egress"], &["egress-proxy"]).unwrap(),
+        Requires::from_table(
+            &t,
+            &ClassId::new("vm"),
+            &VerbId::new("net_send"),
+            &["net.egress"],
+            &["egress-proxy"],
+        )
+        .unwrap(),
     );
     m.verbs.insert(
         "copy_out".into(),
-        Requires::from_table(&t, "vm", "copy_out", &["ws.fs"], &["cas"]).unwrap(),
+        Requires::from_table(
+            &t,
+            &ClassId::new("vm"),
+            &VerbId::new("copy_out"),
+            &["ws.fs"],
+            &["cas"],
+        )
+        .unwrap(),
     );
     let mount = Mount {
         name: "workspace-slot".into(),
@@ -331,7 +370,7 @@ pub fn rdma() -> Entry {
     )
     .unwrap();
 
-    let mut t = VerbTable::new();
+    let mut t = Declarations::new();
     for c in ["device", "pd", "cq", "qp", "mr", "mr-read"] {
         t.declare_class(c, RevertGrade::Inverse).unwrap();
     }
@@ -376,15 +415,17 @@ pub fn rdma() -> Entry {
     .unwrap(); // 请求出界，数据带 taint 回流
     t.register("qp", "query", VerbEntry::repeatable()).unwrap();
     // 协议：QP 状态机。post_send/post_recv 只在 rts 合法；query 不在辖域（任何状态可查）。
-    let qp_proto = Protocol::new("reset")
+    let qp_proto = ProtocolDraft::new("reset")
         .transition("reset", "init", "init")
         .transition("init", "rtr", "rtr")
         .transition("rtr", "rts", "rts")
         .transition("rts", "post_send", "rts")
         .transition("rts", "post_recv", "rts")
-        .transition("rts", "rdma_read", "rts");
+        .transition("rts", "rdma_read", "rts")
+        .check()
+        .unwrap();
     t.declare_protocol("qp", qp_proto).unwrap();
-    t.check_all().unwrap();
+    let t = t.check_all().unwrap();
 
     let mut m = Manifest {
         driver: "rdma".into(),
@@ -393,24 +434,45 @@ pub fn rdma() -> Entry {
     // 按量：post_send 声明每次最多 64 KiB（单位 KiB）；rdma_read 同；其余按次。
     m.verbs.insert(
         "post_send".into(),
-        Requires::from_table_weighted(&t, "qp", "post_send", &["rdma.send"], &["pd", "cq"], 64)
-            .unwrap(),
+        Requires::from_table_weighted(
+            &t,
+            &ClassId::new("qp"),
+            &VerbId::new("post_send"),
+            &["rdma.send"],
+            &["pd", "cq"],
+            64,
+        )
+        .unwrap(),
     );
     m.verbs.insert(
         "rdma_read".into(),
-        Requires::from_table_weighted(&t, "qp", "rdma_read", &["rdma.read"], &["pd", "cq"], 64)
-            .unwrap(),
+        Requires::from_table_weighted(
+            &t,
+            &ClassId::new("qp"),
+            &VerbId::new("rdma_read"),
+            &["rdma.read"],
+            &["pd", "cq"],
+            64,
+        )
+        .unwrap(),
     );
     m.verbs.insert(
         "post_recv".into(),
-        Requires::from_table(&t, "qp", "post_recv", &["rdma.local"], &[]).unwrap(),
+        Requires::from_table(
+            &t,
+            &ClassId::new("qp"),
+            &VerbId::new("post_recv"),
+            &["rdma.local"],
+            &[],
+        )
+        .unwrap(),
     );
     m.verbs.insert(
         "grant_remote_access".into(),
         Requires::from_table(
             &t,
-            "mr",
-            "grant_remote_access",
+            &ClassId::new("mr"),
+            &VerbId::new("grant_remote_access"),
             &["rdma.expose"],
             &["rkey-broker"],
         )
@@ -418,11 +480,25 @@ pub fn rdma() -> Entry {
     );
     m.verbs.insert(
         "poll_cq".into(),
-        Requires::from_table(&t, "cq", "poll_cq", &["rdma.local"], &[]).unwrap(),
+        Requires::from_table(
+            &t,
+            &ClassId::new("cq"),
+            &VerbId::new("poll_cq"),
+            &["rdma.local"],
+            &[],
+        )
+        .unwrap(),
     );
     m.verbs.insert(
         "query".into(),
-        Requires::from_table(&t, "qp", "query", &["rdma.local"], &[]).unwrap(),
+        Requires::from_table(
+            &t,
+            &ClassId::new("qp"),
+            &VerbId::new("query"),
+            &["rdma.local"],
+            &[],
+        )
+        .unwrap(),
     );
     let mount = Mount {
         name: "rdma-slot".into(),

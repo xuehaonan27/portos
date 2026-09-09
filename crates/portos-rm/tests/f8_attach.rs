@@ -1,6 +1,6 @@
 //! F8 法则测试 —— 每个测试名 = 它执行的定理/纪律（对照 attachments-v0.md v0.5 §11 拟决与 §13.3 墓碑）。
 
-use portos_rm::attach::*;
+use portos_rm::test_support::attach::*;
 
 const NAV: &str = "browser::navigate";
 const GRANT: &str = "grant_5b";
@@ -59,7 +59,7 @@ fn n_max_is_enforced_through_the_fire_component_even_for_zero_budget_plans() {
     assert_eq!(s.fire("zero", &Run::ok(&[], 0), 3), Err(Reject::NMax));
     assert_eq!(s.fired_count("zero"), 3);
     assert!(s.audit.iter().any(|a| matches!(a, Audit::Rejected { id, why: Reject::NMax } if id == "zero")));
-    assert_eq!(s.cached_outstanding.get("zero/attach::fire"), Some(&3));
+    assert_eq!(s.total_spent("zero", FIRE_CLASS), 3);
     assert!(s.invariants().is_ok(), "{:?}", s.invariants());
 
     s.attach(manual("spider", &[(NAV, 21)], 2), 10).unwrap();
@@ -67,7 +67,7 @@ fn n_max_is_enforced_through_the_fire_component_even_for_zero_budget_plans() {
     assert_eq!(s.fire("spider", &Run::ok(&[(NAV, 21)], 0), 11), Ok(2));
     assert_eq!(s.fire("spider", &Run::ok(&[(NAV, 1)], 0), 12), Err(Reject::NMax));
     // 类分量与 fire 分量同时耗尽：B_total = scale(n_max, B_firing)。
-    assert_eq!(s.cached_outstanding.get(&format!("spider/{NAV}")), Some(&42));
+    assert_eq!(s.total_spent("spider", NAV), 42);
     assert!(s.invariants().is_ok(), "{:?}", s.invariants());
 }
 
@@ -287,8 +287,8 @@ fn unused_balance_is_never_refunded_and_rejected_firings_mint_nothing() {
     s.attach(decl("a", Trigger::Topic { topic: "t".into() }, &[(NAV, 21)], 3), 0).unwrap();
     s.event("t", true, 1);
     s.fire("a", &Run::ok(&[(NAV, 3)], 0), 1).unwrap();
-    assert_eq!(s.cached_outstanding.get(&format!("a/{NAV}")), Some(&21));
-    assert_eq!(s.recompute_outstanding().get(&format!("a/{NAV}")), Some(&21));
+    assert_eq!(s.total_spent("a", NAV), 21);
+    assert_eq!(s.recompute_outstanding(), s.cached_outstanding);
     let rows_before = s.ledger.holdings().len();
     s.event("t", false, 2);
     assert_eq!(s.fire("a", &Run::ok(&[], 0), 2), Err(Reject::Precondition));
@@ -475,4 +475,34 @@ fn per_attachment_serial_and_min_interval_hold() {
     assert_eq!(s.fire("a", &Run::ok(&[], 0), 3), Err(Reject::MinInterval));
     assert_eq!(s.fire("a", &Run::ok(&[], 0), 6), Ok(2));
     assert!(s.invariants().is_ok());
+}
+
+
+#[test]
+fn names_with_separators_cannot_alias_budgets_or_cleanup_scopes() {
+    let mut s = Scheduler::new(true);
+    let cases = [("a", "branch/charge"), ("a/branch", "charge"), ("a#1", NAV), ("a:seg#1", NAV)];
+    for (id, class) in cases {
+        s.attach(manual(id, &[(class, 2)], 3), 0).unwrap();
+        s.begin(id, 1).unwrap();
+    }
+    s.detach("a", 2);
+    assert_eq!(s.total_spent("a", "branch/charge"), 0);
+    for (id, class) in &cases[1..] {
+        assert_eq!(s.status(id), Status::Active);
+        assert_eq!(s.inflight_seq(id), Some(1));
+        assert_eq!(s.total_spent(id, class), 2);
+        assert!(!s.firing_pool_closed(id, 1, class));
+        assert!(s.ledger.holding(s.attachments[*id].root).unwrap().state.is_active());
+    }
+    s.invariants().unwrap();
+    s.crash();
+    s.recover(3);
+    for (id, class) in &cases[1..] {
+        assert_eq!(s.fired_count(id), 1);
+        assert_eq!(s.total_spent(id, class), 2);
+        assert!(s.firing_pool_closed(id, 1, class));
+        assert_eq!(s.fire(id, &Run::ok(&[], 0), 4), Ok(2));
+    }
+    s.invariants().unwrap();
 }

@@ -1,15 +1,16 @@
 //! F6 法则测试（怪物志）—— 两个走查条目真的驱动 F1–F5 五套冻结机制跑通：
 //! Workspace（microVM/容器）与 RDMA。每条测试名＝它证明的"落位"或"扩充承重"。
 
-use portos_rm::bestiary::*;
+use portos_rm::identity::VerbId;
+use portos_rm::test_support::bestiary::*;
 use portos_rm::coeffect::*;
 use portos_rm::identity::{ClassId, Generation, HoldingId, InstanceId, ResourceKey, SubjectId};
 use portos_rm::ledger::GrantRequest;
 use portos_rm::ledger::*;
-use portos_rm::monitor::*;
+use portos_rm::test_support::monitor::*;
 use portos_rm::ra::{Ex, Frac, Ranges};
 use portos_rm::registry::Claim;
-use portos_rm::teardown::{Orchestrator, RunOutcome};
+use portos_rm::test_support::teardown::{Orchestrator, RunOutcome};
 use portos_rm::time::{LeaseRequest, Timestamp};
 use portos_rm::verbs::*;
 
@@ -28,10 +29,10 @@ fn consent(n: &str, b: u64) -> Consent {
 #[test]
 fn workspace_entry_passes_all_frozen_gates() {
     let e = workspace();
-    e.table.check_all().unwrap();
+    // The fixture publishes only checked classes.
     assert_eq!(admit_mount(&e.manifest, &e.mount), Ok(()));
 
-    let hp = e.table.derive_handler_policy("vm");
+    let hp = e.table.derive_handler_policy(&ClassId::new("vm")).unwrap();
     assert!(
         hp.contained.contains("exec") && hp.contained.contains("write_file"),
         "exec/写文件是界内变换"
@@ -41,13 +42,13 @@ fn workspace_entry_passes_all_frozen_gates() {
         "变换进预算（fuel）、不扣发"
     );
     assert!(!hp.budget.contains("read_file"), "可重复读零预算");
-    let ns = e.table.lookup("vm", "net_send").unwrap();
+    let ns = e.table.lookup(&ClassId::new("vm"), &VerbId::new("net_send")).unwrap();
     assert!(
         ns.staged_shape() && !ns.withhold(),
         "出网：两阶段由准入满足，可摊销不扣发"
     );
     assert_eq!(
-        e.table.derive_holding_grade("vm"),
+        e.table.derive_holding_grade(&ClassId::new("vm")),
         Some(RevertGrade::Inverse)
     );
 
@@ -183,7 +184,7 @@ fn workspace_entry_passes_all_frozen_gates() {
 #[test]
 fn workspace_segment_rollback_restores_touched_vm_exactly_once() {
     let e = workspace();
-    let hp = e.table.derive_handler_policy("vm");
+    let hp = e.table.derive_handler_policy(&ClassId::new("vm")).unwrap();
     let mut pol = Policy::default();
     pol.handler = "vm".into();
     pol.contained = hp.contained.clone();
@@ -277,17 +278,17 @@ fn workspace_weighted_budget_static_bound_covers_metered_spend() {
 #[test]
 fn rdma_entry_passes_all_frozen_gates_with_interval_and_frac() {
     let e = rdma();
-    e.table.check_all().unwrap();
+    // The fixture publishes only checked classes.
     assert_eq!(admit_mount(&e.manifest, &e.mount), Ok(()));
 
     // 投影
-    let mr = e.table.derive_handler_policy("mr");
+    let mr = e.table.derive_handler_policy(&ClassId::new("mr")).unwrap();
     assert_eq!(
         mr.withhold,
         ["grant_remote_access".to_string()].into_iter().collect(),
         "暴露内存＝硬清单"
     );
-    let qp = e.table.derive_handler_policy("qp");
+    let qp = e.table.derive_handler_policy(&ClassId::new("qp")).unwrap();
     assert!(qp.protocol.is_some(), "QP 状态机投影给 qp handler");
     assert!(
         qp.contained.contains("init") && qp.contained.contains("rts"),
@@ -298,7 +299,7 @@ fn rdma_entry_passes_all_frozen_gates_with_interval_and_frac() {
         "RDMA WRITE 可摊销"
     );
     assert!(matches!(
-        e.table.lookup("cq", "poll_cq").unwrap().kind,
+        e.table.lookup(&ClassId::new("cq"), &VerbId::new("poll_cq")).unwrap().kind().clone(),
         Kind::Consuming {
             world: ConsumeGrade::External
         }
@@ -507,7 +508,7 @@ fn rdma_entry_passes_all_frozen_gates_with_interval_and_frac() {
 #[test]
 fn rdma_qp_protocol_enforced_end_to_end() {
     let e = rdma();
-    let hp = e.table.derive_handler_policy("qp");
+    let hp = e.table.derive_handler_policy(&ClassId::new("qp")).unwrap();
     let mut pol = Policy::default();
     pol.handler = "qp".into();
     pol.protocol = hp.protocol.clone();
@@ -536,7 +537,7 @@ fn rdma_qp_protocol_enforced_end_to_end() {
     assert_eq!(*m.run(10), MonState::Done(MonOutcome::FailStop { at: 1 }));
     assert_eq!(m.world.emitted.len(), 1);
     // 准入期就能预言
-    let proto = hp.protocol.unwrap();
+    let proto = hp.protocol.as_ref().unwrap();
     let plan = Plan::Seq(bad.iter().map(|a| Plan::verb("qp", &a.verb)).collect());
     assert!(proto.check_plan(&plan).is_err());
     let good_plan = Plan::Seq(ok.iter().map(|a| Plan::verb("qp", &a.verb)).collect());

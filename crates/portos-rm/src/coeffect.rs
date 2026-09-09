@@ -53,6 +53,7 @@
 //!   [EXACT] 静态用量按精确自然数计算；超出 u64 池容量的需求必须被拒，不能饱和成达标。
 
 use crate::verbs::{VerbError, VerbTable};
+use crate::identity::{ClassId, VerbId};
 use num_bigint::BigUint;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
@@ -290,8 +291,8 @@ impl Requires {
     /// 效应类键取 handler.verb——effect-plan 的 origin 维度由 F3 的 (动词,目标) 范围承担（偏离申报）。
     pub fn from_table(
         table: &VerbTable,
-        class: &str,
-        verb: &str,
+        class: &ClassId,
+        verb: &VerbId,
         caps: &[&str],
         deps: &[&str],
     ) -> Result<Self, VerbError> {
@@ -303,8 +304,8 @@ impl Requires {
     /// 闸门（[TWO]：can_mint ＝ ↓B）衔接：实际 ≤ 声明 ⇒ 静态过则运行期必过。可重复动词恒 0。
     pub fn from_table_weighted(
         table: &VerbTable,
-        class: &str,
-        verb: &str,
+        class: &ClassId,
+        verb: &VerbId,
         caps: &[&str],
         deps: &[&str],
         weight: u64,
@@ -346,9 +347,9 @@ impl Requires {
 // ---------------------------------------------------------------------------
 // 计划的极小 AST 与两种求值。语言本体（守卫、变量、纯计算）归 m0 plancheck；
 // 这里只留决定计量的四种形状：动词、顺序、有界循环、分支。
-// **D31 隔离区**：计划语言仍在讨论中——以下计划形状的类型与求值只在 cargo feature
-// `plan-shapes`（默认开，法则测试用）下编译；内核以 `default-features = false` 依赖本 crate，
-// 从而在编译期就无法依赖它们。
+// Plan shapes are production analysis APIs behind `plan-shapes` (D41).
+// The kernel explicitly enables this feature. Mutable monitor and attachment
+// exercises are separately available only under `test_support`.
 // ---------------------------------------------------------------------------
 #[cfg(feature = "plan-shapes")]
 #[derive(Clone, PartialEq, Eq, Debug)]

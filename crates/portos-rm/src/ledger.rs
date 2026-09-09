@@ -651,49 +651,6 @@ impl Ledger {
         }
         depth
     }
-    /// Expired parents wait for children with independent, unexpired leases.
-    pub fn sweep(&mut self, now: Timestamp) -> Vec<HoldingId> {
-        let mut due: BTreeSet<_> = self
-            .active()
-            .filter(|h| matches!(h.lease, Lease::Until(t) if t <= now))
-            .map(|h| h.id)
-            .collect();
-        loop {
-            let kids: Vec<_> = self
-                .active()
-                .filter(|h| {
-                    h.lease == Lease::ParentBound && h.parent.is_some_and(|p| due.contains(&p))
-                })
-                .map(|h| h.id)
-                .collect();
-            let old = due.len();
-            due.extend(kids);
-            if due.len() == old {
-                break;
-            }
-        }
-        self.release_order(due, now)
-    }
-    fn release_order(&mut self, ids: BTreeSet<HoldingId>, now: Timestamp) -> Vec<HoldingId> {
-        let mut order: Vec<_> = ids
-            .into_iter()
-            .map(|id| (self.depth(id), self.holding(id).unwrap().handle()))
-            .collect();
-        order.sort_by(|a, b| b.0.cmp(&a.0));
-        order
-            .into_iter()
-            .filter_map(|(_, h)| self.release(&h, now).ok().map(|_| h.id()))
-            .collect()
-    }
-    pub fn teardown(&mut self, subject: &SubjectId, now: Timestamp) -> Vec<HoldingId> {
-        self.release_order(
-            self.active()
-                .filter(|h| &h.subject == subject)
-                .map(|h| h.id)
-                .collect(),
-            now,
-        )
-    }
     /// Includes orphan rows and the entire parent graph, not just capacity keys.
     pub fn invariant(&self) -> Result<(), LedgerError> {
         let mut ids = BTreeSet::new();
@@ -823,18 +780,6 @@ impl Ledger {
     }
     pub fn tombstone_count(&self) -> usize {
         self.holdings.iter().filter(|h| !h.state.occupies()).count()
-    }
-}
-
-/// Deterministic pseudo-random generator for the law tests.
-pub struct Lcg(pub u64);
-impl Lcg {
-    pub fn next(&mut self) -> u64 {
-        self.0 = self
-            .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        self.0 >> 33
     }
 }
 

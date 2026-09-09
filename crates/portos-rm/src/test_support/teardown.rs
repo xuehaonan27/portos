@@ -1,41 +1,17 @@
-//! Teardown planner + executor — freeze drill F2.
-//!
-//! 理论标签（对照 design/freeze-f2-teardown.md 的三列表）：
-//!   [T43]   任意序撤销定理（Cordis 定理 43）：两两独立的效应，其逆可按任意顺序执行、
-//!           各自只撤自己的贡献 —— 波内乱序并行的许可证。
-//!   [TREE]  排序约束只长在 ownership 树的边上（子先于父）—— 排序定理/提供者守卫的
-//!           资源侧形态；波次 = 约束图的拓扑分层。
-//!   [SAGA]  Garcia-Molina–Salem：长事务 = 步骤 + 补偿；本模块的反向日志记录
-//!           "清理进行到哪"，写在动手之前（write-ahead，ARIES/WAL 纪律）。
-//!   [E-IDEM] F1 法则"release 幂等" ⇒ 有逆档恢复 = 盲重放，不依赖日志内容。
-//!   [KEY]   可补偿档动作非幂等 ⇒ 必须携带去重钥匙，由补偿对端凭钥匙去重
-//!           （exactly-once = at-least-once + 按钥匙去重）。
-//!   [CRASH] crash-only 单路径：本执行器是唯一清理通道；优雅卸载 = 提前触发之。
-//!   [ρ]     动作选择由类声明的可逆档决定（theory-spec §2.5）：有逆 → release；
-//!           可补偿 → 记日志的补偿。等价由声明固定，不由执行者挑选。
+//! F2 deterministic cleanup drill using the production retirement transitions.
+//! Crashes preserve the in-memory ledger and mock world; this does not model
+//! SQLite durability. Wave shuffling exercises the mock's independence contract,
+//! never a permission inferred from a parent graph or a verb boolean.
 
-use crate::identity::{ClassId, Generation, HoldingId, InstanceId, SubjectId};
+use crate::cleanup::*;
+use crate::identity::{ClassId, Generation, HoldingHandle, HoldingId, InstanceId, SubjectId};
 use crate::ledger::{Ledger, LiveItem, RevertGrade};
 use crate::time::Timestamp;
 
-/// F2 的世界接口：执行器对基底的动作。演练用 [`MockWorld`]；内核实装用真基底
-/// （kill 进程、撤订阅、关 target……）。执行器只按类声明的 ρ 选动作（[ρ]），
-/// 世界只负责"做"与"报告成败"——恰好一次的承重仍在钥匙去重（[KEY]）。
-/// 调用方须为所声明的状态与观察范围建立恢复契约，并保证同一波中动作及其逆两两独立。
-/// parent 图只提供生命周期次序；没有 parent 边或 RA 组合合法，都不足以证明此独立性。
-pub trait World {
-    /// 有逆档：释放持有。须幂等——对已释放实例为空操作（[E-IDEM]：盲重放安全）。
-    fn release(&mut self, item: &LiveItem) -> Result<(), ()>;
-    /// 可补偿档：携钥匙请求补偿；返回是否真的生效（对端凭钥匙去重）。
-    fn compensate(&mut self, item: &LiveItem, key: &str) -> Result<bool, ()>;
-    /// 重试前复位注入故障（演练件用；实装无故障注入，默认空操作）。
-    fn reset_faults(&mut self) {}
-}
-
 // ---------------------------------------------------------------------------
-// 反向日志（saga-log）。这是 F2 的进程内演练结构，其崩溃模拟保留 Ledger+Journal。
-// 生产内核使用 cleanup 模块的持久任务与独立提交，不以这里的进程内步骤证明
-// 持久意图先于世界动作；本模块的模拟入口隔离仍属于 M3。
+// Journal is a drill trace, not recovery authority. Cleanup tasks in Ledger
+// retain stable keys and attempts even if this observation trace is discarded.
+// Only the kernel's storage coordinator establishes durable write ordering.
 // ---------------------------------------------------------------------------
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum JState {
@@ -62,7 +38,7 @@ impl Journal {
     pub fn from_entries(entries: Vec<JournalEntry>) -> Journal {
         Journal(entries)
     }
-    /// 全部条目（实装写穿持久化用）。
+    /// Read the simulated action trace; production persistence uses CleanupRecord.
     pub fn entries(&self) -> &[JournalEntry] {
         &self.0
     }
@@ -77,12 +53,6 @@ impl Journal {
             state: JState::Pending,
         });
         self.0.len() - 1
-    }
-    fn state_of(&self, holding_id: HoldingId) -> Option<JState> {
-        self.0
-            .iter()
-            .find(|e| e.holding_id == holding_id)
-            .map(|e| e.state)
     }
 }
 
@@ -135,7 +105,7 @@ impl MockWorld {
     }
 }
 
-impl World for MockWorld {
+impl MockWorld {
     /// [E-IDEM] 有逆档：重复 release 是空操作，永远成功。
     fn release(&mut self, item: &LiveItem) -> Result<(), ()> {
         if self.maybe_fail(item.id) {
@@ -163,7 +133,7 @@ impl World for MockWorld {
         }
         Ok(false) // 被去重：请求了但未再生效
     }
-    fn reset_faults(&mut self) {
+    pub fn reset_faults(&mut self) {
         self.fail_holding = None;
     }
 }
@@ -174,7 +144,7 @@ impl World for MockWorld {
 // ---------------------------------------------------------------------------
 pub fn plan_waves(ledger: &Ledger, subject: &str) -> Vec<Vec<HoldingId>> {
     // [B15] 规划对象是主体持有的 ownership 闭包（含跨主体后代），不是主体本人的行。
-    plan_waves_over(&ledger.live_closure(&SubjectId::new(subject)))
+    plan_waves_over(&ledger.occupying_closure(&SubjectId::new(subject)))
 }
 
 /// 波次规划的共享核：对任意存活集（主体的闭包、某持有的子树）按"集内深度"分层。
@@ -205,7 +175,7 @@ fn plan_waves_over(items: &[LiveItem]) -> Vec<Vec<HoldingId>> {
 // 执行器（含崩溃模拟）。步进计数把每个持有拆成三个可崩点：
 //   写日志后(1) / 世界动作后(2) / 标 Done 后(3) —— 覆盖 [SAGA] 的暧昧窗口。
 // ---------------------------------------------------------------------------
-pub struct Orchestrator<W: World = MockWorld> {
+pub struct Orchestrator<W: CleanupExecutor = MockWorld> {
     pub ledger: Ledger,
     pub journal: Journal,
     pub world: W,
@@ -227,8 +197,15 @@ impl Orchestrator<MockWorld> {
     }
 }
 
-impl<W: World> Orchestrator<W> {
-    /// 实装入口：账本＋真基底世界（内核的 kill/撤订阅…）。
+impl Orchestrator<MockWorld> {
+    pub fn resume(&mut self, subject: &str, order_seed: u64) -> RunOutcome {
+        self.world.reset_faults();
+        self.teardown(subject, order_seed, None)
+    }
+}
+
+impl<W: CleanupExecutor> Orchestrator<W> {
+    /// Drill entry with a cleanup executor; the domain transitions are shared.
     pub fn with_world(ledger: Ledger, world: W) -> Self {
         Self {
             ledger,
@@ -256,24 +233,11 @@ impl<W: World> Orchestrator<W> {
             Timestamp::ZERO,
         )
     }
-
-    /// 崩溃后恢复 = 原样再调 teardown（无专用恢复代码路径 —— [CRASH] 单路径的另一半）：
-    /// 有逆档靠 [E-IDEM] 盲重放；可补偿档靠 [SAGA] 日志的 InFlight + [KEY] 去重。
-    pub fn resume(&mut self, subject: &str, order_seed: u64) -> RunOutcome {
-        // 将 Failed 复位为 Pending 以允许重试（重试策略属实装；演练中显式复位）。
-        for e in self.journal.0.iter_mut() {
-            if e.state == JState::Failed {
-                e.state = JState::Pending;
-            }
-        }
-        self.world.reset_faults();
-        self.teardown(subject, order_seed, None)
-    }
 }
 
-/// 执行器本体（自由函数形态，供内核在自己的锁纪律下对共享账本调用）。
+/// Drill executor; production storage has its own durable coordinator.
 /// 语义与 [`Orchestrator::teardown`] 完全相同——后者只是它的薄包装。
-pub fn teardown_with<W: World>(
+pub fn teardown_with<W: CleanupExecutor>(
     ledger: &mut Ledger,
     journal: &mut Journal,
     world: &mut W,
@@ -286,7 +250,7 @@ pub fn teardown_with<W: World>(
         ledger,
         journal,
         world,
-        &|l| l.live_closure(&SubjectId::new(subject)),
+        &|l| l.occupying_closure(&SubjectId::new(subject)),
         subject,
         order_seed,
         crash_at_step,
@@ -298,7 +262,7 @@ pub fn teardown_with<W: World>(
 /// 后代），子先于父、根最后；主体名下的其他持有不受影响。`key_scope` 是 [KEY] 去重
 /// 钥匙的稳定前缀（主体名，或根持有的稳定名如 cap_id）——跨崩溃必须稳定。
 #[allow(clippy::too_many_arguments)]
-pub fn teardown_subtree_with<W: World>(
+pub fn teardown_subtree_with<W: CleanupExecutor>(
     ledger: &mut Ledger,
     journal: &mut Journal,
     world: &mut W,
@@ -312,7 +276,7 @@ pub fn teardown_subtree_with<W: World>(
         ledger,
         journal,
         world,
-        &|l| l.live_subtree(root),
+        &|l| l.occupying_subtree(root),
         key_scope,
         order_seed,
         crash_at_step,
@@ -323,7 +287,7 @@ pub fn teardown_subtree_with<W: World>(
 /// 执行器内核：`scope` 给出当前存活集（每次从账本现状重算——计划无状态，
 /// 状态全在账本与日志），其余纪律两形态同一。
 #[allow(clippy::too_many_arguments)]
-fn run<W: World>(
+fn run<W: CleanupExecutor>(
     ledger: &mut Ledger,
     journal: &mut Journal,
     world: &mut W,
@@ -333,96 +297,77 @@ fn run<W: World>(
     crash_at_step: Option<u64>,
     now: Timestamp,
 ) -> RunOutcome {
-    let mut step: u64 = 0;
-    let mut failed = Vec::new();
-    let mut passes: u32 = 0;
-    let tick = |step: &mut u64| -> bool {
-        *step += 1;
-        matches!(crash_at_step, Some(c) if *step >= c)
-    };
-    loop {
-        let waves = plan_waves_over(&scope(ledger));
-        if waves.is_empty() {
-            return RunOutcome::Completed { failed };
-        }
-        passes += 1;
-        assert!(
-            passes <= 4096,
-            "teardown failed to make progress — planner/guard bug"
-        );
-        let mut progressed = false;
-        for wave in waves {
-            let mut order = wave.clone();
-            // [T43] 波内洗牌；任意次序等效依赖 World 的独立性契约，MockWorld 测试覆盖其特例。
-            let mut s = order_seed.wrapping_add(order.len() as u64);
-            for i in (1..order.len()).rev() {
-                s = s
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                order.swap(i, (s >> 33) as usize % (i + 1));
-            }
-            for hid in order {
-                // [B15] 守卫与规划器看同一视图：闭包（跨主体子项也算"存活子项"）。
-                let snap = scope(ledger);
-                let item = match snap.iter().find(|it| it.id == hid) {
-                    Some(it) => it.clone(),
-                    None => continue, // 已被此前（或崩溃前）清掉
-                };
-                // [TREE] 守卫：仍有存活子项的父项必须延迟——不写日志、不动世界。
-                // （正常波次天然满足；子项 Failed 时这里就是"失败不越级殃及"的实现点。）
-                if snap.iter().any(|it| it.parent == Some(hid)) {
-                    continue;
-                }
-                // 跳过此前已判 Failed 的（留给重试调用）
-                if journal.state_of(hid) == Some(JState::Failed) {
-                    if !failed.contains(&hid) {
-                        failed.push(hid);
-                    }
-                    continue;
-                }
-                let key = format!("td:{key_scope}:{hid}");
-                // [SAGA] write-ahead：动手之前先记日志。
-                let ji = journal.ensure(hid, item.grade, &key);
-                journal.0[ji].state = JState::InFlight;
-                if tick(&mut step) {
-                    return RunOutcome::Crashed; // 崩点 1：日志已写、世界未动
-                }
-                // [ρ] 动作由类声明的可逆档决定。
-                let ok = match item.grade {
-                    RevertGrade::Inverse => world.release(&item).is_ok(),
-                    RevertGrade::Compensable => {
-                        // [KEY] 可补偿：携钥匙请求，对端去重 ⇒ 恰好一次。
-                        world.compensate(&item, &key).is_ok()
-                    }
-                    RevertGrade::External => {
-                        // 纯外部残迹不该作为持有出现（emission 不入账本）；防御性放行。
-                        true
-                    }
-                };
-                if tick(&mut step) {
-                    return RunOutcome::Crashed; // 崩点 2：世界已动、日志未标 Done —— 暧昧窗口
-                }
-                if ok {
-                    // 账本侧收尾（F1 的 release：幂等、落墓碑）。守卫已保证不会越序。
-                    match ledger.release(&item.handle(), now) {
-                        Ok(()) => {}
-                        Err(e) => panic!("ledger release invariant broken: {e:?}"),
-                    }
-                    journal.0[ji].state = JState::Done;
-                    progressed = true;
-                } else {
-                    journal.0[ji].state = JState::Failed;
-                    failed.push(hid);
-                }
-                if tick(&mut step) {
-                    return RunOutcome::Crashed; // 崩点 3：全部完成后
-                }
-            }
-        }
-        if !progressed {
-            return RunOutcome::Completed { failed };
+    let worker = HostWitness::new(
+        ProcessWitness::new(1, 1, Generation::new("drill-boot")).unwrap(),
+        Generation::new("drill-worker"),
+    )
+    .unwrap();
+    let items = scope(ledger);
+    // Recover only attempts in this selected scope. A simulation crash kills its
+    // sole worker; a real coordinator must establish that fact from its witness.
+    for item in &items {
+        let record = ledger
+            .cleanup_tasks()
+            .find(|t| t.holding.id() == item.id && matches!(t.state, CleanupState::Running { .. }))
+            .map(|t| (**t).clone());
+        if let Some(record) = record {
+            ledger.abandon_cleanup(&record, now).unwrap();
         }
     }
+    for item in items {
+        ledger
+            .request_retirement(
+                &item.handle(),
+                CleanupKey::new(format!("td:{key_scope}:{}", item.id)).unwrap(),
+                now,
+            )
+            .unwrap();
+    }
+    let mut step = 0;
+    let mut failed = Vec::new();
+    let tick = |step: &mut u64| {
+        *step += 1;
+        crash_at_step.is_some_and(|c| *step >= c)
+    };
+    for wave in plan_waves_over(&scope(ledger)) {
+        let mut order = wave;
+        let mut seed = order_seed.wrapping_add(order.len() as u64);
+        for i in (1..order.len()).rev() {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            order.swap(i, (seed >> 33) as usize % (i + 1));
+        }
+        for hid in order {
+            let task = ledger
+                .cleanup_tasks()
+                .find(|t| t.holding.id() == hid)
+                .unwrap()
+                .id;
+            let Some(work) = ledger.claim_cleanup(task, worker.clone(), now).unwrap() else {
+                continue;
+            };
+            let ji = journal.ensure(hid, work.grade(), work.task().key.as_str());
+            journal.0[ji].state = JState::InFlight;
+            if tick(&mut step) {
+                return RunOutcome::Crashed;
+            }
+            let outcome = world.execute(&work);
+            if tick(&mut step) {
+                return RunOutcome::Crashed;
+            }
+            ledger.finish_cleanup(&work, outcome, now).unwrap();
+            let done = ledger.cleanup_task(task).unwrap().state.is_done();
+            journal.0[ji].state = if done { JState::Done } else { JState::Failed };
+            if !done {
+                failed.push(hid);
+            }
+            if tick(&mut step) {
+                return RunOutcome::Crashed;
+            }
+        }
+    }
+    RunOutcome::Completed { failed }
 }
 
 // The drill world can also exercise the durable kernel coordinator. Its effects
@@ -430,8 +375,135 @@ fn run<W: World>(
 impl crate::cleanup::CleanupExecutor for MockWorld {
     fn execute(&mut self, work: &crate::cleanup::CleanupWork) -> crate::cleanup::CleanupOutcome {
         use crate::cleanup::CleanupOutcome;
-        let item=LiveItem { id:work.task().holding.id(),parent:None,class_id:work.resource().class().clone(),instance:work.resource().instance().clone(),generation:work.task().holding.generation().clone(),grade:work.grade() };
-        let result=if work.grade()==RevertGrade::Compensable { self.compensate(&item,work.task().key.as_str()).map(|_|()) } else { self.release(&item) };
-        match result { Ok(())=>CleanupOutcome::Confirmed,Err(())=>CleanupOutcome::Retryable("injected drill failure".into()) }
+        let item = LiveItem {
+            id: work.task().holding.id(),
+            parent: None,
+            class_id: work.resource().class().clone(),
+            instance: work.resource().instance().clone(),
+            generation: work.task().holding.generation().clone(),
+            grade: work.grade(),
+        };
+        let result = if work.grade() == RevertGrade::Compensable {
+            self.compensate(&item, work.task().key.as_str()).map(|_| ())
+        } else {
+            self.release(&item)
+        };
+        match result {
+            Ok(()) => CleanupOutcome::Confirmed,
+            Err(()) => CleanupOutcome::Retryable("injected drill failure".into()),
+        }
+    }
+}
+
+/// Select a cleanup scope by handles, including ownership descendants. Labels
+/// and subject formatting are not used to recover membership.
+pub fn teardown_handles(
+    ledger: &mut Ledger,
+    journal: &mut Journal,
+    world: &mut impl CleanupExecutor,
+    handles: &[HoldingHandle],
+    now: Timestamp,
+) -> RunOutcome {
+    for handle in handles {
+        assert_eq!(
+            ledger.holding(handle.id()).map(|h| h.handle()).as_ref(),
+            Some(handle)
+        );
+    }
+    run(
+        ledger,
+        journal,
+        world,
+        &|l| {
+            let mut items = std::collections::BTreeMap::new();
+            for h in handles {
+                for item in l.occupying_subtree(h.id()) {
+                    items.insert(item.id, item);
+                }
+            }
+            items.into_values().collect()
+        },
+        "handles",
+        0,
+        None,
+        now,
+    )
+}
+
+/// Pure accounting fixtures still use the same retirement/claim/finish path.
+/// Physical targets require a real or explicitly chosen mock executor.
+pub struct AccountingWorld;
+impl CleanupExecutor for AccountingWorld {
+    fn execute(&mut self, work: &CleanupWork) -> CleanupOutcome {
+        match work.target() {
+            CleanupTarget::AccountingOnly => CleanupOutcome::Confirmed,
+            _ => CleanupOutcome::Blocked("accounting fixture has no physical provider".into()),
+        }
+    }
+}
+
+pub trait LedgerDrill {
+    fn sweep(&mut self, now: Timestamp) -> Vec<HoldingId>;
+    fn teardown(&mut self, subject: &SubjectId, now: Timestamp) -> Vec<HoldingId>;
+}
+impl LedgerDrill for Ledger {
+    fn sweep(&mut self, now: Timestamp) -> Vec<HoldingId> {
+        let due = self.due_retirements(now);
+        let selected: std::collections::BTreeSet<_> = due
+            .iter()
+            .map(|h| h.id())
+            .chain(
+                self.cleanup_tasks()
+                    .filter(|t| !t.state.is_done())
+                    .map(|t| t.holding.id()),
+            )
+            .collect();
+        let mut journal = Journal::default();
+        run(
+            self,
+            &mut journal,
+            &mut AccountingWorld,
+            &|l| {
+                l.occupying()
+                    .filter(|h| selected.contains(&h.id))
+                    .map(|h| LiveItem {
+                        id: h.id,
+                        parent: h.parent,
+                        class_id: h.class_id.clone(),
+                        instance: h.instance.clone(),
+                        generation: h.generation.clone(),
+                        grade: l.grade_of(&h.class_id).unwrap(),
+                    })
+                    .collect()
+            },
+            "sweep",
+            0,
+            None,
+            now,
+        );
+        journal
+            .entries()
+            .iter()
+            .filter(|e| e.state == JState::Done)
+            .map(|e| e.holding_id)
+            .collect()
+    }
+    fn teardown(&mut self, subject: &SubjectId, now: Timestamp) -> Vec<HoldingId> {
+        let mut journal = Journal::default();
+        teardown_with(
+            self,
+            &mut journal,
+            &mut AccountingWorld,
+            subject.as_str(),
+            0,
+            None,
+            now,
+        );
+        journal
+            .entries()
+            .iter()
+            .filter(|e| e.state == JState::Done)
+            .map(|e| e.holding_id)
+            .collect()
     }
 }

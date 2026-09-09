@@ -1,13 +1,13 @@
 //! Plan runs in the kernel (WP-06): admission → consent (WYSIWYS) → run
 //! under the F3 monitor → prefix delivery.
 //!
-//! The semantics are the law crate's F3 monitor (`portos_rm::monitor`,
-//! unchanged) rebuilt on the real kernel:
+//! F3 is the semantic reference (`portos_rm::test_support::monitor`). This
+//! executor adds SQLite buffering, plugin protocol checks and per-class accounts:
 //!
 //!   - **Budget is rows** ([GATE]): a consent mints one capability per family
 //!     for the fiber `plan:<h_plan>#<run>` (counts = the consented per-class
 //!     budgets, expiry = consent ttl); every effect spends through the issuer
-//!     gate (`find_and_exercise` → pool row under `<fiber>:spent`). There is
+//!     gate (`find_and_exercise` → the explicit resource account binding). There is
 //!     no subtraction anywhere.
 //!   - **The monitor pipeline** per effect: sink re-check → staged (withhold
 //!     the hard list: emitting ∧ non-amortizable) → protocol (enforced at the
@@ -20,12 +20,15 @@
 //!     Paused) are bounded by the *original* consent's ttl ([TTL]); the
 //!     sweeper expires them.
 //!   - **Segment = transaction** ([SEG-TX]): holdings the run acquires are
-//!     booked under `<fiber>:seg`; commit transfers them to the fiber, any
-//!     other terminal state tears the segment down (the F2 path).
+//!     selected by the run's persisted `plan_segments` association; commit
+//!     transfers them to the fiber, other terminal states request M2 cleanup.
+//!     This preserves parent dependencies and never refunds the spent account.
+//!     Plugin-created acquisitions/checkpoints are not yet routed into that
+//!     segment by this interpreter; F3's stage_acquire/restore are drill hooks.
 //!
 //! Escalate resume is in-process (the interpreter thread parks on a condvar).
-//! A crashed kernel's suspended runs are aborted at open (`recover`), which
-//! matches the drill's crash model (buffer loss = degraded abort).
+//! Recovery aborts running/paused interpreters; awaiting-approval buffers
+//! survive for approval from a later process. F3's in-memory buffer does not.
 
 use portos_rm::identity::SubjectId;
 use portos_rm::time::Timestamp;
@@ -142,8 +145,10 @@ impl PlanService {
         Arc::new(svc)
     }
 
-    fn seg_of(fiber: &str) -> String {
-        format!("{fiber}:seg")
+    fn segment_of(&self, run_id: &str) -> Result<SubjectId, KernelError> {
+        let conn = self.kernel.db.lock().unwrap();
+        conn.query_row("SELECT subject FROM plan_segments WHERE run_id=?1", params![run_id], |r| r.get::<_, String>(0))
+            .map(SubjectId::new).map_err(|e| KernelError::Corrupt(format!("plan segment {run_id}: {e}")))
     }
 
     /// Abort every run a previous process left *non-resumable*: the
@@ -154,24 +159,24 @@ impl PlanService {
     /// process can approve it ([INSERT]).
     fn recover(&self) {
         let now = crate::db::now_unix();
-        let stale: Vec<(String, String)> = {
+        let stale: Vec<String> = {
             let conn = self.kernel.db.lock().unwrap();
             let mut stmt = conn
                 .prepare(
-                    "SELECT run_id, subject FROM plan_runs \
+                    "SELECT run_id FROM plan_runs \
                      WHERE state IN ('running','paused')",
                 )
                 .unwrap();
-            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            stmt.query_map([], |r| r.get::<_, String>(0))
                 .unwrap()
                 .filter_map(|r| r.ok())
                 .collect()
         };
-        for (run_id, fiber) in stale {
+        for run_id in stale {
             let _ = self.set_buffer_state(&run_id, "held", "aborted");
-            let seg = Self::seg_of(&fiber);
+            let seg = self.segment_of(&run_id).expect("registered plan segment");
             let mut world = HostWorld { inner: self.inner.clone() };
-            let _ = self.kernel.ledger.teardown(&SubjectId::new(&seg), &mut world, Timestamp::try_from(now).expect("system timestamp in range"));
+            let _ = self.kernel.ledger.teardown(&seg, &mut world, Timestamp::try_from(now).expect("system timestamp in range"));
             self.finish_row(&run_id, &Outcome::Aborted { expired: false });
             let _ = self.kernel.audit.lock().unwrap().append(json!({
                 "event": "plan.aborted", "run": run_id, "crashed": true,
@@ -214,12 +219,15 @@ impl PlanService {
         let run_id = format!("run_{}", hex_short());
         let fiber = format!("plan:{plan_hash}#{run_id}");
         {
-            let conn = self.kernel.db.lock().unwrap();
-            conn.execute(
+            let mut conn = self.kernel.db.lock().unwrap();
+            let tx = conn.transaction()?;
+            tx.execute(
                 "INSERT INTO plan_runs (run_id, plan_hash, subject, nonce, state, started_at) \
                  VALUES (?1, ?2, ?3, '', 'admitted', ?4)",
                 params![run_id, plan_hash, fiber, crate::db::now_unix() as i64],
             )?;
+            tx.execute("INSERT INTO plan_segments (run_id, subject) VALUES (?1, ?2)", params![run_id, format!("{fiber}:seg")])?;
+            tx.commit()?;
         }
         self.runs.lock().unwrap().insert(
             run_id.clone(),
@@ -470,9 +478,9 @@ impl PlanService {
                 "event": "plan.approve_failed", "run": run_id, "released": released, "error": why,
             }));
             let _ = self.set_buffer_state(run_id, "held", "aborted");
-            let seg = Self::seg_of(&row.subject);
+            let seg = self.segment_of(run_id)?;
             let mut world = HostWorld { inner: self.inner.clone() };
-            let _ = self.kernel.ledger.teardown(&SubjectId::new(&seg), &mut world, Timestamp::try_from(crate::db::now_unix()).expect("system timestamp in range"));
+            let _ = self.kernel.ledger.teardown(&seg, &mut world, Timestamp::try_from(crate::db::now_unix()).expect("system timestamp in range"));
             self.finish_run(run_id, &Outcome::FailStop { at: why.clone() }, 0);
             return Err(KernelError::Denied(format!("approve release failed: {why}")));
         }
@@ -483,8 +491,8 @@ impl PlanService {
         }));
         self.emit(run_id, json!({"kind": "approved", "released": batch.len()}));
         // [SEG-TX] approval = commit.
-        let seg = Self::seg_of(&row.subject);
-        let moved = self.kernel.ledger.transfer_all(&SubjectId::new(&seg), &SubjectId::new(&row.subject))?;
+        let seg = self.segment_of(run_id)?;
+        let moved = self.kernel.ledger.transfer_all(&seg, &SubjectId::new(&row.subject))?;
         self.finish_run(run_id, &Outcome::Completed, moved);
         Ok(())
     }
@@ -529,7 +537,7 @@ impl PlanService {
     /// past ttl ([TTL]): drop the buffer, roll back the segment, the already
     /// emitted prefix stands.
     pub fn expire(&self, now: u64) {
-        let expiring: Vec<(String, Arc<(Mutex<Ctrl>, Condvar)>, String, RunState)> = {
+        let expiring: Vec<(String, Arc<(Mutex<Ctrl>, Condvar)>, RunState)> = {
             let runs = self.runs.lock().unwrap();
             runs.iter()
                 .filter(|(_, r)| {
@@ -537,10 +545,10 @@ impl PlanService {
                         && r.original_ttl_at > 0
                         && now > r.original_ttl_at
                 })
-                .map(|(id, r)| (id.clone(), r.ctrl.clone(), r.fiber.clone(), r.state))
+                .map(|(id, r)| (id.clone(), r.ctrl.clone(), r.state))
                 .collect()
         };
-        for (run_id, ctrl, fiber, state) in expiring {
+        for (run_id, ctrl, state) in expiring {
             {
                 let (lock, cv) = &*ctrl;
                 let mut c = lock.lock().unwrap();
@@ -550,17 +558,17 @@ impl PlanService {
             // A Paused interpreter settles itself on wake; an
             // AwaitingApproval run has no thread — settle it here.
             if state == RunState::AwaitingApproval {
-                self.settle_aborted(&run_id, &fiber, true);
+                self.settle_aborted(&run_id, true);
             }
         }
     }
 
-    fn settle_aborted(&self, run_id: &str, fiber: &str, expired: bool) {
+    fn settle_aborted(&self, run_id: &str, expired: bool) {
         let now = crate::db::now_unix();
         let _ = self.set_buffer_state(run_id, "held", "aborted");
-        let seg = Self::seg_of(fiber);
+        let seg = self.segment_of(run_id).expect("registered plan segment");
         let mut world = HostWorld { inner: self.inner.clone() };
-        let _ = self.kernel.ledger.teardown(&SubjectId::new(&seg), &mut world, Timestamp::try_from(now).expect("system timestamp in range"));
+        let _ = self.kernel.ledger.teardown(&seg, &mut world, Timestamp::try_from(now).expect("system timestamp in range"));
         self.finish_run(run_id, &Outcome::Aborted { expired }, 0);
     }
 
@@ -588,13 +596,12 @@ impl PlanService {
     // ---- interpreter ----
 
     fn exec_thread(self: &Arc<Self>, run_id: &str, plan: Plan, consent: ConsentRecord) {
-        let fiber = format!("plan:{}#{}", self.plan_hash_of(run_id), run_id);
-        let ctrl = self
+        let (fiber, ctrl) = self
             .runs
             .lock()
             .unwrap()
             .get(run_id)
-            .map(|r| r.ctrl.clone())
+            .map(|r| (r.fiber.clone(), r.ctrl.clone()))
             .expect("run registered");
         let mut rt = Rt {
             svc: self,
@@ -611,8 +618,8 @@ impl PlanService {
             Ok(()) => {
                 if rt.withheld == 0 {
                     // [SEG-TX] walked to the end with nothing withheld = commit.
-                    let seg = Self::seg_of(&fiber);
-                    let moved = self.kernel.ledger.transfer_all(&SubjectId::new(&seg), &SubjectId::new(&fiber)).unwrap_or(0);
+                    let seg = self.segment_of(run_id).expect("registered plan segment");
+                    let moved = self.kernel.ledger.transfer_all(&seg, &SubjectId::new(&fiber)).unwrap_or(0);
                     self.finish_run(run_id, &Outcome::Completed, moved);
                 } else {
                     self.set_state(run_id, RunState::AwaitingApproval);
@@ -629,9 +636,9 @@ impl PlanService {
                 // Any non-commit terminal state: drop the buffer, roll the
                 // segment back ([SEG-TX], the monitor does it itself).
                 let _ = self.set_buffer_state(run_id, "held", "aborted");
-                let seg = Self::seg_of(&fiber);
+                let seg = self.segment_of(run_id).expect("registered plan segment");
                 let mut world = HostWorld { inner: self.inner.clone() };
-                let _ = self.kernel.ledger.teardown(&SubjectId::new(&seg), &mut world, Timestamp::try_from(crate::db::now_unix()).expect("system timestamp in range"));
+                let _ = self.kernel.ledger.teardown(&seg, &mut world, Timestamp::try_from(crate::db::now_unix()).expect("system timestamp in range"));
                 self.finish_run(run_id, &outcome, 0);
             }
         }
@@ -685,14 +692,6 @@ impl PlanService {
         );
     }
 
-    fn plan_hash_of(&self, run_id: &str) -> String {
-        self.runs
-            .lock()
-            .unwrap()
-            .get(run_id)
-            .map(|r| r.plan_hash.clone())
-            .unwrap_or_default()
-    }
 
     fn plan_bytes(&self, plan_hash: &str) -> Result<Vec<u8>, KernelError> {
         let mut out = Vec::new();
@@ -1331,3 +1330,6 @@ impl PlanService {
         let _ = self.kernel.audit.lock().unwrap().append(body);
     }
 }
+
+#[cfg(test)]
+mod m3_tests;

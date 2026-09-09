@@ -20,10 +20,12 @@ macro_rules! name {
 name!(
     SubjectId,
     ClassId,
+    VerbId,
     InstanceId,
     Generation,
     EffectClass,
-    AccountId
+    AccountId,
+    AttachmentId
 );
 
 /// Zero is a valid historical ID. Values must round-trip through SQLite INTEGER.

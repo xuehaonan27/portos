@@ -18,4 +18,5 @@ hex = { workspace = true }
 nix = { workspace = true }
 
 [dev-dependencies]
+portos-rm = { path = "../portos-rm", default-features = false, features = ["test-support"] }
 portos-signer = { path = "../../plugins/signer" }

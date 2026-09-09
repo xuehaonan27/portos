@@ -23,13 +23,58 @@ use crate::coeffect::Plan;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// 动词上的确定性安全自动机。
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Protocol {
-    pub initial: String,
+    initial: String,
     /// (state, verb) → next state。缺项＝违规（安全自动机：未列出的转移一律拒）。
-    pub transitions: BTreeMap<(String, String), String>,
+    transitions: BTreeMap<(String, String), String>,
     /// 辖域动词：出现在任何转移里的动词。辖域外动词不改状态。
-    pub scoped: BTreeSet<String>,
+    scoped: BTreeSet<String>,
+}
+
+/// Raw protocol input preserves duplicate transitions until validation.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ProtocolDraft {
+    pub initial: String,
+    pub transitions: Vec<(String, String, String)>,
+}
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ProtocolError {
+    EmptyName,
+    DuplicateTransition,
+}
+impl ProtocolDraft {
+    pub fn new(initial: &str) -> Self {
+        Self {
+            initial: initial.into(),
+            transitions: Vec::new(),
+        }
+    }
+    pub fn transition(mut self, from: &str, verb: &str, to: &str) -> Self {
+        self.transitions.push((from.into(), verb.into(), to.into()));
+        self
+    }
+    pub fn check(self) -> Result<Protocol, ProtocolError> {
+        if self.initial.is_empty() {
+            return Err(ProtocolError::EmptyName);
+        }
+        let mut transitions = BTreeMap::new();
+        let mut scoped = BTreeSet::new();
+        for (from, verb, to) in self.transitions {
+            if from.is_empty() || verb.is_empty() || to.is_empty() {
+                return Err(ProtocolError::EmptyName);
+            }
+            scoped.insert(verb.clone());
+            if transitions.insert((from, verb), to).is_some() {
+                return Err(ProtocolError::DuplicateTransition);
+            }
+        }
+        Ok(Protocol {
+            initial: self.initial,
+            transitions,
+            scoped,
+        })
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -42,13 +87,11 @@ pub struct Violation {
 }
 
 impl Protocol {
-    pub fn new(initial: &str) -> Self {
-        Protocol { initial: initial.into(), transitions: BTreeMap::new(), scoped: BTreeSet::new() }
+    pub fn initial(&self) -> &str {
+        &self.initial
     }
-    pub fn transition(mut self, from: &str, verb: &str, to: &str) -> Self {
-        self.transitions.insert((from.into(), verb.into()), to.into());
-        self.scoped.insert(verb.into());
-        self
+    pub fn scoped(&self) -> &BTreeSet<String> {
+        &self.scoped
     }
     /// 在给定状态执行动词。辖域外动词 ⇒ 状态不变；辖域内无转移 ⇒ 违规。
     pub fn step(&self, state: &str, verb: &str) -> Result<String, Violation> {
@@ -58,7 +101,11 @@ impl Protocol {
         self.transitions
             .get(&(state.to_string(), verb.to_string()))
             .cloned()
-            .ok_or(Violation { verb: verb.into(), state: state.into(), at: None })
+            .ok_or(Violation {
+                verb: verb.into(),
+                state: state.into(),
+                at: None,
+            })
     }
     /// 序列判定：返回首个违规位置。这是"精确执行＝交付最长合法前缀"的判据函数。
     pub fn check_sequence(&self, verbs: &[&str]) -> Result<String, Violation> {
@@ -74,7 +121,11 @@ impl Protocol {
 
     /// [STATIC] 状态集语义：从状态集出发跑完计划，得到可达状态集；任一路径违规即 Err。
     #[cfg(feature = "plan-shapes")]
-    pub fn reach(&self, plan: &Plan, states: &BTreeSet<String>) -> Result<BTreeSet<String>, Violation> {
+    pub fn reach(
+        &self,
+        plan: &Plan,
+        states: &BTreeSet<String>,
+    ) -> Result<BTreeSet<String>, Violation> {
         match plan {
             Plan::Verb { verb, .. } => {
                 let mut out = BTreeSet::new();
@@ -118,7 +169,11 @@ impl Protocol {
     /// [REORDER] 准入期检查（世界序）：扣发动词殿后。Seq(非扣发投影, 扣发投影)，
     /// 对分支过近似（sound）。`withhold` 为该 handler 的扣发集（F4 投影）。
     #[cfg(feature = "plan-shapes")]
-    pub fn check_plan_world_order(&self, plan: &Plan, withhold: &BTreeSet<String>) -> Result<BTreeSet<String>, Violation> {
+    pub fn check_plan_world_order(
+        &self,
+        plan: &Plan,
+        withhold: &BTreeSet<String>,
+    ) -> Result<BTreeSet<String>, Violation> {
         let immediate = project(plan, &|v| !withhold.contains(v));
         let deferred = project(plan, &|v| withhold.contains(v));
         self.check_plan(&Plan::Seq(vec![immediate, deferred]))
@@ -137,14 +192,17 @@ pub fn project(plan: &Plan, keep: &dyn Fn(&str) -> bool) -> Plan {
             }
         }
         Plan::Seq(items) => Plan::Seq(items.iter().map(|p| project(p, keep)).collect()),
-        Plan::Loop { bound, body } => Plan::Loop { bound: *bound, body: Box::new(project(body, keep)) },
+        Plan::Loop { bound, body } => Plan::Loop {
+            bound: *bound,
+            body: Box::new(project(body, keep)),
+        },
         Plan::Branch(a, b) => Plan::Branch(Box::new(project(a, keep)), Box::new(project(b, keep))),
     }
 }
 
 /// 穷举计划的全部具体执行路径（循环按 0..=N 轮展开、分支两取）。测试用参照实现；
 /// 规模随嵌套指数增长，只对小计划使用——它是 [STATIC] 的"真值表"。
-#[cfg(feature = "plan-shapes")]
+#[cfg(all(feature = "plan-shapes", feature = "test-support"))]
 pub fn enumerate_paths(plan: &Plan) -> Vec<Vec<String>> {
     match plan {
         Plan::Verb { verb, .. } => vec![vec![verb.clone()]],
@@ -189,3 +247,9 @@ pub fn enumerate_paths(plan: &Plan) -> Vec<Vec<String>> {
         }
     }
 }
+
+/// ```compile_fail
+/// use portos_rm::protocol::Protocol;
+/// fn overwrite(protocol: &mut Protocol) { protocol.transitions.clear(); }
+/// ```
+const _: () = ();

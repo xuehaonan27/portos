@@ -4,7 +4,7 @@
 use portos_rm::identity::{ClassId, Generation, HoldingHandle, InstanceId, ResourceKey, SubjectId};
 use portos_rm::ledger::GrantRequest;
 use portos_rm::ledger::*;
-use portos_rm::monitor::*;
+use portos_rm::test_support::monitor::*;
 use portos_rm::ra::Ex;
 use portos_rm::registry::{Capacity, Claim};
 use portos_rm::time::{LeaseDuration, LeaseRequest, Timestamp};
@@ -932,4 +932,38 @@ fn truncate_never_silent() {
         "同界不同结局"
     );
     assert_eq!(s.world.emitted, t.world.emitted, "两种模式交付同一前缀");
+}
+
+
+#[test]
+fn segment_membership_is_not_inferred_from_an_owner_label() {
+    for commit in [false, true] {
+        let mut ledger = Ledger::new();
+        let class = ClassId::new("scratch");
+        ledger.register_class(ClassDecl {
+            class_id: class.clone(), algebra: AlgebraTag::Exclusive,
+            cleanup: portos_rm::cleanup::CleanupPolicy::AccountingOnly,
+            release_idempotent: true, lease_duration: None, revert_grade: RevertGrade::Inverse,
+        }).unwrap();
+        let mut pools = Vec::new();
+        for name in ["member", "unrelated"] {
+            pools.push(ledger.create_pool(&ledger.registered_class::<Ex>(&class).unwrap(), InstanceId::new(name), Capacity::new(Ex::Token).unwrap()).unwrap());
+        }
+        let outsider = ledger.grant(&pools[1], GrantRequest {
+            owner: SubjectId::new("fib:seg"), claim: Claim::new(Ex::Token).unwrap(), generation: Generation::new("g"),
+            parent: None, lease: LeaseRequest::UseClassDefault, now: Timestamp::ZERO,
+        }).unwrap();
+        let mut monitor = Monitor::new(base_policy(), Mode::Strict, ledger, "fib");
+        let plan = if commit { vec![] } else { vec![a("post", "evil.example", "x")] };
+        monitor.admit(plan, H, consent("n", 2), NOW).unwrap();
+        let member = monitor.stage_acquire(&pools[0], Generation::new("g"), Claim::new(Ex::Token).unwrap(), Timestamp::ZERO).unwrap();
+        assert_eq!(monitor.promote(&outsider), Err(PromoteError::Ledger(LedgerError::ForgedHandle)));
+        monitor.run(NOW);
+        let outsider = monitor.orch.ledger.holding(outsider.id()).unwrap();
+        assert!(outsider.state.is_active());
+        assert_eq!(outsider.subject, SubjectId::new("fib:seg"));
+        let member = monitor.orch.ledger.holding(member.id()).unwrap();
+        if commit { assert_eq!(member.subject, SubjectId::new("fib")); } else { assert!(member.released_at().is_some()); }
+        assert!(monitor.stage_acquire(&pools[0], Generation::new("late"), Claim::new(Ex::Token).unwrap(), Timestamp::ZERO).is_err());
+    }
 }
