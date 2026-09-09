@@ -8,7 +8,7 @@
 //! with RuntimeLimits) replaces the builtin bodies at M0.5 WITHOUT changing
 //! this interface; see design/m0-kernel-v0.md §8.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 pub struct FuelMeter {
@@ -44,7 +44,10 @@ impl Registry {
         ] {
             // M0 pin identity: hash of name@version. When real code (JS/WASM)
             // arrives, this becomes the hash of the code bytes.
-            let pin = format!("blake3:{}", blake3::hash(format!("{name}@0.1").as_bytes()).to_hex());
+            let pin = format!(
+                "blake3:{}",
+                blake3::hash(format!("{name}@0.1").as_bytes()).to_hex()
+            );
             by_name.insert(name.to_string(), (pin, f));
         }
         Registry { by_name }
@@ -77,7 +80,10 @@ impl Registry {
 }
 
 fn f_upper(args: &[Value], fuel: &mut FuelMeter) -> Result<Value, String> {
-    let s = args.get(0).and_then(|v| v.as_str()).ok_or("upper: want string")?;
+    let s = args
+        .get(0)
+        .and_then(|v| v.as_str())
+        .ok_or("upper: want string")?;
     fuel.charge(s.len() as u64)?;
     Ok(json!(s.to_uppercase()))
 }
@@ -114,15 +120,24 @@ mod tests {
         let err = reg.run("upper", None, &[json!("looooong")], &mut fuel);
         assert!(err.is_err(), "fuel must bound work");
         let mut fuel = FuelMeter::new(1000);
-        assert_eq!(reg.run("upper", None, &[json!("hi")], &mut fuel).unwrap(), json!("HI"));
+        assert_eq!(
+            reg.run("upper", None, &[json!("hi")], &mut fuel).unwrap(),
+            json!("HI")
+        );
     }
 
     #[test]
     fn pin_guard_refuses_mismatch() {
         let reg = Registry::builtin();
         let mut fuel = FuelMeter::new(1000);
-        assert!(reg.run("upper", Some("blake3:wrong"), &[json!("x")], &mut fuel).is_err());
+        assert!(
+            reg.run("upper", Some("blake3:wrong"), &[json!("x")], &mut fuel)
+                .is_err()
+        );
         let good = reg.pin_of("upper").unwrap().to_string();
-        assert!(reg.run("upper", Some(&good), &[json!("x")], &mut fuel).is_ok());
+        assert!(
+            reg.run("upper", Some(&good), &[json!("x")], &mut fuel)
+                .is_ok()
+        );
     }
 }

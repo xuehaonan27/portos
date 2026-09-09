@@ -252,12 +252,16 @@ pub fn run_send(
                 }
                 ev
             };
-            emit(with_character(json!({"kind": "tool_call", "verb": call.verb, "args": call.args})));
+            emit(with_character(
+                json!({"kind": "tool_call", "verb": call.verb, "args": call.args}),
+            ));
             let (content, is_error) = match invoke(&call.verb, call.args.clone()) {
                 Ok(v) => (serde_json::to_string(&v).unwrap_or_default(), false),
                 Err(e) => (e, true),
             };
-            emit(with_character(json!({"kind": "tool_result", "verb": call.verb, "ok": !is_error})));
+            emit(with_character(
+                json!({"kind": "tool_result", "verb": call.verb, "ok": !is_error}),
+            ));
             results.push(ToolResultMsg {
                 call_id: call.id,
                 content,
@@ -286,7 +290,10 @@ mod tests {
         let mut r = ToolDef::new("browser::snapshot", "", json!({}));
         r.kind = Some("repeatable".into());
         r.budgeted = Some(false);
-        assert_eq!(r.provider_description(), "[kind: repeatable; read-only, safe to repeat; not budgeted]");
+        assert_eq!(
+            r.provider_description(),
+            "[kind: repeatable; read-only, safe to repeat; not budgeted]"
+        );
     }
 
     #[test]
@@ -314,7 +321,11 @@ mod tests {
                         stop: StopKind::ToolUse,
                     })
                 } else {
-                    Ok(TurnResult { parts: vec![Part::Text("done".into())], raw: Value::Null, stop: StopKind::EndTurn })
+                    Ok(TurnResult {
+                        parts: vec![Part::Text("done".into())],
+                        raw: Value::Null,
+                        stop: StopKind::EndTurn,
+                    })
                 }
             }
         }
@@ -330,11 +341,24 @@ mod tests {
         let mut click = ToolDef::new("browser::click", "Click.", json!({}));
         click.kind = Some("emitting".into());
         click.budgeted = Some(true);
-        let mut session = Session { system: String::new(), messages: Vec::new() };
+        let mut session = Session {
+            system: String::new(),
+            messages: Vec::new(),
+        };
         let events = std::cell::RefCell::new(Vec::new());
         let emit = |v: Value| events.borrow_mut().push(v);
         let invoke = |_: &str, _: Value| Ok(json!({"clicked": true}));
-        let out = run_send(&Scripted, &NoNet, &mut session, &[click], "go".into(), 4, &emit, &invoke).unwrap();
+        let out = run_send(
+            &Scripted,
+            &NoNet,
+            &mut session,
+            &[click],
+            "go".into(),
+            4,
+            &emit,
+            &invoke,
+        )
+        .unwrap();
         assert_eq!(out, "done");
         let evs = events.borrow();
         let call = evs.iter().find(|e| e["kind"] == "tool_call").unwrap();

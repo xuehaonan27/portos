@@ -58,14 +58,21 @@ fn n_max_is_enforced_through_the_fire_component_even_for_zero_budget_plans() {
     }
     assert_eq!(s.fire("zero", &Run::ok(&[], 0), 3), Err(Reject::NMax));
     assert_eq!(s.fired_count("zero"), 3);
-    assert!(s.audit.iter().any(|a| matches!(a, Audit::Rejected { id, why: Reject::NMax } if id == "zero")));
+    assert!(
+        s.audit
+            .iter()
+            .any(|a| matches!(a, Audit::Rejected { id, why: Reject::NMax } if id == "zero"))
+    );
     assert_eq!(s.total_spent("zero", FIRE_CLASS), 3);
     assert!(s.invariants().is_ok(), "{:?}", s.invariants());
 
     s.attach(manual("spider", &[(NAV, 21)], 2), 10).unwrap();
     assert_eq!(s.fire("spider", &Run::ok(&[(NAV, 3)], 0), 10), Ok(1));
     assert_eq!(s.fire("spider", &Run::ok(&[(NAV, 21)], 0), 11), Ok(2));
-    assert_eq!(s.fire("spider", &Run::ok(&[(NAV, 1)], 0), 12), Err(Reject::NMax));
+    assert_eq!(
+        s.fire("spider", &Run::ok(&[(NAV, 1)], 0), 12),
+        Err(Reject::NMax)
+    );
     // 类分量与 fire 分量同时耗尽：B_total = scale(n_max, B_firing)。
     assert_eq!(s.total_spent("spider", NAV), 42);
     assert!(s.invariants().is_ok(), "{:?}", s.invariants());
@@ -80,7 +87,11 @@ fn seq_is_read_from_rows_and_nonces_are_unique_and_stable_across_restart() {
     s.fire("a", &Run::ok(&[(NAV, 1)], 0), 1).unwrap();
     s.crash();
     s.recover(2);
-    assert_eq!(s.next_seq("a"), 3, "seq is the number of live fire rows + 1, not a memory counter");
+    assert_eq!(
+        s.next_seq("a"),
+        3,
+        "seq is the number of live fire rows + 1, not a memory counter"
+    );
     assert_eq!(s.fire("a", &Run::ok(&[], 0), 3), Ok(3));
     let nonces = s.nonces("a");
     let distinct: std::collections::BTreeSet<_> = nonces.iter().collect();
@@ -101,12 +112,23 @@ fn seq_is_read_from_rows_and_nonces_are_unique_and_stable_across_restart() {
 fn fragment_without_pool_after_crash_is_a_fired_but_empty_run() {
     let mut s = Scheduler::new(false);
     s.attach(manual("a", &[(NAV, 2)], 2), 0).unwrap();
-    assert_eq!(s.fire("a", &Run::crash(Crash::BetweenRows), 0), Err(Reject::Crashed));
+    assert_eq!(
+        s.fire("a", &Run::crash(Crash::BetweenRows), 0),
+        Err(Reject::Crashed)
+    );
     s.recover(1);
-    assert!(s.audit.iter().any(|a| matches!(a, Audit::RecoveredEmpty { id, seq: 1 } if id == "a")));
+    assert!(
+        s.audit
+            .iter()
+            .any(|a| matches!(a, Audit::RecoveredEmpty { id, seq: 1 } if id == "a"))
+    );
     let f = &s.attachments["a"].firings[0];
     assert_eq!((f.seq, f.end), (1, Some(End::CompletedEmpty)));
-    assert_eq!(s.fired_count("a"), 1, "the empty run occupies n_max (宁紧勿漏)");
+    assert_eq!(
+        s.fired_count("a"),
+        1,
+        "the empty run occupies n_max (宁紧勿漏)"
+    );
     assert_eq!(s.fire("a", &Run::ok(&[], 0), 2), Ok(2));
     assert_ne!(s.nonces("a")[0], s.nonces("a")[1]);
     assert_eq!(s.fire("a", &Run::ok(&[], 0), 3), Err(Reject::NMax));
@@ -114,11 +136,22 @@ fn fragment_without_pool_after_crash_is_a_fired_but_empty_run() {
 
     let mut t = Scheduler::new(true);
     t.attach(manual("a", &[(NAV, 2)], 2), 0).unwrap();
-    assert_eq!(t.fire("a", &Run::crash(Crash::BetweenRows), 0), Err(Reject::Crashed));
+    assert_eq!(
+        t.fire("a", &Run::crash(Crash::BetweenRows), 0),
+        Err(Reject::Crashed)
+    );
     t.recover(1);
-    assert!(!t.audit.iter().any(|a| matches!(a, Audit::RecoveredEmpty { .. })));
+    assert!(
+        !t.audit
+            .iter()
+            .any(|a| matches!(a, Audit::RecoveredEmpty { .. }))
+    );
     assert_eq!(t.fired_count("a"), 0);
-    assert_eq!(t.next_seq("a"), 1, "a transaction leaves only two states: nothing, or both rows");
+    assert_eq!(
+        t.next_seq("a"),
+        1,
+        "a transaction leaves only two states: nothing, or both rows"
+    );
     assert!(t.invariants().is_ok(), "{:?}", t.invariants());
 }
 
@@ -201,7 +234,11 @@ fn outstanding_recomputed_from_live_fragments_equals_cache_after_any_sequence() 
         let total = OPS.len().pow(depth as u32);
         for code in 0..total {
             let mut s = Scheduler::new(transactional);
-            s.attach(decl("a", Trigger::Topic { topic: "t".into() }, &[(NAV, 3)], 3), 0).unwrap();
+            s.attach(
+                decl("a", Trigger::Topic { topic: "t".into() }, &[(NAV, 3)], 3),
+                0,
+            )
+            .unwrap();
             let mut now = 0u64;
             let mut c = code;
             let mut trace = Vec::new();
@@ -247,7 +284,10 @@ fn settlement_is_one_path_for_every_terminal_state() {
                 s.fire("a", &Run::ok(&[(NAV, 3)], 1), 1).unwrap();
             }
             End::Crashed => {
-                assert_eq!(s.fire("a", &Run::crash(Crash::AfterRows), 1), Err(Reject::Crashed));
+                assert_eq!(
+                    s.fire("a", &Run::crash(Crash::AfterRows), 1),
+                    Err(Reject::Crashed)
+                );
                 s.recover(2);
             }
             End::Expired => {
@@ -263,19 +303,40 @@ fn settlement_is_one_path_for_every_terminal_state() {
         let f = &s.attachments["a"].firings[0];
         assert_eq!(f.end, Some(expect), "{name}");
         assert!(s.inflight_seq("a").is_none(), "{name}");
-        assert!(!s.ledger.active().any(|h| h.subject.as_str() == "attach/a:seg#1"), "{name}: segment rows gone");
-        assert!(s.firing_pool_closed("a", 1, NAV), "{name}: firing pool capacity is 0");
-        assert!(s.firing_pool_refuses("a", 1, NAV), "{name}: closed pool refuses minting");
+        assert!(
+            !s.ledger
+                .active()
+                .any(|h| h.subject.as_str() == "attach/a:seg#1"),
+            "{name}: segment rows gone"
+        );
+        assert!(
+            s.firing_pool_closed("a", 1, NAV),
+            "{name}: firing pool capacity is 0"
+        );
+        assert!(
+            s.firing_pool_refuses("a", 1, NAV),
+            "{name}: closed pool refuses minting"
+        );
         if s.status("a").is_terminal() {
             // 整体退役（规则 4）：②随①落墓碑——行仍在，只是不再存活。
             assert!(
-                s.ledger.holdings().iter().any(|h| h.subject.as_str() == "attach/a:spent" && h.generation.as_str() == "seq:1" && h.released_at().is_some()),
+                s.ledger
+                    .holdings()
+                    .iter()
+                    .any(|h| h.subject.as_str() == "attach/a:spent"
+                        && h.generation.as_str() == "seq:1"
+                        && h.released_at().is_some()),
                 "{name}: the spend row is retained as a tombstone"
             );
         } else {
             assert_eq!(s.fired_count("a"), 1, "{name}: the spend row stays live");
         }
-        assert!(s.audit.iter().any(|a| matches!(a, Audit::Settled { seq: 1, end, .. } if *end == expect)), "{name}");
+        assert!(
+            s.audit
+                .iter()
+                .any(|a| matches!(a, Audit::Settled { seq: 1, end, .. } if *end == expect)),
+            "{name}"
+        );
         assert!(s.invariants().is_ok(), "{name}: {:?}", s.invariants());
     }
 }
@@ -284,7 +345,11 @@ fn settlement_is_one_path_for_every_terminal_state() {
 #[test]
 fn unused_balance_is_never_refunded_and_rejected_firings_mint_nothing() {
     let mut s = Scheduler::new(true);
-    s.attach(decl("a", Trigger::Topic { topic: "t".into() }, &[(NAV, 21)], 3), 0).unwrap();
+    s.attach(
+        decl("a", Trigger::Topic { topic: "t".into() }, &[(NAV, 21)], 3),
+        0,
+    )
+    .unwrap();
     s.event("t", true, 1);
     s.fire("a", &Run::ok(&[(NAV, 3)], 0), 1).unwrap();
     assert_eq!(s.total_spent("a", NAV), 21);
@@ -292,7 +357,11 @@ fn unused_balance_is_never_refunded_and_rejected_firings_mint_nothing() {
     let rows_before = s.ledger.holdings().len();
     s.event("t", false, 2);
     assert_eq!(s.fire("a", &Run::ok(&[], 0), 2), Err(Reject::Precondition));
-    assert_eq!(s.ledger.holdings().len(), rows_before, "a rejected firing mints nothing");
+    assert_eq!(
+        s.ledger.holdings().len(),
+        rows_before,
+        "a rejected firing mints nothing"
+    );
     assert_eq!(s.next_seq("a"), 2);
     assert_eq!(s.attachments["a"].consecutive_failures, 0);
     assert!(s.invariants().is_ok());
@@ -309,14 +378,34 @@ fn withdrawal_is_bounded_to_this_firings_unconsumed_events() {
     s.begin("a", 2).unwrap(); // a#2 in flight
     let e3 = s.emit("a").unwrap();
     let e4 = s.emit("a").unwrap();
-    assert!(s.consume(e3), "a fast reader consumed one event before the run failed");
+    assert!(
+        s.consume(e3),
+        "a fast reader consumed one event before the run failed"
+    );
     s.finish("a", &Run::fail(&[], 0), 3).unwrap();
     let ids: Vec<u64> = s.inbox.iter().map(|e| e.id).collect();
-    assert!(ids.contains(&1) && ids.contains(&2), "other firings and other attachments untouched");
-    assert!(ids.contains(&e3), "consumed events cannot be withdrawn — a person cannot be un-notified");
-    assert!(!ids.contains(&e4), "this firing's unconsumed event is withdrawn");
-    assert!(s.audit.iter().any(|a| matches!(a, Audit::Withdrawn { id, seq: 2, events: 1 } if id == "a")));
-    assert!(s.audit.iter().any(|a| matches!(a, Audit::Settled { id, seq: 2, end: End::FailStop } if id == "a")));
+    assert!(
+        ids.contains(&1) && ids.contains(&2),
+        "other firings and other attachments untouched"
+    );
+    assert!(
+        ids.contains(&e3),
+        "consumed events cannot be withdrawn — a person cannot be un-notified"
+    );
+    assert!(
+        !ids.contains(&e4),
+        "this firing's unconsumed event is withdrawn"
+    );
+    assert!(
+        s.audit
+            .iter()
+            .any(|a| matches!(a, Audit::Withdrawn { id, seq: 2, events: 1 } if id == "a"))
+    );
+    assert!(
+        s.audit
+            .iter()
+            .any(|a| matches!(a, Audit::Settled { id, seq: 2, end: End::FailStop } if id == "a"))
+    );
     assert!(s.invariants().is_ok());
 }
 
@@ -328,14 +417,22 @@ fn pump_failed_always_arrives_normal_path_emits_survive_later_failures() {
     s.fire("ci", &Run::ok(&[], 1), 1).unwrap(); // r.status ≠ 0 是正常路径：摘要照常投递
     s.fire("ci", &Run::fail(&[], 1), 2).unwrap(); // 一次真正的触发失败
     let seqs: Vec<u64> = s.inbox.iter().map(|e| e.seq).collect();
-    assert_eq!(seqs, vec![1], "the summary from the completed run stays; the failed run's event is withdrawn");
+    assert_eq!(
+        seqs,
+        vec![1],
+        "the summary from the completed run stays; the failed run's event is withdrawn"
+    );
 }
 
 /// [A4] 有界队列：每次丢弃都入审计（DropOldest／DropNewest／FailStop→Paused）；Timer 停机后只追赶一次、记 missed。
 #[test]
 fn queue_overflow_never_drops_silently_and_timer_catches_up_once_with_missed() {
     let mut s = Scheduler::new(true);
-    s.attach(decl("old", Trigger::Topic { topic: "t".into() }, &[], 10), 0).unwrap();
+    s.attach(
+        decl("old", Trigger::Topic { topic: "t".into() }, &[], 10),
+        0,
+    )
+    .unwrap();
     let mut newest = decl("new", Trigger::Topic { topic: "t".into() }, &[], 10);
     newest.overflow = Overflow::DropNewest;
     s.attach(newest, 0).unwrap();
@@ -359,14 +456,19 @@ fn queue_overflow_never_drops_silently_and_timer_catches_up_once_with_missed() {
     assert!(dropped(&s, "stop") >= 1);
 
     let mut t = Scheduler::new(true);
-    t.attach(decl("timer", Trigger::Timer { period: 10 }, &[], 100), 0).unwrap();
+    t.attach(decl("timer", Trigger::Timer { period: 10 }, &[], 100), 0)
+        .unwrap();
     t.tick(10);
     assert_eq!(t.queue_len("timer"), 1);
     t.fire("timer", &Run::ok(&[], 0), 10).unwrap();
     t.crash();
     t.recover(55);
     assert_eq!(t.queue_len("timer"), 1, "catch up once");
-    assert!(t.audit.iter().any(|a| matches!(a, Audit::Coalesced { id, missed: 3 } if id == "timer")));
+    assert!(
+        t.audit
+            .iter()
+            .any(|a| matches!(a, Audit::Coalesced { id, missed: 3 } if id == "timer"))
+    );
     assert!(t.invariants().is_ok());
 }
 
@@ -385,7 +487,10 @@ fn failure_budget_pauses_after_k_consecutive_failstops_and_resets_on_success() {
     assert_eq!(s.status("a"), Status::Active, "a success reset the count");
     s.fire("a", &fail, 6).unwrap();
     assert_eq!(s.status("a"), Status::PausedFailure);
-    assert_eq!(s.fire("a", &ok, 7), Err(Reject::NotActive(Status::PausedFailure)));
+    assert_eq!(
+        s.fire("a", &ok, 7),
+        Err(Reject::NotActive(Status::PausedFailure))
+    );
     assert!(s.resume("a"));
     assert_eq!(s.fire("a", &ok, 8), Ok(7));
     assert!(s.invariants().is_ok());
@@ -414,11 +519,22 @@ fn detach_expiry_and_revocation_end_in_the_same_ledger_shape() {
     t.tick(100);
     assert_eq!(t.status("x"), Status::Expired);
     for (sch, id) in [(&s, "d"), (&s, "e"), (&s, "r"), (&t, "x")] {
-        assert!(!sch.ledger.active().any(|h| h.subject.as_str().starts_with(&format!("attach/{id}"))), "{id}: no live rows");
+        assert!(
+            !sch.ledger
+                .active()
+                .any(|h| h.subject.as_str().starts_with(&format!("attach/{id}"))),
+            "{id}: no live rows"
+        );
         assert!(sch.invariants().is_ok(), "{id}: {:?}", sch.invariants());
-        assert_eq!(sch.inbox.iter().filter(|e| e.attach == id).count(), 1, "{id}: delivered event stays");
+        assert_eq!(
+            sch.inbox.iter().filter(|e| e.attach == id).count(),
+            1,
+            "{id}: delivered event stays"
+        );
     }
-    assert!(s.audit.iter().any(|a| matches!(a, Audit::Detached { id, why } if id == "e" && why == "revoked:grant_5b")));
+    assert!(s.audit.iter().any(
+        |a| matches!(a, Audit::Detached { id, why } if id == "e" && why == "revoked:grant_5b")
+    ));
 }
 
 /// [LEASE]+裁定三：触发段租约为 None、随根走；ttl_i ≤ 根租约剩余 ⇒ sweeper 不因在途触发等待，
@@ -431,15 +547,33 @@ fn firing_segments_carry_no_lease_so_expiry_never_waits_on_a_run_in_flight() {
     d.run_cap = 10;
     s.attach(d, 0).unwrap();
     let seq = s.begin("a", 9).unwrap();
-    assert_eq!(s.quad("a").unwrap().ttl_expires_at, 10, "ttl_i = min(now + run_cap, lease end)");
-    let seg = s.ledger.active().find(|h| h.subject.as_str() == "attach/a:seg#1").unwrap();
-    assert!(seg.lease.expires_at().map(|t| t.get()).is_none(), "segment rows carry no lease of their own");
+    assert_eq!(
+        s.quad("a").unwrap().ttl_expires_at,
+        10,
+        "ttl_i = min(now + run_cap, lease end)"
+    );
+    let seg = s
+        .ledger
+        .active()
+        .find(|h| h.subject.as_str() == "attach/a:seg#1")
+        .unwrap();
+    assert!(
+        seg.lease.expires_at().map(|t| t.get()).is_none(),
+        "segment rows carry no lease of their own"
+    );
     s.emit("a").unwrap();
     s.tick(10);
-    assert_eq!(s.status("a"), Status::Expired, "the sweep did not wait on the run in flight");
+    assert_eq!(
+        s.status("a"),
+        Status::Expired,
+        "the sweep did not wait on the run in flight"
+    );
     assert_eq!(s.attachments["a"].firings[0].end, Some(End::Expired));
     assert_eq!(seq, 1);
-    assert!(s.unconsumed_events("a").is_empty(), "the aborted run's event was withdrawn");
+    assert!(
+        s.unconsumed_events("a").is_empty(),
+        "the aborted run's event was withdrawn"
+    );
     assert!(s.invariants().is_ok(), "{:?}", s.invariants());
 }
 
@@ -453,9 +587,15 @@ fn table_change_reruns_admission_paused_until_resign_or_detached() {
     s.table_change("blake3:new", &|d: &Declaration| d.id != "bad", 1);
     assert_eq!(s.status("good"), Status::PausedTableChanged);
     assert_eq!(s.status("bad"), Status::Detached);
-    assert_eq!(s.fire("good", &Run::ok(&[], 0), 2), Err(Reject::NotActive(Status::PausedTableChanged)));
+    assert_eq!(
+        s.fire("good", &Run::ok(&[], 0), 2),
+        Err(Reject::NotActive(Status::PausedTableChanged))
+    );
     assert!(s.resign("good", "blake3:new"));
-    assert_ne!(s.attachments["good"].h_attach, before, "h_table is in the signed bytes");
+    assert_ne!(
+        s.attachments["good"].h_attach, before,
+        "h_table is in the signed bytes"
+    );
     assert_eq!(s.fire("good", &Run::ok(&[], 0), 3), Ok(1));
     assert!(s.invariants().is_ok());
 }
@@ -470,18 +610,26 @@ fn per_attachment_serial_and_min_interval_hold() {
     s.attach(manual("b", &[], 5), 0).unwrap();
     s.begin("a", 1).unwrap();
     assert_eq!(s.begin("a", 1), Err(Reject::Serial));
-    assert_eq!(s.fire("b", &Run::ok(&[], 0), 1), Ok(1), "another attachment runs concurrently");
+    assert_eq!(
+        s.fire("b", &Run::ok(&[], 0), 1),
+        Ok(1),
+        "another attachment runs concurrently"
+    );
     s.finish("a", &Run::ok(&[], 0), 2).unwrap();
     assert_eq!(s.fire("a", &Run::ok(&[], 0), 3), Err(Reject::MinInterval));
     assert_eq!(s.fire("a", &Run::ok(&[], 0), 6), Ok(2));
     assert!(s.invariants().is_ok());
 }
 
-
 #[test]
 fn names_with_separators_cannot_alias_budgets_or_cleanup_scopes() {
     let mut s = Scheduler::new(true);
-    let cases = [("a", "branch/charge"), ("a/branch", "charge"), ("a#1", NAV), ("a:seg#1", NAV)];
+    let cases = [
+        ("a", "branch/charge"),
+        ("a/branch", "charge"),
+        ("a#1", NAV),
+        ("a:seg#1", NAV),
+    ];
     for (id, class) in cases {
         s.attach(manual(id, &[(class, 2)], 3), 0).unwrap();
         s.begin(id, 1).unwrap();
@@ -493,7 +641,13 @@ fn names_with_separators_cannot_alias_budgets_or_cleanup_scopes() {
         assert_eq!(s.inflight_seq(id), Some(1));
         assert_eq!(s.total_spent(id, class), 2);
         assert!(!s.firing_pool_closed(id, 1, class));
-        assert!(s.ledger.holding(s.attachments[*id].root.id()).unwrap().state.is_active());
+        assert!(
+            s.ledger
+                .holding(s.attachments[*id].root.id())
+                .unwrap()
+                .state
+                .is_active()
+        );
     }
     s.invariants().unwrap();
     s.crash();

@@ -1,15 +1,15 @@
 //! F6 法则测试（怪物志）—— 两个走查条目真的驱动 F1–F5 五套冻结机制跑通：
 //! Workspace（microVM/容器）与 RDMA。每条测试名＝它证明的"落位"或"扩充承重"。
 
-use portos_rm::identity::VerbId;
-use portos_rm::test_support::bestiary::*;
 use portos_rm::coeffect::*;
+use portos_rm::identity::VerbId;
 use portos_rm::identity::{ClassId, Generation, HoldingId, InstanceId, ResourceKey, SubjectId};
 use portos_rm::ledger::GrantRequest;
 use portos_rm::ledger::*;
-use portos_rm::test_support::monitor::*;
 use portos_rm::ra::{Ex, Frac, Ranges};
 use portos_rm::registry::Claim;
+use portos_rm::test_support::bestiary::*;
+use portos_rm::test_support::monitor::*;
 use portos_rm::test_support::teardown::{Orchestrator, RunOutcome};
 use portos_rm::time::{LeaseRequest, Timestamp};
 use portos_rm::verbs::*;
@@ -42,7 +42,10 @@ fn workspace_entry_passes_all_frozen_gates() {
         "变换进预算（fuel）、不扣发"
     );
     assert!(!hp.budget().contains("read_file"), "可重复读零预算");
-    let ns = e.table.lookup(&ClassId::new("vm"), &VerbId::new("net_send")).unwrap();
+    let ns = e
+        .table
+        .lookup(&ClassId::new("vm"), &VerbId::new("net_send"))
+        .unwrap();
     assert!(
         ns.staged_shape() && !ns.withhold(),
         "出网：两阶段由准入满足，可摊销不扣发"
@@ -299,7 +302,11 @@ fn rdma_entry_passes_all_frozen_gates_with_interval_and_frac() {
         "RDMA WRITE 可摊销"
     );
     assert!(matches!(
-        e.table.lookup(&ClassId::new("cq"), &VerbId::new("poll_cq")).unwrap().kind().clone(),
+        e.table
+            .lookup(&ClassId::new("cq"), &VerbId::new("poll_cq"))
+            .unwrap()
+            .kind()
+            .clone(),
         Kind::Consuming {
             world: ConsumeGrade::External
         }

@@ -176,12 +176,18 @@ fn injects_secret_and_sanitizes_response() {
 
     assert_eq!(out["status"].as_u64(), Some(200));
     let wire = out["body"].as_str().unwrap();
-    assert!(wire.contains("x-test-key: sekrit-value-123"), "secret injected");
+    assert!(
+        wire.contains("x-test-key: sekrit-value-123"),
+        "secret injected"
+    );
     assert!(
         !wire.contains("attacker-value"),
         "caller cannot override an injected header"
     );
-    assert!(wire.contains("x-custom: ok"), "ordinary caller headers pass");
+    assert!(
+        wire.contains("x-custom: ok"),
+        "ordinary caller headers pass"
+    );
     assert!(wire.ends_with("hello upstream"), "body forwarded");
     assert!(
         out["headers"].get("set-cookie").is_none(),
@@ -284,9 +290,10 @@ fn secret_stays_out_of_responses_and_audit() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let entry = loop {
         let entries = portos_kernel::audit::AuditLog::verify(&audit_path).unwrap();
-        if let Some(e) = entries.iter().find(|e| {
-            e["body"]["event"] == "topic.audit" && e["body"]["topic"] == "egress::log"
-        }) {
+        if let Some(e) = entries
+            .iter()
+            .find(|e| e["body"]["event"] == "topic.audit" && e["body"]["topic"] == "egress::log")
+        {
             break e.clone();
         }
         assert!(
@@ -296,7 +303,10 @@ fn secret_stays_out_of_responses_and_audit() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
     assert_eq!(entry["body"]["data"]["host"].as_str(), Some("127.0.0.1"));
-    assert_eq!(entry["body"]["data"]["injected"][0].as_str(), Some("x-api-key"));
+    assert_eq!(
+        entry["body"]["data"]["injected"][0].as_str(),
+        Some("x-api-key")
+    );
     let audit_text = std::fs::read_to_string(&audit_path).unwrap();
     assert!(
         !audit_text.contains("sekrit"),
@@ -316,7 +326,10 @@ fn secret_stays_out_of_responses_and_audit() {
 fn plugin_invoke_reaches_broker_capability_gated() {
     let echo_bin = Path::new(BROKER_BIN).with_file_name("portos-echo");
     if !echo_bin.exists() {
-        eprintln!("skipping: portos-echo binary not built ({})", echo_bin.display());
+        eprintln!(
+            "skipping: portos-echo binary not built ({})",
+            echo_bin.display()
+        );
         return;
     }
     let (kernel, host, root) = setup("invoke");

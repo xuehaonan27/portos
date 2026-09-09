@@ -20,9 +20,9 @@
 
 mod chat;
 
+use portos_kernel::Kernel;
 use portos_kernel::consent::{ConsentRecord, render_budget};
 use portos_kernel::host::Host;
-use portos_kernel::Kernel;
 use portos_proto::Label;
 use serde_json::json;
 use std::io::Write;
@@ -47,7 +47,10 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "put" => {
             let root = need(args, 2, "root")?;
             let file = need(args, 3, "file")?;
-            let ty = args.get(4).cloned().unwrap_or_else(|| "application/octet-stream".into());
+            let ty = args
+                .get(4)
+                .cloned()
+                .unwrap_or_else(|| "application/octet-stream".into());
             let k = Kernel::open(std::path::Path::new(&root))?;
             let f = std::fs::File::open(&file)?;
             let meta = k.cas.put_stream(f, &ty, Label::public_trusted(), "cli")?;
@@ -128,7 +131,8 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 chat::spawn_chat_plugins(&host, &root_path, &cfg)?;
             }
             let bytes = std::fs::read(&plan_path)?;
-            let rec: ConsentRecord = serde_json::from_str(&std::fs::read_to_string(&consent_path)?)?;
+            let rec: ConsentRecord =
+                serde_json::from_str(&std::fs::read_to_string(&consent_path)?)?;
             let signer = portos_signer::Signer::load(&root_path)?;
             let plan_hash = portos_proto::artifact::id_for_bytes(&bytes);
             // Prefer the run `consent` already admitted for this plan.
@@ -146,7 +150,10 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     Err(_) => break,
                 };
                 let kind = ev["data"]["kind"].as_str().unwrap_or("").to_string();
-                println!("[run] {}", serde_json::to_string(&ev["data"]).unwrap_or_default());
+                println!(
+                    "[run] {}",
+                    serde_json::to_string(&ev["data"]).unwrap_or_default()
+                );
                 match kind.as_str() {
                     "finished" => break,
                     "awaiting_approval" => {
@@ -173,12 +180,16 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                             }
                             // keep watching for finished
                         } else {
-                            println!("[run] left awaiting approval; it will be aborted at consent expiry");
+                            println!(
+                                "[run] left awaiting approval; it will be aborted at consent expiry"
+                            );
                             break;
                         }
                     }
                     "paused" => {
-                        print!("Plan paused (escalate). Grant another batch with the same budget? [y/N] ");
+                        print!(
+                            "Plan paused (escalate). Grant another batch with the same budget? [y/N] "
+                        );
                         std::io::stdout().flush()?;
                         let mut line = String::new();
                         stdin.read_line(&mut line)?;
@@ -266,5 +277,7 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn need(args: &[String], i: usize, what: &str) -> Result<String, String> {
-    args.get(i).cloned().ok_or_else(|| format!("missing arg: {what}"))
+    args.get(i)
+        .cloned()
+        .ok_or_else(|| format!("missing arg: {what}"))
 }

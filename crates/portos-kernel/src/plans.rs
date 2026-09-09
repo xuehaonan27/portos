@@ -30,14 +30,14 @@
 //! Recovery aborts running/paused interpreters; awaiting-approval buffers
 //! survive for approval from a later process. F3's in-memory buffer does not.
 
-use portos_rm::identity::SubjectId;
-use portos_rm::time::Timestamp;
 use crate::consent::{ConsentRecord, render_budget};
 use crate::host::{HostInner, HostWorld, dispatch_event, invoke_as, kernel_schemas};
 use crate::plancheck::{self, VerbSchemas};
 use crate::{Kernel, KernelError};
 use portos_proto::cap::Constraints;
 use portos_proto::{CmpOp, Expr, Guard, Label, Mode, Plan, Stmt, artifact::id_for_bytes};
+use portos_rm::identity::SubjectId;
+use portos_rm::time::Timestamp;
 use rusqlite::params;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -147,8 +147,13 @@ impl PlanService {
 
     fn segment_of(&self, run_id: &str) -> Result<SubjectId, KernelError> {
         let conn = self.kernel.db.lock().unwrap();
-        conn.query_row("SELECT subject FROM plan_segments WHERE run_id=?1", params![run_id], |r| r.get::<_, String>(0))
-            .map(SubjectId::new).map_err(|e| KernelError::Corrupt(format!("plan segment {run_id}: {e}")))
+        conn.query_row(
+            "SELECT subject FROM plan_segments WHERE run_id=?1",
+            params![run_id],
+            |r| r.get::<_, String>(0),
+        )
+        .map(SubjectId::new)
+        .map_err(|e| KernelError::Corrupt(format!("plan segment {run_id}: {e}")))
     }
 
     /// Abort every run a previous process left *non-resumable*: the
@@ -175,8 +180,14 @@ impl PlanService {
         for run_id in stale {
             let _ = self.set_buffer_state(&run_id, "held", "aborted");
             let seg = self.segment_of(&run_id).expect("registered plan segment");
-            let mut world = HostWorld { inner: self.inner.clone() };
-            let _ = self.kernel.ledger.teardown(&seg, &mut world, Timestamp::try_from(now).expect("system timestamp in range"));
+            let mut world = HostWorld {
+                inner: self.inner.clone(),
+            };
+            let _ = self.kernel.ledger.teardown(
+                &seg,
+                &mut world,
+                Timestamp::try_from(now).expect("system timestamp in range"),
+            );
             self.finish_row(&run_id, &Outcome::Aborted { expired: false });
             let _ = self.kernel.audit.lock().unwrap().append(json!({
                 "event": "plan.aborted", "run": run_id, "crashed": true,
@@ -201,8 +212,11 @@ impl PlanService {
         if subject != "user" {
             let demand = verb_demand(&plan);
             let grants = live_grant_verbs(&self.kernel, subject)?;
-            let missing: Vec<String> =
-                demand.iter().filter(|v| !grants.contains(*v)).cloned().collect();
+            let missing: Vec<String> = demand
+                .iter()
+                .filter(|v| !grants.contains(*v))
+                .cloned()
+                .collect();
             if !missing.is_empty() {
                 let _ = self.kernel.audit.lock().unwrap().append(json!({
                     "event": "plan.submit_denied", "from": subject,
@@ -226,7 +240,10 @@ impl PlanService {
                  VALUES (?1, ?2, ?3, '', 'admitted', ?4)",
                 params![run_id, plan_hash, fiber, crate::db::now_unix() as i64],
             )?;
-            tx.execute("INSERT INTO plan_segments (run_id, subject) VALUES (?1, ?2)", params![run_id, format!("{fiber}:seg")])?;
+            tx.execute(
+                "INSERT INTO plan_segments (run_id, subject) VALUES (?1, ?2)",
+                params![run_id, format!("{fiber}:seg")],
+            )?;
             tx.commit()?;
         }
         self.runs.lock().unwrap().insert(
@@ -280,7 +297,10 @@ impl PlanService {
             params![consent.nonce, json, now as i64, source],
         ) {
             Ok(_) => Ok(()),
-            Err(_) => Err(KernelError::Denied(format!("stale nonce: {}", consent.nonce))),
+            Err(_) => Err(KernelError::Denied(format!(
+                "stale nonce: {}",
+                consent.nonce
+            ))),
         }
     }
 
@@ -309,7 +329,10 @@ impl PlanService {
                 fiber,
                 &format!("driver:{family}"),
                 verbs.into_iter().collect(),
-                Constraints { expires_at: Some(ttl_at), counts },
+                Constraints {
+                    expires_at: Some(ttl_at),
+                    counts,
+                },
                 None,
             )?;
         }
@@ -321,7 +344,11 @@ impl PlanService {
     /// Start an admitted run under a consent: verify the quadruple, mint the
     /// fiber's caps, and spawn the interpreter thread. The run then drives
     /// itself to a stable state (done / awaiting approval / paused).
-    pub fn start(self: &Arc<Self>, run_id: &str, consent: &ConsentRecord) -> Result<(), KernelError> {
+    pub fn start(
+        self: &Arc<Self>,
+        run_id: &str,
+        consent: &ConsentRecord,
+    ) -> Result<(), KernelError> {
         // Hydrate a run admitted by an earlier process (e.g. `portos consent`)
         // from its durable row.
         if !self.runs.lock().unwrap().contains_key(run_id) {
@@ -445,7 +472,10 @@ impl PlanService {
                 &row.subject,
                 &format!("driver:{family}"),
                 verbs.into_iter().collect(),
-                Constraints { expires_at: Some(ttl_at), counts },
+                Constraints {
+                    expires_at: Some(ttl_at),
+                    counts,
+                },
                 None,
             )?;
         }
@@ -456,7 +486,13 @@ impl PlanService {
         let mut released = 0usize;
         let mut failure: Option<String> = None;
         for item in &batch {
-            match invoke_as(&self.kernel, &self.inner, &row.subject, &item.verb, item.args.clone()) {
+            match invoke_as(
+                &self.kernel,
+                &self.inner,
+                &row.subject,
+                &item.verb,
+                item.args.clone(),
+            ) {
                 Ok(_) => {
                     seq += 1;
                     self.log_emission(run_id, seq, &item.verb, &item.target, &consent.nonce)?;
@@ -479,10 +515,18 @@ impl PlanService {
             }));
             let _ = self.set_buffer_state(run_id, "held", "aborted");
             let seg = self.segment_of(run_id)?;
-            let mut world = HostWorld { inner: self.inner.clone() };
-            let _ = self.kernel.ledger.teardown(&seg, &mut world, Timestamp::try_from(crate::db::now_unix()).expect("system timestamp in range"));
+            let mut world = HostWorld {
+                inner: self.inner.clone(),
+            };
+            let _ = self.kernel.ledger.teardown(
+                &seg,
+                &mut world,
+                Timestamp::try_from(crate::db::now_unix()).expect("system timestamp in range"),
+            );
             self.finish_run(run_id, &Outcome::FailStop { at: why.clone() }, 0);
-            return Err(KernelError::Denied(format!("approve release failed: {why}")));
+            return Err(KernelError::Denied(format!(
+                "approve release failed: {why}"
+            )));
         }
         self.set_buffer_state(run_id, "held", "inserted")?;
         let _ = self.kernel.audit.lock().unwrap().append(json!({
@@ -492,7 +536,10 @@ impl PlanService {
         self.emit(run_id, json!({"kind": "approved", "released": batch.len()}));
         // [SEG-TX] approval = commit.
         let seg = self.segment_of(run_id)?;
-        let moved = self.kernel.ledger.transfer_all(&seg, &SubjectId::new(&row.subject))?;
+        let moved = self
+            .kernel
+            .ledger
+            .transfer_all(&seg, &SubjectId::new(&row.subject))?;
         self.finish_run(run_id, &Outcome::Completed, moved);
         Ok(())
     }
@@ -567,8 +614,14 @@ impl PlanService {
         let now = crate::db::now_unix();
         let _ = self.set_buffer_state(run_id, "held", "aborted");
         let seg = self.segment_of(run_id).expect("registered plan segment");
-        let mut world = HostWorld { inner: self.inner.clone() };
-        let _ = self.kernel.ledger.teardown(&seg, &mut world, Timestamp::try_from(now).expect("system timestamp in range"));
+        let mut world = HostWorld {
+            inner: self.inner.clone(),
+        };
+        let _ = self.kernel.ledger.teardown(
+            &seg,
+            &mut world,
+            Timestamp::try_from(now).expect("system timestamp in range"),
+        );
         self.finish_run(run_id, &Outcome::Aborted { expired }, 0);
     }
 
@@ -619,7 +672,11 @@ impl PlanService {
                 if rt.withheld == 0 {
                     // [SEG-TX] walked to the end with nothing withheld = commit.
                     let seg = self.segment_of(run_id).expect("registered plan segment");
-                    let moved = self.kernel.ledger.transfer_all(&seg, &SubjectId::new(&fiber)).unwrap_or(0);
+                    let moved = self
+                        .kernel
+                        .ledger
+                        .transfer_all(&seg, &SubjectId::new(&fiber))
+                        .unwrap_or(0);
                     self.finish_run(run_id, &Outcome::Completed, moved);
                 } else {
                     self.set_state(run_id, RunState::AwaitingApproval);
@@ -637,8 +694,14 @@ impl PlanService {
                 // segment back ([SEG-TX], the monitor does it itself).
                 let _ = self.set_buffer_state(run_id, "held", "aborted");
                 let seg = self.segment_of(run_id).expect("registered plan segment");
-                let mut world = HostWorld { inner: self.inner.clone() };
-                let _ = self.kernel.ledger.teardown(&seg, &mut world, Timestamp::try_from(crate::db::now_unix()).expect("system timestamp in range"));
+                let mut world = HostWorld {
+                    inner: self.inner.clone(),
+                };
+                let _ = self.kernel.ledger.teardown(
+                    &seg,
+                    &mut world,
+                    Timestamp::try_from(crate::db::now_unix()).expect("system timestamp in range"),
+                );
                 self.finish_run(run_id, &outcome, 0);
             }
         }
@@ -692,7 +755,6 @@ impl PlanService {
         );
     }
 
-
     fn plan_bytes(&self, plan_hash: &str) -> Result<Vec<u8>, KernelError> {
         let mut out = Vec::new();
         let mut reader = self.kernel.cas.open_read(&plan_hash.to_string())?;
@@ -702,7 +764,12 @@ impl PlanService {
     }
 
     fn emit(&self, run_id: &str, data: Value) {
-        dispatch_event(&self.kernel, &self.inner, &format!("plan::run::{run_id}"), data);
+        dispatch_event(
+            &self.kernel,
+            &self.inner,
+            &format!("plan::run::{run_id}"),
+            data,
+        );
     }
 
     fn load_run_row(&self, run_id: &str) -> Result<RunRow, KernelError> {
@@ -725,10 +792,14 @@ impl PlanService {
     fn consent_ttl_at(&self, nonce: &str) -> Result<u64, KernelError> {
         let conn = self.kernel.db.lock().unwrap();
         let json: String = conn
-            .query_row("SELECT json FROM consents WHERE nonce = ?1", params![nonce], |r| r.get(0))
+            .query_row(
+                "SELECT json FROM consents WHERE nonce = ?1",
+                params![nonce],
+                |r| r.get(0),
+            )
             .map_err(|_| KernelError::NotFound(format!("consent: {nonce}")))?;
-        let rec: ConsentRecord =
-            serde_json::from_str(&json).map_err(|e| KernelError::Corrupt(format!("consent json: {e}")))?;
+        let rec: ConsentRecord = serde_json::from_str(&json)
+            .map_err(|e| KernelError::Corrupt(format!("consent json: {e}")))?;
         Ok(rec.issued_at + rec.ttl_secs)
     }
 
@@ -790,12 +861,26 @@ impl PlanService {
         Ok(n as u64)
     }
 
-    fn log_emission(&self, run_id: &str, seq: u64, verb: &str, target: &str, nonce: &str) -> Result<(), KernelError> {
+    fn log_emission(
+        &self,
+        run_id: &str,
+        seq: u64,
+        verb: &str,
+        target: &str,
+        nonce: &str,
+    ) -> Result<(), KernelError> {
         let conn = self.kernel.db.lock().unwrap();
         conn.execute(
             "INSERT INTO emission_log (run_id, seq, verb, target, nonce, at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![run_id, seq as i64, verb, target, nonce, crate::db::now_unix() as i64],
+            params![
+                run_id,
+                seq as i64,
+                verb,
+                target,
+                nonce,
+                crate::db::now_unix() as i64
+            ],
         )?;
         Ok(())
     }
@@ -910,15 +995,23 @@ impl Rt<'_> {
                     let vl = self.eval(expr)?;
                     self.env.insert(var.clone(), vl);
                 }
-                Stmt::Effect { verb, args } => {
-                    self.exec_effect(verb, args, pc, stmts.len() - i)?
-                }
-                Stmt::If { guard, then_, else_ } => {
+                Stmt::Effect { verb, args } => self.exec_effect(verb, args, pc, stmts.len() - i)?,
+                Stmt::If {
+                    guard,
+                    then_,
+                    else_,
+                } => {
                     let (b, gl) = self.eval_guard(guard)?;
                     let pc2 = pc.join(&gl);
                     self.exec_stmts(if b { then_ } else { else_ }, &pc2)?;
                 }
-                Stmt::Foreach { var, list, bound, mode, body } => {
+                Stmt::Foreach {
+                    var,
+                    list,
+                    bound,
+                    mode,
+                    body,
+                } => {
                     let (lv, ll) = self.eval(list)?;
                     let items = lv.as_array().cloned().unwrap_or_default();
                     let n = items.len();
@@ -932,12 +1025,19 @@ impl Rt<'_> {
                             }
                             Mode::Truncate => {
                                 let dropped = n - *bound as usize;
-                                self.svc.audit(self.run_id, "plan.truncated", json!({
-                                    "bound": bound, "actual": n, "dropped": dropped,
-                                }));
-                                self.svc.emit(self.run_id, json!({
-                                    "kind": "truncated", "dropped": dropped,
-                                }));
+                                self.svc.audit(
+                                    self.run_id,
+                                    "plan.truncated",
+                                    json!({
+                                        "bound": bound, "actual": n, "dropped": dropped,
+                                    }),
+                                );
+                                self.svc.emit(
+                                    self.run_id,
+                                    json!({
+                                        "kind": "truncated", "dropped": dropped,
+                                    }),
+                                );
                                 take = *bound as usize;
                             }
                             Mode::Escalate => {
@@ -967,7 +1067,13 @@ impl Rt<'_> {
     /// The monitor pipeline per effect: sink re-check → staged → budget →
     /// execute. (Confine has no declared stand-ins today; protocol is
     /// enforced at the serving plugin inside `call_on`.)
-    fn exec_effect(&mut self, verb: &str, args: &[Expr], pc: &Label, remaining: usize) -> Result<(), Halt> {
+    fn exec_effect(
+        &mut self,
+        verb: &str,
+        args: &[Expr],
+        pc: &Label,
+        remaining: usize,
+    ) -> Result<(), Halt> {
         let mut eff_label = pc.clone();
         let mut vals = Vec::with_capacity(args.len());
         for a in args {
@@ -991,7 +1097,9 @@ impl Rt<'_> {
             .copied()
             .unwrap_or(true);
         if external && !eff_label.conf.is_empty() {
-            return Err(Halt::Stop(Outcome::FailStop { at: format!("sink denied: {verb}") }));
+            return Err(Halt::Stop(Outcome::FailStop {
+                at: format!("sink denied: {verb}"),
+            }));
         }
         let target = crate::host::target_of(&self.svc.inner, verb, &args_json);
         // Staged (the hard list: emitting ∧ non-amortizable): withhold fully
@@ -1005,36 +1113,59 @@ impl Rt<'_> {
                 cost: 1,
             };
             if self.svc.push_buffer(self.run_id, &item).is_err() {
-                return Err(Halt::Stop(Outcome::FailStop { at: format!("buffer write failed: {verb}") }));
+                return Err(Halt::Stop(Outcome::FailStop {
+                    at: format!("buffer write failed: {verb}"),
+                }));
             }
             self.withheld += 1;
-            self.svc.audit(self.run_id, "plan.withheld", json!({
-                "verb": verb, "target": target,
-            }));
-            self.svc.emit(self.run_id, json!({
-                "kind": "withheld", "verb": verb, "target": target,
-            }));
+            self.svc.audit(
+                self.run_id,
+                "plan.withheld",
+                json!({
+                    "verb": verb, "target": target,
+                }),
+            );
+            self.svc.emit(
+                self.run_id,
+                json!({
+                    "kind": "withheld", "verb": verb, "target": target,
+                }),
+            );
             return Ok(());
         }
         // Budget gate + execute (capability check against the consent-minted
         // caps; protocol enforced at the serving plugin). Escalate retries
         // the same effect against the fresh pool after each resume.
         loop {
-            match invoke_as(&self.svc.kernel, &self.svc.inner, self.fiber, verb, args_json.clone()) {
+            match invoke_as(
+                &self.svc.kernel,
+                &self.svc.inner,
+                self.fiber,
+                verb,
+                args_json.clone(),
+            ) {
                 Ok(_) => {
                     let seq = self.svc.emission_count(self.run_id).unwrap_or(0) + 1;
-                    let _ = self.svc.log_emission(self.run_id, seq, verb, &target, &self.active_nonce);
-                    self.svc.emit(self.run_id, json!({
-                        "kind": "effect", "verb": verb, "target": target, "ok": true,
-                    }));
+                    let _ =
+                        self.svc
+                            .log_emission(self.run_id, seq, verb, &target, &self.active_nonce);
+                    self.svc.emit(
+                        self.run_id,
+                        json!({
+                            "kind": "effect", "verb": verb, "target": target, "ok": true,
+                        }),
+                    );
                     return Ok(());
                 }
                 Err(e) => {
                     let msg = e.to_string();
-                    self.svc.emit(self.run_id, json!({
-                        "kind": "effect", "verb": verb, "target": target, "ok": false,
-                        "error": msg,
-                    }));
+                    self.svc.emit(
+                        self.run_id,
+                        json!({
+                            "kind": "effect", "verb": verb, "target": target, "ok": false,
+                            "error": msg,
+                        }),
+                    );
                     if msg.contains("budget exhausted") || msg.contains("no capability") {
                         match self.current_mode() {
                             Mode::Strict => {
@@ -1043,12 +1174,19 @@ impl Rt<'_> {
                                 }));
                             }
                             Mode::Truncate => {
-                                self.svc.audit(self.run_id, "plan.truncated", json!({
-                                    "at": verb, "dropped": remaining,
-                                }));
-                                self.svc.emit(self.run_id, json!({
-                                    "kind": "truncated", "at": verb, "dropped": remaining,
-                                }));
+                                self.svc.audit(
+                                    self.run_id,
+                                    "plan.truncated",
+                                    json!({
+                                        "at": verb, "dropped": remaining,
+                                    }),
+                                );
+                                self.svc.emit(
+                                    self.run_id,
+                                    json!({
+                                        "kind": "truncated", "at": verb, "dropped": remaining,
+                                    }),
+                                );
                                 return Err(Halt::Stop(Outcome::Truncated { dropped: remaining }));
                             }
                             Mode::Escalate => {
@@ -1057,7 +1195,9 @@ impl Rt<'_> {
                             }
                         }
                     } else {
-                        return Err(Halt::Stop(Outcome::FailStop { at: format!("{verb}: {msg}") }));
+                        return Err(Halt::Stop(Outcome::FailStop {
+                            at: format!("{verb}: {msg}"),
+                        }));
                     }
                 }
             }
@@ -1102,12 +1242,17 @@ impl Rt<'_> {
                     &fiber,
                     &format!("driver:{family}"),
                     verbs.into_iter().collect(),
-                    Constraints { expires_at: Some(ttl_at), counts },
+                    Constraints {
+                        expires_at: Some(ttl_at),
+                        counts,
+                    },
                     None,
                 )
                 .is_err()
             {
-                return Err(Halt::Stop(Outcome::FailStop { at: "resume pool mint failed".into() }));
+                return Err(Halt::Stop(Outcome::FailStop {
+                    at: "resume pool mint failed".into(),
+                }));
             }
         }
         self.active_nonce = consent.nonce.clone();
@@ -1118,12 +1263,11 @@ impl Rt<'_> {
     fn eval(&mut self, e: &Expr) -> Result<(Value, Label), Halt> {
         match e {
             Expr::Observe { verb, args } => {
-                let base = self
-                    .schemas
-                    .observe
-                    .get(verb)
-                    .cloned()
-                    .ok_or_else(|| Halt::Stop(Outcome::FailStop { at: format!("unknown verb {verb}") }))?;
+                let base = self.schemas.observe.get(verb).cloned().ok_or_else(|| {
+                    Halt::Stop(Outcome::FailStop {
+                        at: format!("unknown verb {verb}"),
+                    })
+                })?;
                 let mut label = base;
                 let mut vals = Vec::new();
                 for a in args {
@@ -1131,11 +1275,25 @@ impl Rt<'_> {
                     label = label.join(&l);
                     vals.push(v);
                 }
-                let args_json = if vals.len() == 1 { vals.remove(0) } else { Value::Array(vals) };
+                let args_json = if vals.len() == 1 {
+                    vals.remove(0)
+                } else {
+                    Value::Array(vals)
+                };
                 // Reads go through the same capability gate (minted uncounted)
                 // and are metered, never budgeted (truth table).
-                let v = invoke_as(&self.svc.kernel, &self.svc.inner, self.fiber, verb, args_json)
-                    .map_err(|e| Halt::Stop(Outcome::FailStop { at: format!("{verb}: {e}") }))?;
+                let v = invoke_as(
+                    &self.svc.kernel,
+                    &self.svc.inner,
+                    self.fiber,
+                    verb,
+                    args_json,
+                )
+                .map_err(|e| {
+                    Halt::Stop(Outcome::FailStop {
+                        at: format!("{verb}: {e}"),
+                    })
+                })?;
                 Ok((v, label))
             }
             Expr::Pure { func, args } => {
@@ -1156,15 +1314,19 @@ impl Rt<'_> {
                     "compute::run",
                     json!({"func": func, "args": vals}),
                 )
-                .map_err(|e| Halt::Stop(Outcome::FailStop { at: format!("pure {func}: {e}") }))?;
+                .map_err(|e| {
+                    Halt::Stop(Outcome::FailStop {
+                        at: format!("pure {func}: {e}"),
+                    })
+                })?;
                 Ok((v, label))
             }
             Expr::Const { value } => Ok((value.clone(), Label::public_trusted())),
-            Expr::Var { name } => self
-                .env
-                .get(name)
-                .cloned()
-                .ok_or_else(|| Halt::Stop(Outcome::FailStop { at: format!("unknown var {name}") })),
+            Expr::Var { name } => self.env.get(name).cloned().ok_or_else(|| {
+                Halt::Stop(Outcome::FailStop {
+                    at: format!("unknown var {name}"),
+                })
+            }),
             Expr::Index { base, idx } => {
                 let (v, l) = self.eval(base)?;
                 let item = v
@@ -1181,12 +1343,18 @@ impl Rt<'_> {
         Ok(match g {
             Guard::Exists { expr } => {
                 let (v, l) = self.eval(expr)?;
-                (v.as_array().map(|a| !a.is_empty()).unwrap_or(!v.is_null()), l)
+                (
+                    v.as_array().map(|a| !a.is_empty()).unwrap_or(!v.is_null()),
+                    l,
+                )
             }
             Guard::Matches { expr, regex } => {
                 let (v, l) = self.eval(expr)?;
-                let re = regex::Regex::new(regex)
-                    .map_err(|e| Halt::Stop(Outcome::FailStop { at: format!("guard regex: {e}") }))?;
+                let re = regex::Regex::new(regex).map_err(|e| {
+                    Halt::Stop(Outcome::FailStop {
+                        at: format!("guard regex: {e}"),
+                    })
+                })?;
                 (v.as_str().map(|s| re.is_match(s)).unwrap_or(false), l)
             }
             Guard::Cmp { lhs, op, rhs } => {
@@ -1236,7 +1404,11 @@ fn verb_demand(plan: &Plan) -> Vec<String> {
         for s in stmts {
             match s {
                 Stmt::Effect { verb, .. } => out.push(verb.clone()),
-                Stmt::If { guard, then_, else_ } => {
+                Stmt::If {
+                    guard,
+                    then_,
+                    else_,
+                } => {
                     of_guard(guard, out);
                     of_stmts(then_, out);
                     of_stmts(else_, out);

@@ -3,8 +3,6 @@
 //! [C1]=行式生命周期记账；[C2]=中央容量检查与 FPU 的区别；
 //! [GEN]=世代化句柄；[CRASH]=crash-only 单路径；[T]=租约/对账。
 
-use portos_rm::test_support::Lcg;
-use portos_rm::test_support::teardown::LedgerDrill;
 use portos_rm::auth::{auth_valid, can_mint, compose};
 use portos_rm::identity::{
     ClassId, Generation, HoldingHandle, HoldingId, InstanceId, ResourceKey, SubjectId,
@@ -13,6 +11,8 @@ use portos_rm::ledger::GrantRequest;
 use portos_rm::ledger::*;
 use portos_rm::ra::*;
 use portos_rm::registry::{Capacity, Claim};
+use portos_rm::test_support::Lcg;
+use portos_rm::test_support::teardown::LedgerDrill;
 use portos_rm::time::{LeaseDuration, LeaseRequest, Timestamp};
 
 fn sample_counts(rng: &mut Lcg, n: usize) -> Vec<Count> {

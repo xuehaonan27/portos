@@ -272,12 +272,17 @@ mod tests {
 
     #[test]
     fn oversized_nested_budget_is_refused_without_arithmetic_overflow() {
-        let effect = Stmt::Effect { verb: "echo::emit".into(), args: vec![] };
+        let effect = Stmt::Effect {
+            verb: "echo::emit".into(),
+            args: vec![],
+        };
         let mut body = vec![effect.clone(), effect];
         for _ in 0..3 {
             body = vec![Stmt::Foreach {
                 var: "x".into(),
-                list: Expr::Const { value: serde_json::json!([]) },
+                list: Expr::Const {
+                    value: serde_json::json!([]),
+                },
                 bound: u32::MAX,
                 mode: Mode::Strict,
                 body,

@@ -24,8 +24,8 @@ use std::{
 };
 
 use portos_proto::{Capability, Constraints};
-use portos_rm::identity::{AccountId, EffectClass, SpendRequest, SubjectId};
 use portos_rm::cleanup::CleanupExecutor;
+use portos_rm::identity::{AccountId, EffectClass, SpendRequest, SubjectId};
 use portos_rm::time::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -476,7 +476,8 @@ mod tests {
                     host: portos_rm::cleanup::HostWitness::new(
                         crate::ledger::capture_process(std::process::id()).unwrap(),
                         "caps-test-host".into(),
-                    ).unwrap(),
+                    )
+                    .unwrap(),
                     subscription: 1,
                 },
                 None,

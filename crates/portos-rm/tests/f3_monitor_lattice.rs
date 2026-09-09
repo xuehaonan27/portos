@@ -68,7 +68,16 @@ enum Arch {
     StagedOff,
 }
 use Arch::*;
-const ARCHS: [Arch; 8] = [Ok, Staged, OffDegOk, OffDegOff, OffNoDeg, Confined, ConfinedStaged, StagedOff];
+const ARCHS: [Arch; 8] = [
+    Ok,
+    Staged,
+    OffDegOk,
+    OffDegOff,
+    OffNoDeg,
+    Confined,
+    ConfinedStaged,
+    StagedOff,
+];
 
 impl Arch {
     /// 原型 → 具体动作。payload 记计划位序号（穷举里恰好一次/顺序断言的锚点）。
@@ -109,7 +118,12 @@ fn policy() -> Policy {
 }
 
 fn consent(nonce: &str, budget: u64) -> Consent {
-    Consent { plan_hash: H.into(), budget, nonce: nonce.into(), ttl_expires_at: TTL }
+    Consent {
+        plan_hash: H.into(),
+        budget,
+        nonce: nonce.into(),
+        ttl_expires_at: TTL,
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -118,7 +132,11 @@ enum Ending {
     ApproveShortThenExpire,
     ExpireOnly,
 }
-const ENDINGS: [Ending; 3] = [Ending::ApproveEnough, Ending::ApproveShortThenExpire, Ending::ExpireOnly];
+const ENDINGS: [Ending; 3] = [
+    Ending::ApproveEnough,
+    Ending::ApproveShortThenExpire,
+    Ending::ExpireOnly,
+];
 
 /// 全扫描的见证收集（防格点空转）。
 #[derive(Default)]
@@ -134,7 +152,7 @@ struct Witness {
     truncation_ev: bool,
     attenuated: bool,
     confined: bool,
-    multi_resume: bool, // 同一局 ≥2 次续跑（挤牙膏式增批确被走到）
+    multi_resume: bool,   // 同一局 ≥2 次续跑（挤牙膏式增批确被走到）
     mixed_emission: bool, // 同一局同时有即时发射与批准插入
 }
 
@@ -150,13 +168,21 @@ fn drive(archs: &[Arch], mode: Mode, budget: u64, ending: Ending, w: &mut Witnes
     let mut guard = 0u32;
     loop {
         guard += 1;
-        assert!(guard <= 16, "driver stuck — 状态机悬置于 {:?}（{:?} {:?} b={budget} {:?}）", m.state(), archs, mode, ending);
+        assert!(
+            guard <= 16,
+            "driver stuck — 状态机悬置于 {:?}（{:?} {:?} b={budget} {:?}）",
+            m.state(),
+            archs,
+            mode,
+            ending
+        );
         match m.state().clone() {
             MonState::Done(_) => break,
             MonState::Paused => {
                 fresh += 1;
                 resumes += 1;
-                m.resume_with(consent(&format!("r{fresh}"), 1), NOW).unwrap();
+                m.resume_with(consent(&format!("r{fresh}"), 1), NOW)
+                    .unwrap();
             }
             MonState::AwaitingApproval => {
                 let need = m.pending_cost();
@@ -199,25 +225,39 @@ fn check(m: &Monitor, archs: &[Arch], mode: Mode, ending: Ending, w: &mut Witnes
     for e in &m.world.emitted {
         assert!(
             pol.allow.contains(&(e.verb.clone(), e.target.clone())),
-            "越界泄漏：{:?}（{:?} {:?} {:?}）", e, archs, mode, ending
+            "越界泄漏：{:?}（{:?} {:?} {:?}）",
+            e,
+            archs,
+            mode,
+            ending
         );
     }
 
     // 【替身分账】替身通道只承接隔离目标件；真实通道零隔离目标件（上一条已含）。
     for s in &m.world.standin {
-        assert!(archs[pos_of(s)].is_confined(), "替身通道混入非隔离件：{:?}", s);
+        assert!(
+            archs[pos_of(s)].is_confined(),
+            "替身通道混入非隔离件：{:?}",
+            s
+        );
     }
 
     // 【恰好一次】两通道合并后：payload（=计划位）无重复；动词只能是原型动词
     // 或其声明降档（执行者不得发明第三种）。
     let mut seen = std::collections::BTreeSet::new();
     for e in m.world.emitted.iter().chain(m.world.standin.iter()) {
-        assert!(seen.insert(e.payload.clone()), "计划位 {} 被发射两次", e.payload);
+        assert!(
+            seen.insert(e.payload.clone()),
+            "计划位 {} 被发射两次",
+            e.payload
+        );
         let orig = archs[pos_of(e)].action(pos_of(e));
         let declared_deg = pol.degrade.get(&orig.verb);
         assert!(
             e.verb == orig.verb || Some(&e.verb) == declared_deg,
-            "发明了未声明的动词改写：{} → {}", orig.verb, e.verb
+            "发明了未声明的动词改写：{} → {}",
+            orig.verb,
+            e.verb
         );
     }
 
@@ -234,24 +274,65 @@ fn check(m: &Monitor, archs: &[Arch], mode: Mode, ending: Ending, w: &mut Witnes
         })
         .sum();
     let emitted_cost: u64 = m.world.emitted.iter().map(|e| e.cost).sum();
-    assert_eq!(spent, emitted_cost, "花费行合计 ≠ 真实发射合计（{:?} {:?}）", archs, mode);
+    assert_eq!(
+        spent, emitted_cost,
+        "花费行合计 ≠ 真实发射合计（{:?} {:?}）",
+        archs, mode
+    );
     m.orch.ledger.invariant().unwrap();
 
     // 【staged 只经插入，且插入殿后】staged 位出现在真实世界 ⇔ 走过批准插入；
     // 插入发生在 commit（run 之后），故 staged 件必在全部即时件之后，两段各自保序。
-    let staged_emitted: Vec<usize> =
-        m.world.emitted.iter().filter(|e| archs[pos_of(e)].is_staged_inscope()).map(|e| pos_of(e)).collect();
+    let staged_emitted: Vec<usize> = m
+        .world
+        .emitted
+        .iter()
+        .filter(|e| archs[pos_of(e)].is_staged_inscope())
+        .map(|e| pos_of(e))
+        .collect();
     if !staged_emitted.is_empty() {
-        assert!(m.trace.iter().any(|ev| matches!(ev, Ev::InsertedOnApproval { .. })), "staged 件未经插入出现于世界");
-        assert_eq!(ending, Ending::ApproveEnough, "只有足额批准的收尾才可能放出 staged 件");
+        assert!(
+            m.trace
+                .iter()
+                .any(|ev| matches!(ev, Ev::InsertedOnApproval { .. })),
+            "staged 件未经插入出现于世界"
+        );
+        assert_eq!(
+            ending,
+            Ending::ApproveEnough,
+            "只有足额批准的收尾才可能放出 staged 件"
+        );
         w.inserted = true;
     }
-    let immediate: Vec<usize> =
-        m.world.emitted.iter().filter(|e| !archs[pos_of(e)].is_staged_inscope()).map(|e| pos_of(e)).collect();
-    assert!(immediate.windows(2).all(|p| p[0] < p[1]), "即时段乱序：{:?}", immediate);
-    assert!(staged_emitted.windows(2).all(|p| p[0] < p[1]), "插入段乱序：{:?}", staged_emitted);
-    if let Some(last_im) = m.world.emitted.iter().rposition(|e| !archs[pos_of(e)].is_staged_inscope()) {
-        if let Some(first_st) = m.world.emitted.iter().position(|e| archs[pos_of(e)].is_staged_inscope()) {
+    let immediate: Vec<usize> = m
+        .world
+        .emitted
+        .iter()
+        .filter(|e| !archs[pos_of(e)].is_staged_inscope())
+        .map(|e| pos_of(e))
+        .collect();
+    assert!(
+        immediate.windows(2).all(|p| p[0] < p[1]),
+        "即时段乱序：{:?}",
+        immediate
+    );
+    assert!(
+        staged_emitted.windows(2).all(|p| p[0] < p[1]),
+        "插入段乱序：{:?}",
+        staged_emitted
+    );
+    if let Some(last_im) = m
+        .world
+        .emitted
+        .iter()
+        .rposition(|e| !archs[pos_of(e)].is_staged_inscope())
+    {
+        if let Some(first_st) = m
+            .world
+            .emitted
+            .iter()
+            .position(|e| archs[pos_of(e)].is_staged_inscope())
+        {
             assert!(first_st > last_im, "插入未殿后");
         }
     }
@@ -261,8 +342,19 @@ fn check(m: &Monitor, archs: &[Arch], mode: Mode, ending: Ending, w: &mut Witnes
 
     // 【绝不悬置 / 绝不静默】（B4 的目标不变式）终态缓冲必空；被压制而未插入的
     // 件数必须有处置痕迹（SegmentAborted）盖住——无声滞留即红。
-    assert_eq!(m.pending_suppressed(), 0, "终态仍有悬置缓冲（{:?} {:?} b? e={:?}）", archs, mode, ending);
-    let suppressed = m.trace.iter().filter(|ev| matches!(ev, Ev::Suppressed { .. })).count();
+    assert_eq!(
+        m.pending_suppressed(),
+        0,
+        "终态仍有悬置缓冲（{:?} {:?} b? e={:?}）",
+        archs,
+        mode,
+        ending
+    );
+    let suppressed = m
+        .trace
+        .iter()
+        .filter(|ev| matches!(ev, Ev::Suppressed { .. }))
+        .count();
     let inserted: usize = m
         .trace
         .iter()
@@ -273,15 +365,27 @@ fn check(m: &Monitor, archs: &[Arch], mode: Mode, ending: Ending, w: &mut Witnes
         .sum();
     if suppressed > inserted {
         assert!(
-            m.trace.iter().any(|ev| matches!(ev, Ev::SegmentAborted { .. })),
-            "有压制件被弃置却无 SegmentAborted 痕迹（{:?} {:?} {:?}）", archs, mode, ending
+            m.trace
+                .iter()
+                .any(|ev| matches!(ev, Ev::SegmentAborted { .. })),
+            "有压制件被弃置却无 SegmentAborted 痕迹（{:?} {:?} {:?}）",
+            archs,
+            mode,
+            ending
         );
     }
 
     // 【结局与痕迹对账＋前缀界】
-    let MonState::Done(out) = m.state() else { unreachable!() };
-    let all_world_pos: Vec<usize> =
-        m.world.emitted.iter().chain(m.world.standin.iter()).map(|e| pos_of(e)).collect();
+    let MonState::Done(out) = m.state() else {
+        unreachable!()
+    };
+    let all_world_pos: Vec<usize> = m
+        .world
+        .emitted
+        .iter()
+        .chain(m.world.standin.iter())
+        .map(|e| pos_of(e))
+        .collect();
     match out {
         MonOutcome::Completed => {
             w.completed += 1;
@@ -289,27 +393,42 @@ fn check(m: &Monitor, archs: &[Arch], mode: Mode, ending: Ending, w: &mut Witnes
         MonOutcome::FailStop { at } => {
             w.failstop += 1;
             assert!(m.trace.contains(&Ev::FailStop { at: *at }));
-            assert!(all_world_pos.iter().all(|p| p < at), "FailStop 后仍有 ≥at 的世界动作");
+            assert!(
+                all_world_pos.iter().all(|p| p < at),
+                "FailStop 后仍有 ≥at 的世界动作"
+            );
             // 停点归因：要么该位在 sink 关口必停，要么是 Strict 的预算截停。
             let sink = archs[*at].sink_fails();
             let budget_ev = m.trace.contains(&Ev::BudgetExhausted { at: *at });
             match mode {
                 Mode::Strict => assert!(sink || budget_ev, "Strict FailStop 停点无因"),
-                Mode::Truncate | Mode::Escalate => assert!(sink, "非 Strict 的 FailStop 只能因 sink"),
+                Mode::Truncate | Mode::Escalate => {
+                    assert!(sink, "非 Strict 的 FailStop 只能因 sink")
+                }
             }
         }
         MonOutcome::Truncated { dropped } => {
             w.truncated += 1;
             assert_eq!(mode, Mode::Truncate, "只有 Truncate 模式产出 Truncated");
-            assert!(m.trace.contains(&Ev::Truncation { dropped: *dropped }), "截断必须可听见");
+            assert!(
+                m.trace.contains(&Ev::Truncation { dropped: *dropped }),
+                "截断必须可听见"
+            );
             w.truncation_ev = true;
             let cut = archs.len() - dropped;
-            assert!(all_world_pos.iter().all(|p| *p < cut), "截断点之后仍有世界动作");
+            assert!(
+                all_world_pos.iter().all(|p| *p < cut),
+                "截断点之后仍有世界动作"
+            );
         }
         MonOutcome::Aborted { expired } => {
             assert!(*expired, "穷举里 Aborted 只经 ttl 过期产生");
             w.aborted_expired += 1;
-            assert!(m.trace.iter().any(|ev| matches!(ev, Ev::SegmentAborted { expired: true })));
+            assert!(
+                m.trace
+                    .iter()
+                    .any(|ev| matches!(ev, Ev::SegmentAborted { expired: true }))
+            );
             // 过期废段：staged 件零泄漏（上面恰好一次+零越界已保证不重不漏，
             // 此处再钉死：ExpireOnly/Short 收尾下 staged 位绝不在真实世界）。
             assert!(staged_emitted.is_empty(), "被废的段泄漏了 staged 件");
@@ -317,7 +436,10 @@ fn check(m: &Monitor, archs: &[Arch], mode: Mode, ending: Ending, w: &mut Witnes
     }
 
     // 【终态路径的救济痕迹见证】（供 sweep 末尾防空转）
-    if m.trace.iter().any(|ev| matches!(ev, Ev::SegmentAborted { expired: false })) {
+    if m.trace
+        .iter()
+        .any(|ev| matches!(ev, Ev::SegmentAborted { expired: false }))
+    {
         w.terminal_discard = true;
     }
     if m.trace.iter().any(|ev| matches!(ev, Ev::Attenuated { .. })) {
@@ -360,11 +482,20 @@ fn deterministic_exhaustion_over_combination_lattice() {
     assert_eq!(w.runs, (8 + 64 + 512) * 3 * 4 * 3, "格点被收缩");
 
     // 见证断言：每类结局、每种救济路径都必须真的被走到过（防格点空转）。
-    assert!(w.completed > 0 && w.failstop > 0 && w.truncated > 0 && w.aborted_expired > 0, "有结局类未见证");
+    assert!(
+        w.completed > 0 && w.failstop > 0 && w.truncated > 0 && w.aborted_expired > 0,
+        "有结局类未见证"
+    );
     assert!(w.inserted, "无一局走到批准插入");
-    assert!(w.terminal_discard, "无一局走到终止弃缓冲（B4 路径未被踩到）");
+    assert!(
+        w.terminal_discard,
+        "无一局走到终止弃缓冲（B4 路径未被踩到）"
+    );
     assert!(w.approval_short, "无一局见证整批拒绝");
-    assert!(w.truncation_ev && w.attenuated && w.confined, "有救济/截断痕迹未见证");
+    assert!(
+        w.truncation_ev && w.attenuated && w.confined,
+        "有救济/截断痕迹未见证"
+    );
     assert!(w.multi_resume, "无一局出现 ≥2 次增批续跑");
     assert!(w.mixed_emission, "无一局同时含即时发射与批准插入");
 }

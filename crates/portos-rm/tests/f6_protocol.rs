@@ -4,8 +4,8 @@
 
 use portos_rm::coeffect::Plan;
 use portos_rm::ledger::Ledger;
-use portos_rm::test_support::monitor::*;
 use portos_rm::protocol::*;
+use portos_rm::test_support::monitor::*;
 
 /// QP 状态机：reset→init→rtr→rts；post_send 只在 rts；query 不在辖域。
 fn qp() -> Protocol {
@@ -13,7 +13,9 @@ fn qp() -> Protocol {
         .transition("reset", "init", "init")
         .transition("init", "rtr", "rtr")
         .transition("rtr", "rts", "rts")
-        .transition("rts", "post_send", "rts").check().unwrap()
+        .transition("rts", "post_send", "rts")
+        .check()
+        .unwrap()
 }
 
 fn all_sequences(alphabet: &[&str], max_len: usize) -> Vec<Vec<String>> {
@@ -48,7 +50,10 @@ fn protocol_is_a_safety_property_prefix_closed_and_irremediable() {
         match p.check_sequence(&refs) {
             Ok(_) => {
                 for k in 0..refs.len() {
-                    assert!(p.check_sequence(&refs[..k]).is_ok(), "前缀闭失效：{refs:?} 的前缀 {k}");
+                    assert!(
+                        p.check_sequence(&refs[..k]).is_ok(),
+                        "前缀闭失效：{refs:?} 的前缀 {k}"
+                    );
                 }
             }
             Err(v) => {
@@ -63,7 +68,10 @@ fn protocol_is_a_safety_property_prefix_closed_and_irremediable() {
         }
     }
     // 辖域外动词不改状态：query 可在任何时候查。
-    assert!(p.check_sequence(&["query", "init", "query", "rtr", "rts", "query", "post_send"]).is_ok());
+    assert!(
+        p.check_sequence(&["query", "init", "query", "rtr", "rts", "query", "post_send"])
+            .is_ok()
+    );
 }
 
 fn plans_up_to_depth(leaves: &[&str], depth: u32) -> Vec<Plan> {
@@ -91,7 +99,11 @@ fn plans_up_to_depth(leaves: &[&str], depth: u32) -> Vec<Plan> {
 fn static_reachability_equals_path_enumeration_on_all_small_plans() {
     let p = qp();
     let plans = plans_up_to_depth(&["init", "rtr", "rts", "post_send"], 2);
-    assert_eq!(plans.len(), 4 + (16 + 16 + 16) + (52 * 52 * 2 + 52 * 4), "计划枚举规模被收缩");
+    assert_eq!(
+        plans.len(),
+        4 + (16 + 16 + 16) + (52 * 52 * 2 + 52 * 4),
+        "计划枚举规模被收缩"
+    );
     let mut ok_count = 0;
     for plan in &plans {
         let paths = enumerate_paths(plan);
@@ -125,16 +137,28 @@ fn world_order_projection_is_sound_and_exact_without_branches() {
     // 协议：先授远端访问（硬清单，扣发）再 post_send。
     let p = ProtocolDraft::new("closed")
         .transition("closed", "grant", "open")
-        .transition("open", "post_send", "open").check().unwrap();
+        .transition("open", "post_send", "open")
+        .check()
+        .unwrap();
     let withhold: std::collections::BTreeSet<String> = ["grant".to_string()].into_iter().collect();
 
     // 最小反例：计划序 grant;post_send 合法；世界序 post_send;grant（grant 殿后）违规。
-    let plan = Plan::Seq(vec![Plan::verb("mr", "grant"), Plan::verb("qp", "post_send")]);
+    let plan = Plan::Seq(vec![
+        Plan::verb("mr", "grant"),
+        Plan::verb("qp", "post_send"),
+    ]);
     assert!(p.check_plan(&plan).is_ok(), "计划序合法");
-    assert!(p.check_plan_world_order(&plan, &withhold).is_err(), "世界序违规——扣发把 grant 推到了 post_send 之后");
+    assert!(
+        p.check_plan_world_order(&plan, &withhold).is_err(),
+        "世界序违规——扣发把 grant 推到了 post_send 之后"
+    );
 
     let world_order = |path: &[String]| -> Vec<String> {
-        let mut w: Vec<String> = path.iter().filter(|v| !withhold.contains(*v)).cloned().collect();
+        let mut w: Vec<String> = path
+            .iter()
+            .filter(|v| !withhold.contains(*v))
+            .cloned()
+            .collect();
         w.extend(path.iter().filter(|v| withhold.contains(*v)).cloned());
         w
     };
@@ -171,7 +195,12 @@ fn has_branch(p: &Plan) -> bool {
 }
 
 fn consent(n: &str, b: u64) -> Consent {
-    Consent { plan_hash: "h".into(), budget: b, nonce: n.into(), ttl_expires_at: 100 }
+    Consent {
+        plan_hash: "h".into(),
+        budget: b,
+        nonce: n.into(),
+        ttl_expires_at: 100,
+    }
 }
 
 /// [SAFE]→F3：协议由截停器精确执行——合法流原样通过；违规流在首个违规处 fail-stop、
@@ -185,18 +214,32 @@ fn protocol_precisely_enforced_by_truncation_tier_in_monitor() {
     pol.protocol = Some(qp());
     pol.handler = "qp".into();
 
-    let valid = vec![WAction::new("init", "qp-1", "", 1), WAction::new("rtr", "qp-1", "", 1), WAction::new("rts", "qp-1", "", 1), WAction::new("post_send", "qp-1", "", 1)];
+    let valid = vec![
+        WAction::new("init", "qp-1", "", 1),
+        WAction::new("rtr", "qp-1", "", 1),
+        WAction::new("rts", "qp-1", "", 1),
+        WAction::new("post_send", "qp-1", "", 1),
+    ];
     let mut m = Monitor::new(pol.clone(), Mode::Strict, Ledger::new(), "fib");
     m.admit(valid.clone(), "h", consent("n1", 10), 10).unwrap();
     assert_eq!(*m.run(10), MonState::Done(MonOutcome::Completed));
     assert_eq!(m.world.emitted, valid, "合法流原样通过（透明性）");
 
-    let invalid = vec![WAction::new("init", "qp-1", "", 1), WAction::new("post_send", "qp-1", "", 1), WAction::new("rtr", "qp-1", "", 1)];
+    let invalid = vec![
+        WAction::new("init", "qp-1", "", 1),
+        WAction::new("post_send", "qp-1", "", 1),
+        WAction::new("rtr", "qp-1", "", 1),
+    ];
     let mut m = Monitor::new(pol, Mode::Strict, Ledger::new(), "fib");
-    m.admit(invalid.clone(), "h", consent("n1", 10), 10).unwrap();
+    m.admit(invalid.clone(), "h", consent("n1", 10), 10)
+        .unwrap();
     assert_eq!(*m.run(10), MonState::Done(MonOutcome::FailStop { at: 1 }));
     assert_eq!(m.world.emitted, invalid[..1].to_vec(), "最长合法前缀");
-    assert!(m.trace.contains(&Ev::ProtocolViolation { verb: "post_send".into(), state: "init".into(), at: 1 }));
+    assert!(m.trace.contains(&Ev::ProtocolViolation {
+        verb: "post_send".into(),
+        state: "init".into(),
+        at: 1
+    }));
     // 与静态检查一致
     let plan = Plan::Seq(invalid.iter().map(|a| Plan::verb("qp", &a.verb)).collect());
     assert!(qp().check_plan(&plan).is_err());
@@ -209,17 +252,40 @@ fn withhold_reorder_is_caught_at_step_or_at_approval() {
     // 情形一：grant（扣发）在后放、post_send 即时——post_send 在 closed 状态无转移 ⇒ step 处 fail-stop。
     let p = ProtocolDraft::new("closed")
         .transition("closed", "grant", "open")
-        .transition("open", "post_send", "open").check().unwrap();
+        .transition("open", "post_send", "open")
+        .check()
+        .unwrap();
     let mut pol = Policy::default();
     pol.allow("grant", "buf");
     pol.allow("post_send", "peer");
     pol.staged_verbs.insert("grant".into());
     pol.protocol = Some(p);
     let mut m = Monitor::new(pol, Mode::Strict, Ledger::new(), "fib");
-    m.admit(vec![WAction::new("grant", "buf", "", 1), WAction::new("post_send", "peer", "", 1)], "h", consent("n1", 10), 10).unwrap();
-    assert_eq!(*m.run(10), MonState::Done(MonOutcome::FailStop { at: 1 }), "世界序违规在 step 处被截停");
-    assert!(m.world.emitted.is_empty(), "grant 在缓冲、post_send 被截：世界零发射");
-    assert!(m.trace.iter().any(|e| matches!(e, Ev::SegmentAborted { expired: false })), "终止即弃：缓冲里的 grant 可听见地废弃");
+    m.admit(
+        vec![
+            WAction::new("grant", "buf", "", 1),
+            WAction::new("post_send", "peer", "", 1),
+        ],
+        "h",
+        consent("n1", 10),
+        10,
+    )
+    .unwrap();
+    assert_eq!(
+        *m.run(10),
+        MonState::Done(MonOutcome::FailStop { at: 1 }),
+        "世界序违规在 step 处被截停"
+    );
+    assert!(
+        m.world.emitted.is_empty(),
+        "grant 在缓冲、post_send 被截：世界零发射"
+    );
+    assert!(
+        m.trace
+            .iter()
+            .any(|e| matches!(e, Ev::SegmentAborted { expired: false })),
+        "终止即弃：缓冲里的 grant 可听见地废弃"
+    );
 
     // 情形二：即时动词把状态推到终态，批准整批在终态无转移 ⇒ approve 整批拒。
     // 协议：s0 -grant-> s1 -close-> closed；s0 -close-> closed。计划序 grant;close 合法；
@@ -227,23 +293,42 @@ fn withhold_reorder_is_caught_at_step_or_at_approval() {
     let p2 = ProtocolDraft::new("s0")
         .transition("s0", "grant", "s1")
         .transition("s1", "close", "closed")
-        .transition("s0", "close", "closed").check().unwrap();
+        .transition("s0", "close", "closed")
+        .check()
+        .unwrap();
     let mut pol = Policy::default();
     pol.allow("grant", "buf");
     pol.allow("close", "buf");
     pol.staged_verbs.insert("grant".into());
     pol.protocol = Some(p2.clone());
     let mut m = Monitor::new(pol, Mode::Strict, Ledger::new(), "fib");
-    let plan = vec![WAction::new("grant", "buf", "", 1), WAction::new("close", "buf", "", 1)];
+    let plan = vec![
+        WAction::new("grant", "buf", "", 1),
+        WAction::new("close", "buf", "", 1),
+    ];
     m.admit(plan.clone(), "h", consent("n1", 10), 10).unwrap();
     assert_eq!(*m.run(10), MonState::AwaitingApproval);
-    assert_eq!(m.approve(consent("n2", 5), 10), Err(Refusal::ProtocolViolation), "批准整批违规 ⇒ 整批拒");
-    assert_eq!(m.world.emitted.len(), 1, "只有 close 在世界里；grant 一件未漏");
+    assert_eq!(
+        m.approve(consent("n2", 5), 10),
+        Err(Refusal::ProtocolViolation),
+        "批准整批违规 ⇒ 整批拒"
+    );
+    assert_eq!(
+        m.world.emitted.len(),
+        1,
+        "只有 close 在世界里；grant 一件未漏"
+    );
     m.expire(101).unwrap(); // 段只能废
-    assert_eq!(*m.state(), MonState::Done(MonOutcome::Aborted { expired: true }));
+    assert_eq!(
+        *m.state(),
+        MonState::Done(MonOutcome::Aborted { expired: true })
+    );
     // 静态世界序检查应在准入期就预言这一点。
     let static_plan = Plan::Seq(plan.iter().map(|a| Plan::verb("mr", &a.verb)).collect());
     let withhold: std::collections::BTreeSet<String> = ["grant".to_string()].into_iter().collect();
     assert!(p2.check_plan(&static_plan).is_ok(), "计划序合法");
-    assert!(p2.check_plan_world_order(&static_plan, &withhold).is_err(), "世界序违规——准入期即可拦");
+    assert!(
+        p2.check_plan_world_order(&static_plan, &withhold).is_err(),
+        "世界序违规——准入期即可拦"
+    );
 }

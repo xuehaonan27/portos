@@ -873,11 +873,18 @@ fn legacy_migration_imports_capacity_once_and_retains_history() {
     let effect = EffectClass::new("emit");
     let (store, _) = LedgerStore::open(db.clone()).unwrap();
     assert_eq!(store.count_balance(&account, &effect).unwrap(), Some(2));
-    store.transaction(|tx| {
-        let pool = tx.create_count_pool(&account, &effect, &SubjectId::new("owner"), Capacity::new(Count::Value(4)).unwrap())?;
-        assert_eq!(pool.id().key().instance().as_str(), "legacy/emit");
-        Ok(())
-    }).unwrap();
+    store
+        .transaction(|tx| {
+            let pool = tx.create_count_pool(
+                &account,
+                &effect,
+                &SubjectId::new("owner"),
+                Capacity::new(Count::Value(4)).unwrap(),
+            )?;
+            assert_eq!(pool.id().key().instance().as_str(), "legacy/emit");
+            Ok(())
+        })
+        .unwrap();
     assert_eq!(
         store
             .holding(HoldingId::try_from(0u64).unwrap())

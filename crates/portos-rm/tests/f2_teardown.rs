@@ -628,7 +628,10 @@ fn subtree_teardown_is_children_first_and_spares_off_tree_holdings() {
             l.holding(other).unwrap().released_at().is_none(),
             "子树外的持有不动"
         );
-        assert!(l.holding(cap).unwrap().released_at().is_some(), "根本人落碑");
+        assert!(
+            l.holding(cap).unwrap().released_at().is_some(),
+            "根本人落碑"
+        );
         l.invariant().unwrap();
     }
 }

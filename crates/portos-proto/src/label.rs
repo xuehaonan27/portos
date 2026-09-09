@@ -47,7 +47,7 @@ impl Label {
         }
     }
 
-    /// Partial order: `self ⊑ other` iff inclusion in both dimensions. 
+    /// Partial order: `self ⊑ other` iff inclusion in both dimensions.
     pub fn leq(&self, other: &Label) -> bool {
         self.conf.is_subset(&other.conf) && self.integ.is_subset(&other.integ)
     }

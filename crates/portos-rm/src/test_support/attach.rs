@@ -1413,11 +1413,7 @@ impl Scheduler {
             &[root],
             Timestamp::try_from(now).unwrap(),
         );
-        let mut pools: Vec<_> = self.attachments[id]
-            .pools
-            .values()
-            .cloned()
-            .collect();
+        let mut pools: Vec<_> = self.attachments[id].pools.values().cloned().collect();
         pools.extend(
             self.firing_resources
                 .iter()

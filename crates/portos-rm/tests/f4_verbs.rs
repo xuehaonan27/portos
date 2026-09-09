@@ -3,13 +3,13 @@
 //! v2 新增三块墓碑（B5/B6/B7，见 freeze-f4 §2）与一致性格点的确定性穷举（决策 #8）。
 
 use portos_rm::identity::VerbId;
-use portos_rm::test_support::declarations::Declarations;
 use portos_rm::identity::{ClassId, Generation, InstanceId, ResourceKey, SubjectId};
 use portos_rm::ledger::GrantRequest;
 use portos_rm::ledger::*;
-use portos_rm::test_support::monitor::*;
 use portos_rm::ra::Ex;
 use portos_rm::registry::{Capacity, Claim};
+use portos_rm::test_support::declarations::Declarations;
+use portos_rm::test_support::monitor::*;
 use portos_rm::test_support::teardown::{Orchestrator, RunOutcome};
 use portos_rm::time::{LeaseDuration, LeaseRequest, Timestamp};
 use portos_rm::verbs::*;
@@ -222,10 +222,26 @@ fn d1_same_verb_two_handlers_projections_differ() {
         "read",
         VerbEntry::consuming(ConsumeGrade::External),
     );
-    for class in ["cas", "queue"] { t.insert(extra.check_all().unwrap().class(&ClassId::new(class)).unwrap().clone()).unwrap(); }
-    assert!(!t.lookup(&ClassId::new("cas"), &VerbId::new("read")).unwrap().bears_budget());
+    for class in ["cas", "queue"] {
+        t.insert(
+            extra
+                .check_all()
+                .unwrap()
+                .class(&ClassId::new(class))
+                .unwrap()
+                .clone(),
+        )
+        .unwrap();
+    }
     assert!(
-        t.lookup(&ClassId::new("queue"), &VerbId::new("read")).unwrap().bears_budget(),
+        !t.lookup(&ClassId::new("cas"), &VerbId::new("read"))
+            .unwrap()
+            .bears_budget()
+    );
+    assert!(
+        t.lookup(&ClassId::new("queue"), &VerbId::new("read"))
+            .unwrap()
+            .bears_budget(),
         "预算地位随手柄翻转"
     );
     assert_eq!(
@@ -235,17 +251,36 @@ fn d1_same_verb_two_handlers_projections_differ() {
     );
 
     // B6 墓碑：同名 send 的扣发地位随 handler 而异——按类投影才保得住 D1。
-    assert!(t.derive_handler_policy(&ClassId::new("mail")).unwrap().withhold().contains("send"));
-    assert!(!t.derive_handler_policy(&ClassId::new("bus")).unwrap().withhold().contains("send"));
-    assert!(!t.derive_handler_policy(&ClassId::new("socket")).unwrap().withhold().contains("send"));
+    assert!(
+        t.derive_handler_policy(&ClassId::new("mail"))
+            .unwrap()
+            .withhold()
+            .contains("send")
+    );
+    assert!(
+        !t.derive_handler_policy(&ClassId::new("bus"))
+            .unwrap()
+            .withhold()
+            .contains("send")
+    );
+    assert!(
+        !t.derive_handler_policy(&ClassId::new("socket"))
+            .unwrap()
+            .withhold()
+            .contains("send")
+    );
     for h in ["mail", "bus", "socket"] {
         assert!(
-            t.derive_handler_policy(&ClassId::new(h)).unwrap().budget().contains("send"),
+            t.derive_handler_policy(&ClassId::new(h))
+                .unwrap()
+                .budget()
+                .contains("send"),
             "{h}.send 都进预算"
         );
     }
     assert_eq!(
-        t.derive_handler_policy(&ClassId::new("bus")).unwrap()
+        t.derive_handler_policy(&ClassId::new("bus"))
+            .unwrap()
             .compensations()
             .get("send")
             .map(String::as_str),
@@ -258,10 +293,15 @@ fn d1_same_verb_two_handlers_projections_differ() {
 #[test]
 fn consuming_read_bears_budget_refines_read_write_binary() {
     let t = browser_verb_table();
-    let recv = t.lookup(&ClassId::new("socket"), &VerbId::new("recv")).unwrap();
-    let snap = t.lookup(&ClassId::new("page"), &VerbId::new("snapshot")).unwrap();
+    let recv = t
+        .lookup(&ClassId::new("socket"), &VerbId::new("recv"))
+        .unwrap();
+    let snap = t
+        .lookup(&ClassId::new("page"), &VerbId::new("snapshot"))
+        .unwrap();
     assert!(
-        !matches!(recv.kind(), Kind::Emitting { .. }) && !matches!(snap.kind(), Kind::Emitting { .. })
+        !matches!(recv.kind(), Kind::Emitting { .. })
+            && !matches!(snap.kind(), Kind::Emitting { .. })
     );
     assert!(recv.bears_budget(), "队列 pop 是真实状态变更，必须进预算");
     assert!(!snap.bears_budget(), "不可变源读不占预算，只记标签");
@@ -278,30 +318,51 @@ fn consuming_read_bears_budget_refines_read_write_binary() {
 fn holding_rho_is_per_class_action_grade_is_per_verb() {
     let t = browser_verb_table();
     // 同一个 page 类：持有可精确关闭（Inverse）……
-    assert_eq!(t.derive_holding_grade(&ClassId::new("page")), Some(RevertGrade::Inverse));
+    assert_eq!(
+        t.derive_holding_grade(&ClassId::new("page")),
+        Some(RevertGrade::Inverse)
+    );
     // ……而它的发射动词各有自己的世界档，与持有档无关。
     assert!(
-        t.lookup(&ClassId::new("page"), &VerbId::new("click")).unwrap().staged_shape(),
+        t.lookup(&ClassId::new("page"), &VerbId::new("click"))
+            .unwrap()
+            .staged_shape(),
         "click 是外部发射"
     );
     assert!(matches!(
-        t.lookup(&ClassId::new("page"), &VerbId::new("submit_draft")).unwrap().kind().clone(),
+        t.lookup(&ClassId::new("page"), &VerbId::new("submit_draft"))
+            .unwrap()
+            .kind()
+            .clone(),
         Kind::Emitting {
             world: EmitGrade::Compensable { .. },
             ..
         }
     ));
     assert!(matches!(
-        t.lookup(&ClassId::new("page"), &VerbId::new("attach")).unwrap().kind().clone(),
+        t.lookup(&ClassId::new("page"), &VerbId::new("attach"))
+            .unwrap()
+            .kind()
+            .clone(),
         Kind::Consuming {
             world: ConsumeGrade::Held
         }
     ));
     // socket：连接是持有、recv 外部消耗、send 外部发射——一类三性格。
-    assert_eq!(t.derive_holding_grade(&ClassId::new("socket")), Some(RevertGrade::Inverse));
-    assert!(t.lookup(&ClassId::new("socket"), &VerbId::new("send")).unwrap().staged_shape());
+    assert_eq!(
+        t.derive_holding_grade(&ClassId::new("socket")),
+        Some(RevertGrade::Inverse)
+    );
+    assert!(
+        t.lookup(&ClassId::new("socket"), &VerbId::new("send"))
+            .unwrap()
+            .staged_shape()
+    );
     assert!(matches!(
-        t.lookup(&ClassId::new("socket"), &VerbId::new("recv")).unwrap().kind().clone(),
+        t.lookup(&ClassId::new("socket"), &VerbId::new("recv"))
+            .unwrap()
+            .kind()
+            .clone(),
         Kind::Consuming {
             world: ConsumeGrade::External
         }
@@ -316,29 +377,39 @@ fn holding_rho_is_per_class_action_grade_is_per_verb() {
 #[test]
 fn withhold_iff_non_amortizable_staged_shape_iff_external() {
     let t = browser_verb_table();
-    let click = t.lookup(&ClassId::new("page"), &VerbId::new("click")).unwrap();
+    let click = t
+        .lookup(&ClassId::new("page"), &VerbId::new("click"))
+        .unwrap();
     assert!(
         click.staged_shape() && !click.withhold(),
         "click：两阶段由准入满足，不逐次扣发"
     );
-    let submit = t.lookup(&ClassId::new("page"), &VerbId::new("submit")).unwrap();
+    let submit = t
+        .lookup(&ClassId::new("page"), &VerbId::new("submit"))
+        .unwrap();
     assert!(
         submit.staged_shape() && submit.withhold(),
         "submit：硬清单，逐次同意"
     );
-    let draft = t.lookup(&ClassId::new("page"), &VerbId::new("submit_draft")).unwrap();
+    let draft = t
+        .lookup(&ClassId::new("page"), &VerbId::new("submit_draft"))
+        .unwrap();
     assert!(
         !draft.staged_shape() && !draft.withhold(),
         "可补偿发射：既非两阶段也不扣发"
     );
-    let post = t.lookup(&ClassId::new("api"), &VerbId::new("post")).unwrap();
+    let post = t
+        .lookup(&ClassId::new("api"), &VerbId::new("post"))
+        .unwrap();
     assert!(!post.staged_shape() && !post.withhold());
     // 可补偿但在硬清单上（删除→可从回收站恢复）：不是两阶段形状，但仍逐次同意。
     let mut s = Declarations::new();
     s.register("fs", "delete", comp("restore", false));
     s.register("fs", "restore", ext(true));
     let s = s.check_all().unwrap();
-    let del = s.lookup(&ClassId::new("fs"), &VerbId::new("delete")).unwrap();
+    let del = s
+        .lookup(&ClassId::new("fs"), &VerbId::new("delete"))
+        .unwrap();
     assert!(
         !del.staged_shape() && del.withhold(),
         "硬清单优先于可补偿性"
@@ -351,14 +422,16 @@ fn withhold_iff_non_amortizable_staged_shape_iff_external() {
 fn degrade_declared_and_only_narrows() {
     let t = browser_verb_table(); // 含 read_full→read_preview、submit→submit_draft，check_all 已过
     assert_eq!(
-        t.derive_handler_policy(&ClassId::new("doc")).unwrap()
+        t.derive_handler_policy(&ClassId::new("doc"))
+            .unwrap()
             .degrade()
             .get("read_full")
             .map(String::as_str),
         Some("read_preview")
     );
     assert_eq!(
-        t.derive_handler_policy(&ClassId::new("page")).unwrap()
+        t.derive_handler_policy(&ClassId::new("page"))
+            .unwrap()
             .degrade()
             .get("submit")
             .map(String::as_str),
@@ -406,7 +479,12 @@ fn held_requires_declared_class_rho_and_rho_is_immutable() {
         t.declare_class("port", RevertGrade::External),
         Err(VerbError::ClassAlreadyDeclared)
     );
-    assert_eq!(t.check_all().unwrap().derive_holding_grade(&ClassId::new("port")), Some(RevertGrade::Inverse));
+    assert_eq!(
+        t.check_all()
+            .unwrap()
+            .derive_holding_grade(&ClassId::new("port")),
+        Some(RevertGrade::Inverse)
+    );
     // 补偿动词自己又要补偿——链不闭合，拒。
     let mut c = Declarations::new();
     c.register("api", "post", comp("cancel", true));
@@ -553,7 +631,9 @@ fn truth_table_is_shared_source_for_f2_teardown_and_f3_monitor() {
 
     // mail handler：同一张表投影出另一台监督器的扣发集（D1）。
     assert_eq!(
-        t.derive_handler_policy(&ClassId::new("mail")).unwrap().withhold(),
+        t.derive_handler_policy(&ClassId::new("mail"))
+            .unwrap()
+            .withhold(),
         &["send".to_string()].into_iter().collect()
     );
 }

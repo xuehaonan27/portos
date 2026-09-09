@@ -46,7 +46,12 @@ fn main() -> std::io::Result<()> {
     let list = |env: &str| -> Vec<String> {
         std::env::var(env)
             .ok()
-            .map(|s| s.split(',').filter(|x| !x.is_empty()).map(str::to_string).collect())
+            .map(|s| {
+                s.split(',')
+                    .filter(|x| !x.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
             .unwrap_or_default()
     };
     let emit_kind = if std::env::var("PORTOS_ECHO_BAD_KIND").is_ok() {
@@ -128,7 +133,11 @@ fn main() -> std::io::Result<()> {
                 // bytes and stream them into the CAS.
                 "put_pattern" => {
                     let n = arg(0).as_u64().unwrap_or(0);
-                    let meta = client.put(PatternReader { left: n, pos: 0 }, "test/pattern", Value::Null)?;
+                    let meta = client.put(
+                        PatternReader { left: n, pos: 0 },
+                        "test/pattern",
+                        Value::Null,
+                    )?;
                     Ok(json!({ "meta": meta }))
                 }
                 // invoke another plugin's verb through the kernel (cap-gated
@@ -161,7 +170,9 @@ fn main() -> std::io::Result<()> {
                 "spawn_child" => {
                     let family = arg(0).as_str().unwrap_or("echoc").to_string();
                     let bin = std::env::current_exe().map_err(|e| e.to_string())?;
-                    let bin = bin.to_str().ok_or_else(|| "exe path not utf-8".to_string())?;
+                    let bin = bin
+                        .to_str()
+                        .ok_or_else(|| "exe path not utf-8".to_string())?;
                     client
                         .spawn_child(bin, &[], &[("PORTOS_ECHO_FAMILY", family.as_str())])
                         .map(|name| json!({"name": name}))

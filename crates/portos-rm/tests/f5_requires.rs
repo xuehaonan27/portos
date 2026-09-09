@@ -6,11 +6,11 @@
 //! 措辞纪律：合同内的法则（Definition 1）与实例附加性质（交换、单调、join）分开断言、分开标注，
 //! 后者的失败不算合同失败——但它们是我们实例的真实性质，记录在案供实装依赖时查证。
 
-use portos_rm::identity::{ClassId, VerbId};
-use portos_rm::test_support::declarations::Declarations;
 use portos_rm::auth::{auth_valid, can_mint};
 use portos_rm::coeffect::*;
+use portos_rm::identity::{ClassId, VerbId};
 use portos_rm::ra::{Count, Ra};
+use portos_rm::test_support::declarations::Declarations;
 use portos_rm::verbs::*;
 
 // ---------------------------------------------------------------------------
@@ -23,7 +23,14 @@ fn counting_carrier() -> Vec<Counting> {
 fn flat_carrier(universe: &[&str]) -> Vec<Flat> {
     let n = universe.len();
     (0..(1u32 << n))
-        .map(|mask| Flat((0..n).filter(|i| mask & (1 << i) != 0).map(|i| universe[i].to_string()).collect()))
+        .map(|mask| {
+            Flat(
+                (0..n)
+                    .filter(|i| mask & (1 << i) != 0)
+                    .map(|i| universe[i].to_string())
+                    .collect(),
+            )
+        })
         .collect()
 }
 
@@ -91,8 +98,16 @@ fn check_definition1<S: Scalar>(elems: &[S]) -> usize {
                 assert_eq!(r.seq(s).seq(t), r.seq(&s.seq(t)), "~ 不结合");
                 assert_eq!(r.merge(s).merge(t), r.merge(&s.merge(t)), "⊕ 不结合");
                 // 双侧分配律，原文原形
-                assert_eq!(r.merge(s).seq(t), r.seq(t).merge(&s.seq(t)), "(r⊕s)~t ≠ (r~t)⊕(s~t)");
-                assert_eq!(t.seq(&r.merge(s)), t.seq(r).merge(&t.seq(s)), "t~(r⊕s) ≠ (t~r)⊕(t~s)");
+                assert_eq!(
+                    r.merge(s).seq(t),
+                    r.seq(t).merge(&s.seq(t)),
+                    "(r⊕s)~t ≠ (r~t)⊕(s~t)"
+                );
+                assert_eq!(
+                    t.seq(&r.merge(s)),
+                    t.seq(r).merge(&t.seq(s)),
+                    "t~(r⊕s) ≠ (t~r)⊕(t~s)"
+                );
                 if r.leq(s) && s.leq(t) {
                     assert!(r.leq(t), "≤ 不传递");
                 }
@@ -113,8 +128,14 @@ fn check_instance_extras<S: Join>(elems: &[S]) {
             assert!(r.leq(&j) && s.leq(&j), "join 不是上界");
             for t in elems {
                 if r.leq(s) {
-                    assert!(r.seq(t).leq(&s.seq(t)) && t.seq(r).leq(&t.seq(s)), "实例性质：~ 对 ≤ 单调");
-                    assert!(r.merge(t).leq(&s.merge(t)) && t.merge(r).leq(&t.merge(s)), "实例性质：⊕ 对 ≤ 单调");
+                    assert!(
+                        r.seq(t).leq(&s.seq(t)) && t.seq(r).leq(&t.seq(s)),
+                        "实例性质：~ 对 ≤ 单调"
+                    );
+                    assert!(
+                        r.merge(t).leq(&s.merge(t)) && t.merge(r).leq(&t.merge(s)),
+                        "实例性质：⊕ 对 ≤ 单调"
+                    );
                 }
                 if r.leq(t) && s.leq(t) {
                     assert!(j.leq(t), "join 不是最小上界");
@@ -132,7 +153,11 @@ fn definition1_laws_exhaustive_on_counting_flat_and_fixed_vector() {
     let x = fixed2_carrier();
     assert_eq!(check_definition1(&c), 6 * 6 * 6);
     assert_eq!(check_definition1(&f), 8 * 8 * 8);
-    assert_eq!(check_definition1(&x), 9 * 9 * 9, "固定 K 的 Counting² 逐分量满足 Definition 1");
+    assert_eq!(
+        check_definition1(&x),
+        9 * 9 * 9,
+        "固定 K 的 Counting² 逐分量满足 Definition 1"
+    );
     check_instance_extras(&c);
     check_instance_extras(&f);
     check_instance_extras(&x);
@@ -149,7 +174,11 @@ fn budget_vector_is_a_semimodule_over_counting() {
         assert_eq!(a.merge(&zero), *a);
         assert_eq!(zero.merge(a), *a);
         assert_eq!(Budget::scale(1, a), *a, "1·a = a");
-        assert_eq!(Budget::scale(0, a), zero, "0·a = 0（规范化后与零向量同一表示）");
+        assert_eq!(
+            Budget::scale(0, a),
+            zero,
+            "0·a = 0（规范化后与零向量同一表示）"
+        );
         assert!(a.leq(a));
         for b in &bs {
             assert_eq!(a.merge(b), b.merge(a), "⊕ 交换（实例性质）");
@@ -165,26 +194,61 @@ fn budget_vector_is_a_semimodule_over_counting() {
                 }
             }
             for n in 0..=3u64 {
-                assert_eq!(Budget::scale(n, &a.merge(b)), Budget::scale(n, a).merge(&Budget::scale(n, b)), "n·(a⊕b)=n·a⊕n·b");
+                assert_eq!(
+                    Budget::scale(n, &a.merge(b)),
+                    Budget::scale(n, a).merge(&Budget::scale(n, b)),
+                    "n·(a⊕b)=n·a⊕n·b"
+                );
                 for m in 0..=3u64 {
-                    assert_eq!(Budget::scale(n + m, a), Budget::scale(n, a).merge(&Budget::scale(m, a)), "(n+m)·a = n·a ⊕ m·a");
-                    assert_eq!(Budget::scale(n * m, a), Budget::scale(n, &Budget::scale(m, a)), "(nm)·a = n·(m·a)");
+                    assert_eq!(
+                        Budget::scale(n + m, a),
+                        Budget::scale(n, a).merge(&Budget::scale(m, a)),
+                        "(n+m)·a = n·a ⊕ m·a"
+                    );
+                    assert_eq!(
+                        Budget::scale(n * m, a),
+                        Budget::scale(n, &Budget::scale(m, a)),
+                        "(nm)·a = n·(m·a)"
+                    );
                 }
             }
         }
     }
     // 缺席与 0 同一：{p:0,q:1} 与 {q:1} 相等，且 leq 两向皆成立。
-    let explicit = Budget([("p".to_string(), Counting::new(0)), ("q".to_string(), Counting::new(1))].into_iter().collect());
+    let explicit = Budget(
+        [
+            ("p".to_string(), Counting::new(0)),
+            ("q".to_string(), Counting::new(1)),
+        ]
+        .into_iter()
+        .collect(),
+    );
     let sparse = Budget::of(&[("q", 1)]);
     assert!(explicit.leq(&sparse) && sparse.leq(&explicit));
-    assert_eq!(explicit.merge(&Budget::zero()), sparse, "经运算规范化后表示同一");
+    assert_eq!(
+        explicit.merge(&Budget::zero()),
+        sparse,
+        "经运算规范化后表示同一"
+    );
 
     // [PROD] requires 的 ≤ 逐分量（走查风险点：不许是字典序）：一个分量超了就不算盖住。
-    let lo = Requires { caps: Flat::of(&["a"]), deps: Flat::empty(), uses: Budget::of(&[("k", 5)]) };
-    let hi = Requires { caps: Flat::of(&["a", "b"]), deps: Flat::empty(), uses: Budget::of(&[("k", 2)]) };
+    let lo = Requires {
+        caps: Flat::of(&["a"]),
+        deps: Flat::empty(),
+        uses: Budget::of(&[("k", 5)]),
+    };
+    let hi = Requires {
+        caps: Flat::of(&["a", "b"]),
+        deps: Flat::empty(),
+        uses: Budget::of(&[("k", 2)]),
+    };
     assert!(!lo.leq(&hi), "caps 盖住但 uses 超出 ⇒ 不 ≤");
     assert!(!hi.leq(&lo), "uses 盖住但 caps 超出 ⇒ 不 ≤");
-    assert!(lo.leq(&Requires { caps: Flat::of(&["a", "b"]), deps: Flat::empty(), uses: Budget::of(&[("k", 5)]) }));
+    assert!(lo.leq(&Requires {
+        caps: Flat::of(&["a", "b"]),
+        deps: Flat::empty(),
+        uses: Budget::of(&[("k", 5)])
+    }));
 }
 
 /// [APP] 循环缩放＝application 规则：scale(N, body) = numeral(N) ~ body。
@@ -194,7 +258,11 @@ fn budget_vector_is_a_semimodule_over_counting() {
 #[test]
 fn loop_scaling_is_application_rule_numeral_seq_body() {
     for n in 0..=5u64 {
-        assert_eq!(Counting::numeral(n), Counting::new(n), "counting 的 numeral 就是数字");
+        assert_eq!(
+            Counting::numeral(n),
+            Counting::new(n),
+            "counting 的 numeral 就是数字"
+        );
         assert_eq!(Flat::numeral(n), Flat::empty(), "flat 的 numeral 恒为 ∅");
         for body in 0..=4u64 {
             let b = Counting::new(body);
@@ -205,7 +273,11 @@ fn loop_scaling_is_application_rule_numeral_seq_body() {
             }
             assert_eq!(Counting::scale(n, &b), rep, "缩放 ≠ N 次合并——分配律被破坏");
             for m in 0..=3u64 {
-                assert_eq!(Counting::scale(n, &Counting::scale(m, &b)), Counting::new(n * m * body), "嵌套循环界相乘");
+                assert_eq!(
+                    Counting::scale(n, &Counting::scale(m, &b)),
+                    Counting::new(n * m * body),
+                    "嵌套循环界相乘"
+                );
             }
         }
     }
@@ -214,7 +286,11 @@ fn loop_scaling_is_application_rule_numeral_seq_body() {
         assert_eq!(Flat::scale(n, &s), s, "flat 缩放恒等（含界 0 的保守方向）");
     }
     // requires 上逐分量：向量逐类乘、caps/deps 不变。
-    let r = Requires { caps: Flat::of(&["x"]), deps: Flat::of(&["svc"]), uses: Budget::of(&[("h::a", 2), ("h::b", 1)]) };
+    let r = Requires {
+        caps: Flat::of(&["x"]),
+        deps: Flat::of(&["svc"]),
+        uses: Budget::of(&[("h::a", 2), ("h::b", 1)]),
+    };
     let scaled = Requires::scale(3, &r);
     assert_eq!(scaled.caps, Flat::of(&["x"]));
     assert_eq!(scaled.deps, Flat::of(&["svc"]));
@@ -229,7 +305,7 @@ fn alphabet_lookup(handler: &str, verb: &str) -> Requires {
     match (handler, verb) {
         ("h", "a") => Requires::of(&["x"], &[], Some("h::a")), // 进预算（类 h.a）、需 x
         ("h", "b") => Requires::of(&["y"], &[], Some("h::b")), // 进预算（类 h.b）、需 y
-        ("h", "c") => Requires::of(&[], &[], None),          // 可重复：零预算、零权能
+        ("h", "c") => Requires::of(&[], &[], None),            // 可重复：零预算、零权能
         _ => unreachable!(),
     }
 }
@@ -272,11 +348,20 @@ fn occurrence_sum_overapproximates_path_max_on_all_small_plans() {
     assert!(strict > 0, "无一严格见证——分支过近似未被走到");
     // 最小严格见证：branch(a, a)——路径极大 {h.a:1}，出现之和 {h.a:2}。
     let w = Plan::branch(Plan::verb("h", "a"), Plan::verb("h", "a"));
-    assert_eq!(demand_paths(&w, &alphabet_lookup).uses, Budget::of(&[("h::a", 1)]));
-    assert_eq!(demand_sum(&w, &alphabet_lookup).uses, Budget::of(&[("h::a", 2)]));
+    assert_eq!(
+        demand_paths(&w, &alphabet_lookup).uses,
+        Budget::of(&[("h::a", 1)])
+    );
+    assert_eq!(
+        demand_sum(&w, &alphabet_lookup).uses,
+        Budget::of(&[("h::a", 2)])
+    );
     // 不同类的分支：逐类 join 与逐类 ⊕ 恰好相同（各类只出现一次）——过近似只发生在同类重复处。
     let w2 = Plan::branch(Plan::verb("h", "a"), Plan::verb("h", "b"));
-    assert_eq!(demand_paths(&w2, &alphabet_lookup).uses, demand_sum(&w2, &alphabet_lookup).uses);
+    assert_eq!(
+        demand_paths(&w2, &alphabet_lookup).uses,
+        demand_sum(&w2, &alphabet_lookup).uses
+    );
 }
 
 /// [ROW] effect row：实际可用＝位置天花板 ∩ 主体天花板；
@@ -291,7 +376,10 @@ fn effect_row_is_position_ceiling_meet_subject_ceiling() {
             for grant in &u {
                 let lhs = req.leq(&ceiling(offers, grant));
                 let rhs = req.leq(offers) && req.leq(grant);
-                assert_eq!(lhs, rhs, "交集律失效：req={req:?} offers={offers:?} grant={grant:?}");
+                assert_eq!(
+                    lhs, rhs,
+                    "交集律失效：req={req:?} offers={offers:?} grant={grant:?}"
+                );
                 checked += 1;
             }
         }
@@ -303,10 +391,31 @@ fn effect_row_is_position_ceiling_meet_subject_ceiling() {
     let lookup = |_: &str, _: &str| Requires::of(&["net"], &[], Some("cb::fetch"));
     let plan = Plan::verb("cb", "fetch");
     let b = Budget::of(&[("cb::fetch", 10)]);
-    let r = admit_plan(&plan, &lookup, &ceiling(&offers, &grant), &Flat::empty(), &b);
-    assert_eq!(r, Err(AdmitError::ExceedsCeiling { missing: Flat::of(&["net"]) }), "位置决定天花板");
-    let ok = admit_plan(&plan, &lookup, &ceiling(&Flat::of(&["net", "read_own"]), &grant), &Flat::empty(), &b);
-    assert!(ok.is_ok(), "同一主体同一动词，挂到 offers 含 net 的位置就过");
+    let r = admit_plan(
+        &plan,
+        &lookup,
+        &ceiling(&offers, &grant),
+        &Flat::empty(),
+        &b,
+    );
+    assert_eq!(
+        r,
+        Err(AdmitError::ExceedsCeiling {
+            missing: Flat::of(&["net"])
+        }),
+        "位置决定天花板"
+    );
+    let ok = admit_plan(
+        &plan,
+        &lookup,
+        &ceiling(&Flat::of(&["net", "read_own"]), &grant),
+        &Flat::empty(),
+        &b,
+    );
+    assert!(
+        ok.is_ok(),
+        "同一主体同一动词，挂到 offers 含 net 的位置就过"
+    );
 }
 
 /// [DOWN] 同意＝↓B（逐类下集）；单调性引理（effect-plan §5.4）：B′ ≤ B ⇒ ↓B′ ⊆ ↓B。
@@ -330,11 +439,39 @@ fn consent_monotonicity_downset() {
     let lookup = |_: &str, _: &str| Requires::of(&["x"], &[], Some("h::a"));
     let plan = Plan::loop_(3, Plan::verb("h", "a"));
     let ceil = Flat::of(&["x"]);
-    assert!(admit_plan(&plan, &lookup, &ceil, &Flat::empty(), &Budget::of(&[("h::a", 3)])).is_ok());
-    assert!(admit_plan(&plan, &lookup, &ceil, &Flat::empty(), &Budget::of(&[("h::a", 7), ("h::b", 1)])).is_ok());
+    assert!(
+        admit_plan(
+            &plan,
+            &lookup,
+            &ceil,
+            &Flat::empty(),
+            &Budget::of(&[("h::a", 3)])
+        )
+        .is_ok()
+    );
+    assert!(
+        admit_plan(
+            &plan,
+            &lookup,
+            &ceil,
+            &Flat::empty(),
+            &Budget::of(&[("h::a", 7), ("h::b", 1)])
+        )
+        .is_ok()
+    );
     assert_eq!(
-        admit_plan(&plan, &lookup, &ceil, &Flat::empty(), &Budget::of(&[("h::a", 2)])),
-        Err(AdmitError::OverBudget { class: "h::a".into(), demand: 3u64.into(), budget: 2u64.into() })
+        admit_plan(
+            &plan,
+            &lookup,
+            &ceil,
+            &Flat::empty(),
+            &Budget::of(&[("h::a", 2)])
+        ),
+        Err(AdmitError::OverBudget {
+            class: "h::a".into(),
+            demand: 3u64.into(),
+            budget: 2u64.into()
+        })
     );
 }
 
@@ -348,19 +485,34 @@ fn budget_is_per_effect_class_not_a_total() {
     let ceil = Flat::of(&["ui"]);
     let five_clicks = Plan::loop_(5, Plan::verb("page", "click"));
     let d = demand_sum(&five_clicks, &lookup);
-    assert_eq!(d.uses.total(), consent.total(), "总量恰好相等——单计数会误判为在预算内");
+    assert_eq!(
+        d.uses.total(),
+        consent.total(),
+        "总量恰好相等——单计数会误判为在预算内"
+    );
     assert_eq!(
         admit_plan(&five_clicks, &lookup, &ceil, &Flat::empty(), &consent),
-        Err(AdmitError::OverBudget { class: "page::click".into(), demand: 5u64.into(), budget: 4u64.into() }),
+        Err(AdmitError::OverBudget {
+            class: "page::click".into(),
+            demand: 5u64.into(),
+            budget: 4u64.into()
+        }),
         "逐类判定：click 超了就是超了，send 的余额救不了它"
     );
-    let four_and_one = Plan::Seq(vec![Plan::loop_(4, Plan::verb("page", "click")), Plan::verb("page", "send")]);
+    let four_and_one = Plan::Seq(vec![
+        Plan::loop_(4, Plan::verb("page", "click")),
+        Plan::verb("page", "send"),
+    ]);
     assert!(admit_plan(&four_and_one, &lookup, &ceil, &Flat::empty(), &consent).is_ok());
     // 未在同意里出现的效应类＝上界 0：任何一次都越界（缺席不是"无限"，是"零"）。
     let stray = Plan::verb("page", "delete");
     assert_eq!(
         admit_plan(&stray, &lookup, &ceil, &Flat::empty(), &consent),
-        Err(AdmitError::OverBudget { class: "page::delete".into(), demand: 1u64.into(), budget: 0u64.into() })
+        Err(AdmitError::OverBudget {
+            class: "page::delete".into(),
+            demand: 1u64.into(),
+            budget: 0u64.into()
+        })
     );
 }
 
@@ -370,26 +522,62 @@ fn budget_is_per_effect_class_not_a_total() {
 fn repeatable_verbs_cost_zero_via_truth_table() {
     let mut t = Declarations::new();
     t.register("page", "snapshot", VerbEntry::repeatable());
-    t.register("page", "click", VerbEntry::emitting(EmitGrade::External, true));
+    t.register(
+        "page",
+        "click",
+        VerbEntry::emitting(EmitGrade::External, true),
+    );
     let t = t.check_all().unwrap();
     let lookup = |h: &str, v: &str| -> Requires {
-        let caps: &[&str] = if v == "click" { &["input"] } else { &["dom.read"] };
+        let caps: &[&str] = if v == "click" {
+            &["input"]
+        } else {
+            &["dom.read"]
+        };
         Requires::from_table(&t, &ClassId::new(h), &VerbId::new(v), caps, &[]).unwrap()
     };
     let reads = Plan::loop_(1000, Plan::verb("page", "snapshot"));
     let clicks = Plan::loop_(1000, Plan::verb("page", "click"));
-    assert_eq!(demand_sum(&reads, &lookup).uses, Budget::zero(), "可重复读循环一千次：不占任何类");
-    assert_eq!(demand_sum(&clicks, &lookup).uses, Budget::of(&[("page::click", 1000)]));
-    assert_eq!(demand_sum(&reads, &lookup).caps, Flat::of(&["dom.read"]), "权能仍然要：flat 不因不计数而消失");
+    assert_eq!(
+        demand_sum(&reads, &lookup).uses,
+        Budget::zero(),
+        "可重复读循环一千次：不占任何类"
+    );
+    assert_eq!(
+        demand_sum(&clicks, &lookup).uses,
+        Budget::of(&[("page::click", 1000)])
+    );
+    assert_eq!(
+        demand_sum(&reads, &lookup).caps,
+        Flat::of(&["dom.read"]),
+        "权能仍然要：flat 不因不计数而消失"
+    );
     // 先读后谋：先 1000 次观察再点 3 次，同意面上只有 "page.click ≤ 3"。
-    let plan = Plan::Seq(vec![reads.clone(), Plan::loop_(3, Plan::verb("page", "click"))]);
+    let plan = Plan::Seq(vec![
+        reads.clone(),
+        Plan::loop_(3, Plan::verb("page", "click")),
+    ]);
     let ceil = Flat::of(&["dom.read", "input"]);
-    let d = admit_plan(&plan, &lookup, &ceil, &Flat::empty(), &Budget::of(&[("page::click", 3)])).unwrap();
+    let d = admit_plan(
+        &plan,
+        &lookup,
+        &ceil,
+        &Flat::empty(),
+        &Budget::of(&[("page::click", 3)]),
+    )
+    .unwrap();
     assert_eq!(d.uses, Budget::of(&[("page::click", 3)]));
-    assert!(admit_plan(&reads, &lookup, &ceil, &Flat::empty(), &Budget::zero()).is_ok(), "零预算也能读");
+    assert!(
+        admit_plan(&reads, &lookup, &ceil, &Flat::empty(), &Budget::zero()).is_ok(),
+        "零预算也能读"
+    );
     assert_eq!(
         admit_plan(&clicks, &lookup, &ceil, &Flat::empty(), &Budget::zero()),
-        Err(AdmitError::OverBudget { class: "page::click".into(), demand: 1000u64.into(), budget: 0u64.into() })
+        Err(AdmitError::OverBudget {
+            class: "page::click".into(),
+            demand: 1000u64.into(),
+            budget: 0u64.into()
+        })
     );
 }
 
@@ -401,18 +589,36 @@ fn repeatable_verbs_cost_zero_via_truth_table() {
 fn budget_merge_is_count_ra_op_and_downset_is_auth_valid() {
     for n in 0..=6u64 {
         for m in 0..=6u64 {
-            assert_eq!(Counting::new(n).merge(&Counting::new(m)).value(), Count::Value(n).op(&Count::Value(m)).value(), "⊕ ≠ Count::op within the representable range");
-            assert_eq!(Counting::new(n).leq(&Counting::new(m)), Count::Value(n).included_in(&Count::Value(m)), "≤ ≠ ≼");
+            assert_eq!(
+                Counting::new(n).merge(&Counting::new(m)).value(),
+                Count::Value(n).op(&Count::Value(m)).value(),
+                "⊕ ≠ Count::op within the representable range"
+            );
+            assert_eq!(
+                Counting::new(n).leq(&Counting::new(m)),
+                Count::Value(n).included_in(&Count::Value(m)),
+                "≤ ≠ ≼"
+            );
             let demand = Budget::of(&[("k", n)]);
             let bound = Budget::of(&[("k", m)]);
-            assert_eq!(demand.leq(&bound), auth_valid(&Count::Value(m), &Some(Count::Value(n))), "↓B ≠ auth_valid");
+            assert_eq!(
+                demand.leq(&bound),
+                auth_valid(&Count::Value(m), &Some(Count::Value(n))),
+                "↓B ≠ auth_valid"
+            );
         }
     }
     for b in 0..=6u64 {
         for spent in 0..=6u64 {
             for cost in 0..=3u64 {
-                let gate = can_mint(&Count::Value(b), &[Count::Value(spent)], &Count::Value(cost));
-                let admit = Budget::of(&[("k", spent)]).merge(&Budget::of(&[("k", cost)])).leq(&Budget::of(&[("k", b)]));
+                let gate = can_mint(
+                    &Count::Value(b),
+                    &[Count::Value(spent)],
+                    &Count::Value(cost),
+                );
+                let admit = Budget::of(&[("k", spent)])
+                    .merge(&Budget::of(&[("k", cost)]))
+                    .leq(&Budget::of(&[("k", b)]));
                 assert_eq!(gate, admit, "B={b} spent={spent} cost={cost}");
             }
         }
@@ -424,20 +630,40 @@ fn budget_merge_is_count_ra_op_and_downset_is_auth_valid() {
 /// 再串一遍运行期：同一 manifest 的计划在 offers∩grant 与逐类 ↓B 下准入。
 #[test]
 fn manifest_admission_is_set_inclusion() {
-    let mut m = Manifest { driver: "browser".into(), verbs: Default::default() };
-    m.verbs.insert("snapshot".into(), Requires::of(&["dom.read"], &[], None));
-    m.verbs.insert("click".into(), Requires::of(&["input"], &[], Some("browser::click")));
-    m.verbs.insert("download".into(), Requires::of(&["fs.write"], &["cas"], Some("browser::download")));
+    let mut m = Manifest {
+        driver: "browser".into(),
+        verbs: Default::default(),
+    };
+    m.verbs
+        .insert("snapshot".into(), Requires::of(&["dom.read"], &[], None));
+    m.verbs.insert(
+        "click".into(),
+        Requires::of(&["input"], &[], Some("browser::click")),
+    );
+    m.verbs.insert(
+        "download".into(),
+        Requires::of(&["fs.write"], &["cas"], Some("browser::download")),
+    );
 
-    let mut slot = Mount { name: "browser-slot".into(), offers: Flat::of(&["dom.read", "input"]), provides: Flat::empty() };
+    let mut slot = Mount {
+        name: "browser-slot".into(),
+        offers: Flat::of(&["dom.read", "input"]),
+        provides: Flat::empty(),
+    };
     assert_eq!(
         admit_mount(&m, &slot),
-        Err(AdmitError::VerbExceedsRow { verb: "download".into(), missing: Flat::of(&["fs.write"]) })
+        Err(AdmitError::VerbExceedsRow {
+            verb: "download".into(),
+            missing: Flat::of(&["fs.write"])
+        })
     );
     slot.offers = Flat::of(&["dom.read", "input", "fs.write"]);
     assert_eq!(
         admit_mount(&m, &slot),
-        Err(AdmitError::MissingDependency { verb: "download".into(), missing: Flat::of(&["cas"]) })
+        Err(AdmitError::MissingDependency {
+            verb: "download".into(),
+            missing: Flat::of(&["cas"])
+        })
     );
     slot.provides = Flat::of(&["cas"]);
     assert_eq!(admit_mount(&m, &slot), Ok(()));
@@ -449,12 +675,25 @@ fn manifest_admission_is_set_inclusion() {
     let ceil = ceiling(&slot.offers, &grant);
     let consent = Budget::of(&[("browser::click", 4), ("browser::download", 1)]);
     assert_eq!(
-        admit_plan(&Plan::verb("browser", "download"), &lookup, &ceil, &slot.provides, &consent),
-        Err(AdmitError::ExceedsCeiling { missing: Flat::of(&["fs.write"]) })
+        admit_plan(
+            &Plan::verb("browser", "download"),
+            &lookup,
+            &ceil,
+            &slot.provides,
+            &consent
+        ),
+        Err(AdmitError::ExceedsCeiling {
+            missing: Flat::of(&["fs.write"])
+        })
     );
-    let batch = Plan::Seq(vec![Plan::verb("browser", "snapshot"), Plan::loop_(4, Plan::verb("browser", "click"))]);
+    let batch = Plan::Seq(vec![
+        Plan::verb("browser", "snapshot"),
+        Plan::loop_(4, Plan::verb("browser", "click")),
+    ]);
     assert_eq!(
-        admit_plan(&batch, &lookup, &ceil, &slot.provides, &consent).unwrap().uses,
+        admit_plan(&batch, &lookup, &ceil, &slot.provides, &consent)
+            .unwrap()
+            .uses,
         Budget::of(&[("browser::click", 4)])
     );
 }

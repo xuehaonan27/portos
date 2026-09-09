@@ -165,7 +165,9 @@ fn assemble_tools(
     if introspect {
         if let Ok(grants) = client.grants() {
             for g in grants {
-                let Some(verb) = g["verb"].as_str() else { continue };
+                let Some(verb) = g["verb"].as_str() else {
+                    continue;
+                };
                 let family = verb.split("::").next().unwrap_or(verb);
                 if exclude.iter().any(|e| e == family) {
                     continue;
@@ -173,7 +175,11 @@ fn assemble_tools(
                 let mut def = ToolDef::new(
                     verb,
                     g["description"].as_str().unwrap_or(""),
-                    if g["schema"].is_object() { g["schema"].clone() } else { json!({"type": "object"}) },
+                    if g["schema"].is_object() {
+                        g["schema"].clone()
+                    } else {
+                        json!({"type": "object"})
+                    },
                 );
                 def.kind = g["kind"].as_str().map(String::from);
                 def.budgeted = g["budgeted"].as_bool();
@@ -301,7 +307,10 @@ fn main() -> std::io::Result<()> {
                     if verb == ARTIFACT_READ {
                         let id = a["id"].as_str().ok_or("artifact::read: missing id")?;
                         let offset = a["offset"].as_u64().unwrap_or(0);
-                        let len = a["len"].as_u64().map(|l| l.min(read_max)).unwrap_or(read_max);
+                        let len = a["len"]
+                            .as_u64()
+                            .map(|l| l.min(read_max))
+                            .unwrap_or(read_max);
                         let mut buf = Vec::new();
                         let n = client.read_to(id, offset, Some(len), &mut buf)?;
                         return Ok(json!({
@@ -319,7 +328,14 @@ fn main() -> std::io::Result<()> {
                     client.invoke(verb, a)
                 };
                 let result = portos_model_core::run_send(
-                    &*backend, &gw, &mut session, &tools, text, max_turns, &emit, &invoke,
+                    &*backend,
+                    &gw,
+                    &mut session,
+                    &tools,
+                    text,
+                    max_turns,
+                    &emit,
+                    &invoke,
                 );
                 sessions.insert(sid, session);
                 Ok(json!({"text": result?}))

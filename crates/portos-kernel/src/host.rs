@@ -2445,7 +2445,9 @@ mod m3_metadata_tests {
         assert!(!class.lookup(&VerbId::new("emit")).unwrap().withhold());
         assert!(class.lookup(&VerbId::new("send")).unwrap().withhold());
         assert!(class.lookup(&VerbId::new("legacy")).is_err());
-        assert!(check_class_declaration("p", &verbs, &json!({}), &json!({"holding_rho": 1})).is_err());
+        assert!(
+            check_class_declaration("p", &verbs, &json!({}), &json!({"holding_rho": 1})).is_err()
+        );
     }
 
     #[test]

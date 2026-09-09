@@ -27,11 +27,20 @@ fn all_budgeted(handler: &str, verb: &str) -> Requires {
 /// 是不计量的 `Let`+`Observe`（投影应把它塌缩为透明）。
 fn proto_plans_up_to_depth(depth: u32) -> Vec<ProtoPlan> {
     let leaves: Vec<Vec<Stmt>> = vec![
-        vec![Stmt::Effect { verb: "wp::a".into(), args: vec![] }],
-        vec![Stmt::Effect { verb: "wp::b".into(), args: vec![] }],
+        vec![Stmt::Effect {
+            verb: "wp::a".into(),
+            args: vec![],
+        }],
+        vec![Stmt::Effect {
+            verb: "wp::b".into(),
+            args: vec![],
+        }],
         vec![Stmt::Let {
             var: "x".into(),
-            expr: Expr::Observe { verb: "wp::list".into(), args: vec![] },
+            expr: Expr::Observe {
+                verb: "wp::list".into(),
+                args: vec![],
+            },
         }],
     ];
     let mut all: Vec<Vec<Stmt>> = leaves;
@@ -42,7 +51,10 @@ fn proto_plans_up_to_depth(depth: u32) -> Vec<ProtoPlan> {
                 next.push([p.clone(), q.clone()].concat());
                 next.push(vec![Stmt::If {
                     guard: portos_proto::Guard::Exists {
-                        expr: Box::new(Expr::Const { value: serde_json::json!([]) }) },
+                        expr: Box::new(Expr::Const {
+                            value: serde_json::json!([]),
+                        }),
+                    },
                     then_: p.clone(),
                     else_: q.clone(),
                 }]);
@@ -50,7 +62,9 @@ fn proto_plans_up_to_depth(depth: u32) -> Vec<ProtoPlan> {
             for bound in 0..=3u32 {
                 next.push(vec![Stmt::Foreach {
                     var: "x".into(),
-                    list: Expr::Const { value: serde_json::json!([]) },
+                    list: Expr::Const {
+                        value: serde_json::json!([]),
+                    },
                     bound,
                     mode: portos_proto::Mode::Strict,
                     body: p.clone(),
@@ -69,11 +83,22 @@ fn plancheck_budget_equals_demand_sum_on_all_small_plans() {
     for plan in &plans {
         let adm = admit(plan, &schemas()).unwrap();
         // plancheck 在界为 0 的循环下也会留 0 键；法则侧 Budget 规范化剔除零项。
-        let got: BTreeMap<&String, u64> =
-            adm.budget.iter().filter(|(_, n)| **n > 0).map(|(k, v)| (k, *v)).collect();
+        let got: BTreeMap<&String, u64> = adm
+            .budget
+            .iter()
+            .filter(|(_, n)| **n > 0)
+            .map(|(k, v)| (k, *v))
+            .collect();
         let law = demand_sum(&LawPlan::from_ast(&to_ast_nodes(plan)), &all_budgeted);
-        let want: BTreeMap<&String, u64> =
-            law.uses.0.iter().map(|(k, c)| (k, c.value().expect("small fixture budget"))).collect();
-        assert_eq!(got, want, "plancheck 预算 ≠ demand_sum（逐效应类）：{plan:?}");
+        let want: BTreeMap<&String, u64> = law
+            .uses
+            .0
+            .iter()
+            .map(|(k, c)| (k, c.value().expect("small fixture budget")))
+            .collect();
+        assert_eq!(
+            got, want,
+            "plancheck 预算 ≠ demand_sum（逐效应类）：{plan:?}"
+        );
     }
 }

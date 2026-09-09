@@ -36,7 +36,10 @@ impl Anthropic {
                 .to_string(),
             model: cfg["model"].as_str().unwrap_or("claude-opus-5").to_string(),
             max_tokens: cfg["max_tokens"].as_u64().unwrap_or(64000),
-            version: cfg["api_version"].as_str().unwrap_or("2023-06-01").to_string(),
+            version: cfg["api_version"]
+                .as_str()
+                .unwrap_or("2023-06-01")
+                .to_string(),
         }
     }
 
@@ -162,10 +165,7 @@ impl Backend for Anthropic {
 
 fn drain_body(stream: &EgressStream) -> String {
     let mut out = String::new();
-    while let Ok(ev) = stream
-        .rx
-        .recv_timeout(std::time::Duration::from_secs(10))
-    {
+    while let Ok(ev) = stream.rx.recv_timeout(std::time::Duration::from_secs(10)) {
         if let Some(c) = ev["chunk"].as_str() {
             out.push_str(c);
         } else {
@@ -382,12 +382,42 @@ mod tests {
     fn thinking_blocks_ride_in_raw_only() {
         let mut acc = MsgAcc::default();
         let mut sink = NullSink(String::new());
-        acc.handle("content_block_start", r#"{"index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#, &mut sink).unwrap();
-        acc.handle("content_block_delta", r#"{"index":0,"delta":{"type":"thinking_delta","thinking":"hmm"}}"#, &mut sink).unwrap();
-        acc.handle("content_block_delta", r#"{"index":0,"delta":{"type":"signature_delta","signature":"sig123"}}"#, &mut sink).unwrap();
-        acc.handle("content_block_start", r#"{"index":1,"content_block":{"type":"text","text":""}}"#, &mut sink).unwrap();
-        acc.handle("content_block_delta", r#"{"index":1,"delta":{"type":"text_delta","text":"ok"}}"#, &mut sink).unwrap();
-        acc.handle("message_delta", r#"{"delta":{"stop_reason":"end_turn"}}"#, &mut sink).unwrap();
+        acc.handle(
+            "content_block_start",
+            r#"{"index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+            &mut sink,
+        )
+        .unwrap();
+        acc.handle(
+            "content_block_delta",
+            r#"{"index":0,"delta":{"type":"thinking_delta","thinking":"hmm"}}"#,
+            &mut sink,
+        )
+        .unwrap();
+        acc.handle(
+            "content_block_delta",
+            r#"{"index":0,"delta":{"type":"signature_delta","signature":"sig123"}}"#,
+            &mut sink,
+        )
+        .unwrap();
+        acc.handle(
+            "content_block_start",
+            r#"{"index":1,"content_block":{"type":"text","text":""}}"#,
+            &mut sink,
+        )
+        .unwrap();
+        acc.handle(
+            "content_block_delta",
+            r#"{"index":1,"delta":{"type":"text_delta","text":"ok"}}"#,
+            &mut sink,
+        )
+        .unwrap();
+        acc.handle(
+            "message_delta",
+            r#"{"delta":{"stop_reason":"end_turn"}}"#,
+            &mut sink,
+        )
+        .unwrap();
         let out = acc.finish().unwrap();
         assert_eq!(out.parts.len(), 1, "thinking is not a neutral part");
         assert_eq!(out.raw[0]["thinking"], "hmm");

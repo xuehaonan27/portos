@@ -248,10 +248,7 @@ fn main() -> std::io::Result<()> {
             // caller-named topic as {"chunk"} events, closed by {"done"} (or
             // {"error"}). The caller subscribes before invoking.
             "egress::http_stream" => {
-                let topic = args["topic"]
-                    .as_str()
-                    .ok_or("missing topic")?
-                    .to_string();
+                let topic = args["topic"].as_str().ok_or("missing topic")?.to_string();
                 let sent = send(&agent, &cfg, args, None)?;
                 let status = sent.resp.status();
                 let headers = sanitize_headers(&sent.resp, &sent.strip);

@@ -18,7 +18,7 @@
 //! chat.json shape:
 //!   { "plugins": [ {"bin": "node", "args": ["…/plugin.js"], "env": {"K": "V"},
 //!                    "slot"?: {"offers": ["family::verb", …], "provides": ["family", …]}} ],
-//!     "grants":  [ {"subject"?: <the model driver>, 
+//!     "grants":  [ {"subject"?: <the model driver>,
 //!                   "resource": "driver:browser", "verbs": ["open", …]} ],
 //!     "render":  "builtin" | "none" }
 //! Relative paths in `args` resolve against `<root>` when they exist there.
@@ -64,7 +64,9 @@ pub fn run(root: &str) -> Result<(), Box<dyn std::error::Error>> {
         }
         spawn_chat_plugins(&host, &root, cfg)?;
     } else {
-        println!("[chat] no chat.json — no stack (materialize one with `portos consent` or write one)");
+        println!(
+            "[chat] no chat.json — no stack (materialize one with `portos consent` or write one)"
+        );
     }
     let modeld = host
         .verb_provider("model::start")
@@ -97,7 +99,9 @@ pub fn run(root: &str) -> Result<(), Box<dyn std::error::Error>> {
                     // The verb character rides with the activity (F4): a
                     // read and a budgeted effect read differently.
                     let tag = match d["verb_kind"].as_str() {
-                        Some(k) if d["budgeted"].as_bool() == Some(true) => format!(" ({k}, budgeted)"),
+                        Some(k) if d["budgeted"].as_bool() == Some(true) => {
+                            format!(" ({k}, budgeted)")
+                        }
                         Some(k) => format!(" ({k})"),
                         None => String::new(),
                     };
@@ -106,7 +110,11 @@ pub fn run(root: &str) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Some("tool_result") if render_builtin => {
                     let ok = d["ok"].as_bool().unwrap_or(false);
-                    println!("[tool{}] {}", if ok { "✓" } else { "✗" }, d["verb"].as_str().unwrap_or("?"));
+                    println!(
+                        "[tool{}] {}",
+                        if ok { "✓" } else { "✗" },
+                        d["verb"].as_str().unwrap_or("?")
+                    );
                     let _ = std::io::stdout().flush();
                 }
                 Some("done") => {
@@ -131,7 +139,11 @@ pub fn run(root: &str) -> Result<(), Box<dyn std::error::Error>> {
         if text == "/exit" || text == "/quit" {
             break;
         }
-        match host.call(&modeld, "model::send", json!({"session": sid, "text": text})) {
+        match host.call(
+            &modeld,
+            "model::send",
+            json!({"session": sid, "text": text}),
+        ) {
             Ok(_) => {
                 // Let the render thread finish printing this turn's events.
                 let _ = done_rx.recv_timeout(std::time::Duration::from_secs(2));
@@ -191,7 +203,11 @@ fn resolve_arg(root: &Path, arg: &str) -> String {
 
 fn str_list(v: &Value) -> Vec<String> {
     v.as_array()
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -300,7 +316,11 @@ pub fn ensure_templates(root: &Path) -> std::io::Result<()> {
     }
     let chat_json = root.join("chat.json");
     if !chat_json.exists() {
-        let bin = |n: &str| sibling(n).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        let bin = |n: &str| {
+            sibling(n)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        };
         std::fs::write(
             &chat_json,
             serde_json::to_string_pretty(&json!({
@@ -318,7 +338,10 @@ pub fn ensure_templates(root: &Path) -> std::io::Result<()> {
             }))
             .unwrap(),
         )?;
-        println!("[chat] wrote {} — the default stack is data: edit it freely", chat_json.display());
+        println!(
+            "[chat] wrote {} — the default stack is data: edit it freely",
+            chat_json.display()
+        );
     }
     Ok(())
 }
@@ -351,7 +374,9 @@ pub fn apply_grants(
                         .collect()
                 })
                 .unwrap_or_default();
-            kernel.caps.mint(&subject, resource, verbs, Default::default(), None)?;
+            kernel
+                .caps
+                .mint(&subject, resource, verbs, Default::default(), None)?;
             println!("[chat] grant: {subject} → {resource}");
         }
     }

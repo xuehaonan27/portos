@@ -52,8 +52,8 @@
 //!           （effect-plan §6.2）的类型层依据。
 //!   [EXACT] 静态用量按精确自然数计算；超出 u64 池容量的需求必须被拒，不能饱和成达标。
 
-use crate::verbs::{VerbError, VerbTable};
 use crate::identity::{ClassId, VerbId};
+use crate::verbs::{VerbError, VerbTable};
 use num_bigint::BigUint;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
@@ -210,14 +210,24 @@ impl Budget {
     }
     /// 单位向量：某效应类用一次（逐分量 use，但只在这一类上）。
     pub fn unit(class: &str) -> Self {
-        Budget([(class.to_string(), Counting::new(1))].into_iter().collect())
+        Budget(
+            [(class.to_string(), Counting::new(1))]
+                .into_iter()
+                .collect(),
+        )
     }
     /// 加权单位：某效应类记 n 个单位（按量计价：fuel 秒、字节数——F6 走查项）。
     pub fn unit_n(class: &str, n: u64) -> Self {
         Self::of(&[(class, n)])
     }
     pub fn of(entries: &[(&str, u64)]) -> Self {
-        Budget(entries.iter().filter(|(_, n)| *n > 0).map(|(k, n)| (k.to_string(), Counting::new(*n))).collect())
+        Budget(
+            entries
+                .iter()
+                .filter(|(_, n)| *n > 0)
+                .map(|(k, n)| (k.to_string(), Counting::new(*n)))
+                .collect(),
+        )
     }
     pub fn get(&self, class: &str) -> Counting {
         self.0.get(class).cloned().unwrap_or(Counting::ign())
@@ -237,7 +247,12 @@ impl Budget {
     }
     /// 标量缩放（[APP] 在向量上的形态）：numeral(n) ~ 每个分量＝逐类乘 n。
     pub fn scale(n: u64, body: &Budget) -> Budget {
-        Self::normalized(body.0.iter().map(|(k, v)| (k.clone(), Counting::scale(n, v))).collect())
+        Self::normalized(
+            body.0
+                .iter()
+                .map(|(k, v)| (k.clone(), Counting::scale(n, v)))
+                .collect(),
+        )
     }
     /// ≤ 逐分量：每一类的需求都被盖住才算盖住（缺席＝0 总被盖住）。
     pub fn leq(&self, o: &Budget) -> bool {
@@ -258,7 +273,10 @@ impl Budget {
     }
     /// 首个越界的效应类（报错点名用）。
     pub fn first_exceeding(&self, bound: &Budget) -> Option<(String, BigUint, BigUint)> {
-        self.0.iter().find(|(k, v)| !v.leq(&bound.get(k))).map(|(k, v)| (k.clone(), v.0.clone(), bound.get(k).0))
+        self.0
+            .iter()
+            .find(|(k, v)| !v.leq(&bound.get(k)))
+            .map(|(k, v)| (k.clone(), v.0.clone(), bound.get(k).0))
     }
 }
 
@@ -315,7 +333,11 @@ impl Requires {
         Ok(Requires {
             caps: Flat::of(caps),
             deps: Flat::of(deps),
-            uses: if e.bears_budget() { Budget::unit_n(&key, weight) } else { Budget::zero() },
+            uses: if e.bears_budget() {
+                Budget::unit_n(&key, weight)
+            } else {
+                Budget::zero()
+            },
         })
     }
 
@@ -324,11 +346,19 @@ impl Requires {
     }
     /// ⊕ 逐分量。
     pub fn merge(&self, o: &Self) -> Self {
-        Requires { caps: self.caps.merge(&o.caps), deps: self.deps.merge(&o.deps), uses: self.uses.merge(&o.uses) }
+        Requires {
+            caps: self.caps.merge(&o.caps),
+            deps: self.deps.merge(&o.deps),
+            uses: self.uses.merge(&o.uses),
+        }
     }
     /// [APP] 缩放逐分量：flat 分量恒等（numeral＝∅），向量分量逐类乘 n。
     pub fn scale(n: u64, body: &Self) -> Self {
-        Requires { caps: Flat::scale(n, &body.caps), deps: Flat::scale(n, &body.deps), uses: Budget::scale(n, &body.uses) }
+        Requires {
+            caps: Flat::scale(n, &body.caps),
+            deps: Flat::scale(n, &body.deps),
+            uses: Budget::scale(n, &body.uses),
+        }
     }
     /// ≤ **逐分量**（不是字典序）：三个分量各自被盖住才算盖住。
     pub fn leq(&self, o: &Self) -> bool {
@@ -336,7 +366,11 @@ impl Requires {
     }
     /// join 逐分量（实例级附加）。
     pub fn join(&self, o: &Self) -> Self {
-        Requires { caps: self.caps.join(&o.caps), deps: self.deps.join(&o.deps), uses: self.uses.join(&o.uses) }
+        Requires {
+            caps: self.caps.join(&o.caps),
+            deps: self.deps.join(&o.deps),
+            uses: self.uses.join(&o.uses),
+        }
     }
     /// [DOWN] demand ∈ ↓B：同意向量逐类盖住了需求向量（权能分量走 [ROW]，不在此）。
     pub fn covered_by_budget(&self, budget: &Budget) -> bool {
@@ -363,10 +397,16 @@ pub enum Plan {
 #[cfg(feature = "plan-shapes")]
 impl Plan {
     pub fn verb(handler: &str, verb: &str) -> Plan {
-        Plan::Verb { handler: handler.into(), verb: verb.into() }
+        Plan::Verb {
+            handler: handler.into(),
+            verb: verb.into(),
+        }
     }
     pub fn loop_(bound: u64, body: Plan) -> Plan {
-        Plan::Loop { bound, body: Box::new(body) }
+        Plan::Loop {
+            bound,
+            body: Box::new(body),
+        }
     }
     pub fn branch(a: Plan, b: Plan) -> Plan {
         Plan::Branch(Box::new(a), Box::new(b))
@@ -382,7 +422,9 @@ pub type Lookup<'a> = dyn Fn(&str, &str) -> Requires + 'a;
 pub fn demand_sum(plan: &Plan, lookup: &Lookup) -> Requires {
     match plan {
         Plan::Verb { handler, verb } => lookup(handler, verb),
-        Plan::Seq(items) => items.iter().fold(Requires::ign(), |acc, p| acc.merge(&demand_sum(p, lookup))),
+        Plan::Seq(items) => items
+            .iter()
+            .fold(Requires::ign(), |acc, p| acc.merge(&demand_sum(p, lookup))),
         Plan::Loop { bound, body } => Requires::scale(*bound, &demand_sum(body, lookup)),
         // 过近似点：两条分支都算进去（B̂ ≥ B 的来源）。
         Plan::Branch(a, b) => demand_sum(a, lookup).merge(&demand_sum(b, lookup)),
@@ -395,7 +437,9 @@ pub fn demand_sum(plan: &Plan, lookup: &Lookup) -> Requires {
 pub fn demand_paths(plan: &Plan, lookup: &Lookup) -> Requires {
     match plan {
         Plan::Verb { handler, verb } => lookup(handler, verb),
-        Plan::Seq(items) => items.iter().fold(Requires::ign(), |acc, p| acc.merge(&demand_paths(p, lookup))),
+        Plan::Seq(items) => items.iter().fold(Requires::ign(), |acc, p| {
+            acc.merge(&demand_paths(p, lookup))
+        }),
         Plan::Loop { bound, body } => Requires::scale(*bound, &demand_paths(body, lookup)),
         Plan::Branch(a, b) => demand_paths(a, lookup).join(&demand_paths(b, lookup)),
     }
@@ -417,7 +461,10 @@ pub enum AstNode {
     /// 有界循环（effect-plan §3：界是静态的）。
     Loop { bound: u64, body: Vec<AstNode> },
     /// 分支（两臂都计——B̂ 的过近似点）。
-    Branch { then: Vec<AstNode>, else_: Vec<AstNode> },
+    Branch {
+        then: Vec<AstNode>,
+        else_: Vec<AstNode>,
+    },
     /// 顺序。
     Seq(Vec<AstNode>),
     /// 不计量的语句（Let/Observe/Pure）：投影为透明。
@@ -433,7 +480,10 @@ impl Plan {
             match n {
                 AstNode::Effect { verb } => {
                     let (handler, v) = verb.split_once("::").unwrap_or(("kernel", verb));
-                    Plan::Verb { handler: handler.into(), verb: v.into() }
+                    Plan::Verb {
+                        handler: handler.into(),
+                        verb: v.into(),
+                    }
                 }
                 AstNode::Loop { bound, body } => Plan::loop_(*bound, Plan::from_ast(body)),
                 AstNode::Branch { then, else_ } => {
@@ -476,7 +526,11 @@ pub enum AdmitError {
     /// 运行期：计划总需求依赖的服务不在提供面内。
     UnmetDependency { missing: Flat },
     /// [DOWN] 运行期：某效应类的用量不在 ↓B 内（点名类——同意面逐类渲染，报错也逐类）。
-    OverBudget { class: String, demand: BigUint, budget: BigUint },
+    OverBudget {
+        class: String,
+        demand: BigUint,
+        budget: BigUint,
+    },
 }
 
 /// [ROW] 装载期准入（roadmap Phase C"廉价版"原样）：∀ 动词，requires.caps ⊆ offers 且 deps ⊆ provides。
@@ -484,10 +538,16 @@ pub enum AdmitError {
 pub fn admit_mount(m: &Manifest, mount: &Mount) -> Result<(), AdmitError> {
     for (verb, req) in &m.verbs {
         if !req.caps.leq(&mount.offers) {
-            return Err(AdmitError::VerbExceedsRow { verb: verb.clone(), missing: req.caps.minus(&mount.offers) });
+            return Err(AdmitError::VerbExceedsRow {
+                verb: verb.clone(),
+                missing: req.caps.minus(&mount.offers),
+            });
         }
         if !req.deps.leq(&mount.provides) {
-            return Err(AdmitError::MissingDependency { verb: verb.clone(), missing: req.deps.minus(&mount.provides) });
+            return Err(AdmitError::MissingDependency {
+                verb: verb.clone(),
+                missing: req.deps.minus(&mount.provides),
+            });
         }
     }
     Ok(())
@@ -510,13 +570,21 @@ pub fn admit_plan(
 ) -> Result<Requires, AdmitError> {
     let d = demand_sum(plan, lookup);
     if !d.caps.leq(ceiling) {
-        return Err(AdmitError::ExceedsCeiling { missing: d.caps.minus(ceiling) });
+        return Err(AdmitError::ExceedsCeiling {
+            missing: d.caps.minus(ceiling),
+        });
     }
     if !d.deps.leq(provides) {
-        return Err(AdmitError::UnmetDependency { missing: d.deps.minus(provides) });
+        return Err(AdmitError::UnmetDependency {
+            missing: d.deps.minus(provides),
+        });
     }
     if let Some((class, demand, bound)) = d.uses.first_exceeding(budget) {
-        return Err(AdmitError::OverBudget { class, demand, budget: bound });
+        return Err(AdmitError::OverBudget {
+            class,
+            demand,
+            budget: bound,
+        });
     }
     Ok(d)
 }

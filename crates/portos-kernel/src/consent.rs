@@ -138,7 +138,10 @@ mod tests {
         let mut tampered = rec.clone();
         tampered.budget.insert("echo::emit".into(), 3000);
         assert!(tampered.verify(&key, 2).is_err());
-        assert!(rec.verify(&key, 1 + 3601).is_err(), "expired consent refused");
+        assert!(
+            rec.verify(&key, 1 + 3601).is_err(),
+            "expired consent refused"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

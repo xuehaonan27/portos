@@ -113,7 +113,9 @@ fn restore_requires_all_rows_pools_and_parent_edges_to_agree() {
         Box::new(|s| s.classes.clear()),
         Box::new(|s| s.holdings[0].parent = Some(s.holdings[1].id)),
         Box::new(|s| s.holdings[1].parent = Some(HoldingId::try_from(99u64).unwrap())),
-        Box::new(|s| s.holdings[0].state = portos_rm::cleanup::HoldingState::Retired(Timestamp::ZERO)),
+        Box::new(|s| {
+            s.holdings[0].state = portos_rm::cleanup::HoldingState::Retired(Timestamp::ZERO)
+        }),
         Box::new(|s| s.holdings[0].lease = Lease::ParentBound),
         Box::new(|s| s.holdings[0].generation = Generation::new("")),
         Box::new(|s| s.holdings[0].frag = Frag::Ex(Ex::Token)),
