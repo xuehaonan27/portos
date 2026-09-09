@@ -359,7 +359,8 @@ pub struct AttachState {
     pub h_attach: String,
     pub status: Status,
     pub consecutive_failures: u64,
-    pub root: HoldingId,
+    pub root: HoldingHandle,
+    pools: BTreeMap<EffectClass, PoolRef<Count>>,
     pub last_fire_at: Option<u64>,
     pub last_tick: u64,
     pub firings: Vec<FiringRecord>,
@@ -393,10 +394,6 @@ impl FiringKey {
         }
     }
 }
-struct AttachmentResources {
-    root: HoldingHandle,
-    pools: BTreeMap<EffectClass, PoolRef<Count>>,
-}
 struct FiringResources {
     fire: HoldingHandle,
     spent: Vec<HoldingHandle>,
@@ -418,7 +415,6 @@ pub struct Scheduler {
     pub crashed: bool,
     next_event_id: u64,
     next_pool: u64,
-    resources: BTreeMap<AttachmentId, AttachmentResources>,
     firing_resources: BTreeMap<FiringKey, FiringResources>,
     queues: BTreeMap<String, VecDeque<Event>>,
     inflight: BTreeMap<String, InFlight>,
@@ -538,7 +534,6 @@ impl Scheduler {
             crashed: false,
             next_event_id: 1,
             next_pool: 0,
-            resources: BTreeMap::new(),
             firing_resources: BTreeMap::new(),
             queues: BTreeMap::new(),
             inflight: BTreeMap::new(),
@@ -579,7 +574,7 @@ impl Scheduler {
         }
     }
     fn total_pool(&self, id: &str, class: &str) -> &PoolRef<Count> {
-        &self.resources[&AttachmentId::new(id)].pools[&EffectClass::new(class)]
+        &self.attachments[id].pools[&EffectClass::new(class)]
     }
     fn firing_pool(&self, id: &str, seq: u64, class: &str) -> Option<&PoolRef<Count>> {
         self.firing_resources
@@ -674,15 +669,7 @@ impl Scheduler {
                     now: Timestamp::try_from(now).unwrap(),
                 },
             )
-            .map(|h| h.id())
             .map_err(AttachError::Ledger)?;
-        self.resources.insert(
-            AttachmentId::new(&id),
-            AttachmentResources {
-                root: self.ledger.holding(root).unwrap().handle(),
-                pools,
-            },
-        );
         // 触发器持有（租约 None、随根走）。
         match &decl.trigger {
             Trigger::Topic { topic } => {
@@ -710,8 +697,7 @@ impl Scheduler {
                             owner: SubjectId::new(&subject),
                             claim: Claim::new(Ex::Token).unwrap(),
                             generation: Generation::new("g"),
-                            parent: Some(root)
-                                .map(|id| self.ledger.holding(id).expect("parent exists").handle()),
+                            parent: Some(root.clone()),
                             lease: LeaseRequest::UseClassDefault,
                             now: Timestamp::try_from(now).unwrap(),
                         },
@@ -743,8 +729,7 @@ impl Scheduler {
                             owner: SubjectId::new(&subject),
                             claim: Claim::new(Ex::Token).unwrap(),
                             generation: Generation::new("g"),
-                            parent: Some(root)
-                                .map(|id| self.ledger.holding(id).expect("parent exists").handle()),
+                            parent: Some(root.clone()),
                             lease: LeaseRequest::UseClassDefault,
                             now: Timestamp::try_from(now).unwrap(),
                         },
@@ -779,8 +764,7 @@ impl Scheduler {
                     owner: SubjectId::new(&subject),
                     claim: Claim::new(Ex::Token).unwrap(),
                     generation: Generation::new("g"),
-                    parent: Some(root)
-                        .map(|id| self.ledger.holding(id).expect("parent exists").handle()),
+                    parent: Some(root.clone()),
                     lease: LeaseRequest::UseClassDefault,
                     now: Timestamp::try_from(now).unwrap(),
                 },
@@ -795,6 +779,7 @@ impl Scheduler {
                 status: Status::Active,
                 consecutive_failures: 0,
                 root,
+                pools,
                 last_fire_at: None,
                 last_tick: now,
                 firings: Vec::new(),
@@ -906,7 +891,7 @@ impl Scheduler {
         let expired: Vec<String> = self
             .attachments
             .values()
-            .filter(|a| !a.status.is_terminal() && released.contains(&a.root))
+            .filter(|a| !a.status.is_terminal() && released.contains(&a.root.id()))
             .map(|a| a.decl.id.clone())
             .collect();
         for id in expired {
@@ -955,10 +940,10 @@ impl Scheduler {
 
     /// [Q12] 已触发次数＝存活 fire 碎片行数（含恢复为空跑的）。
     pub fn fired_count(&self, id: &str) -> u64 {
-        let Some(resources) = self.resources.get(&AttachmentId::new(id)) else {
+        let Some(attachment) = self.attachments.get(id) else {
             return 0;
         };
-        let key = resources.pools[&EffectClass::new(FIRE_CLASS)].id().key();
+        let key = attachment.pools[&EffectClass::new(FIRE_CLASS)].id().key();
         self.ledger.active().filter(|h| &h.key() == key).count() as u64
     }
 
@@ -1120,7 +1105,7 @@ impl Scheduler {
         let h_attach = self.attachments[id].h_attach.clone();
         let nonce = derive_nonce(&h_attach, seq);
         let seg = seg_subject(id, seq);
-        let root = self.attachments[id].root;
+        let root = self.attachments[id].root.clone();
         self.ledger
             .declare_instantiation(SubjectId::new(&seg), SubjectId::new(&attach_subject(id)));
         self.ledger
@@ -1147,8 +1132,7 @@ impl Scheduler {
                     owner: SubjectId::new(&seg),
                     claim: Claim::new(Ex::Token).unwrap(),
                     generation: Generation::new(&nonce),
-                    parent: Some(root)
-                        .map(|id| self.ledger.holding(id).expect("parent exists").handle()),
+                    parent: Some(root.clone()),
                     lease: LeaseRequest::UseClassDefault,
                     now: Timestamp::try_from(now).unwrap(),
                 },
@@ -1160,7 +1144,7 @@ impl Scheduler {
         // ---- 派生四元组：ttl_i = min(now + run_cap, 根租约到期) ----
         let lease_end = self
             .ledger
-            .holding(root)
+            .holding(root.id())
             .and_then(|h| h.lease.expires_at().map(|t| t.get()))
             .unwrap_or(u64::MAX);
         let run_cap = self.attachments[id].decl.run_cap;
@@ -1421,7 +1405,7 @@ impl Scheduler {
                 self.settle(id, seq, inflight_end, now);
             }
         }
-        let root = self.resources[&AttachmentId::new(id)].root.clone();
+        let root = self.attachments[id].root.clone();
         teardown_handles(
             &mut self.ledger,
             &mut Journal::default(),
@@ -1429,7 +1413,7 @@ impl Scheduler {
             &[root],
             Timestamp::try_from(now).unwrap(),
         );
-        let mut pools: Vec<_> = self.resources[&AttachmentId::new(id)]
+        let mut pools: Vec<_> = self.attachments[id]
             .pools
             .values()
             .cloned()
@@ -1626,9 +1610,9 @@ impl Scheduler {
     /// outstanding 的真相：按池实例折叠存活碎片行。
     pub fn recompute_outstanding(&self) -> BTreeMap<String, u64> {
         let mut out: BTreeMap<String, u64> = BTreeMap::new();
-        for ((class, inst), _) in self.ledger_capacities() {
-            if class == CLASS_POOL {
-                out.insert(inst, 0);
+        for pool in self.ledger.snapshot().pools {
+            if pool.key.class().as_str() == CLASS_POOL {
+                out.insert(pool.key.instance().to_string(), 0);
             }
         }
         for h in self
@@ -1641,20 +1625,6 @@ impl Scheduler {
             }
         }
         out
-    }
-
-    fn ledger_capacities(&self) -> Vec<((String, String), Frag)> {
-        self.ledger
-            .snapshot()
-            .pools
-            .into_iter()
-            .map(|p| {
-                (
-                    (p.key.class().to_string(), p.key.instance().to_string()),
-                    p.capacity,
-                )
-            })
-            .collect()
     }
 
     /// 触发池是否已关闭（容量置 0 ⇒ `can_mint` 对任何正值拒）。
@@ -1757,8 +1727,7 @@ impl Scheduler {
                 }
             }
             if a.status.is_terminal() {
-                let resources = &self.resources[&AttachmentId::new(id)];
-                let mut handles = vec![resources.root.clone()];
+                let mut handles = vec![a.root.clone()];
                 for (_, r) in self
                     .firing_resources
                     .iter()
@@ -1773,7 +1742,7 @@ impl Scheduler {
                 {
                     return Err(format!("{id}: terminal but associated rows remain"));
                 }
-                for pool in resources.pools.values() {
+                for pool in a.pools.values() {
                     if self.ledger.capacity(pool.id().key()) != Some(&Frag::Count(Count::Value(0)))
                     {
                         return Err(format!("{id}: terminal but associated pool is not closed"));

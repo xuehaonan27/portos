@@ -143,45 +143,37 @@ pub fn workspace() -> Entry {
         t.declare_class(c, RevertGrade::Inverse).unwrap();
     }
     let held = || VerbEntry::consuming(ConsumeGrade::Held);
-    t.register("vm", "spawn", held()).unwrap();
-    t.register("vm", "exec", VerbEntry::transforming()).unwrap(); // [CEFF] 界内变换
-    t.register("vm", "write_file", VerbEntry::transforming())
-        .unwrap();
+    t.register("vm", "spawn", held());
+    t.register("vm", "exec", VerbEntry::transforming()); // [CEFF] 界内变换
+    t.register("vm", "write_file", VerbEntry::transforming());
     t.register(
         "vm",
         "pause",
         VerbEntry::transforming().with_flags(true, false),
-    )
-    .unwrap(); // 幂等变换
+    ); // 幂等变换
     t.register(
         "vm",
         "resume",
         VerbEntry::transforming().with_flags(true, false),
-    )
-    .unwrap();
+    );
     t.register(
         "vm",
         "restore",
         VerbEntry::transforming().with_flags(true, false),
-    )
-    .unwrap(); // 幂等：恢复到同一快照
-    t.register("vm", "read_file", VerbEntry::repeatable())
-        .unwrap();
-    t.register("vm", "inspect", VerbEntry::repeatable())
-        .unwrap();
-    t.register("vm", "copy_out", VerbEntry::repeatable())
-        .unwrap(); // 读入：taint 归数据面
-    t.register("snapshot", "snapshot", held()).unwrap(); // 快照是一笔占盘的持有
-    t.register("mount", "mount", held()).unwrap();
-    t.register("tap", "attach", held()).unwrap();
-    t.register("proc", "spawn", held()).unwrap();
+    ); // 幂等：恢复到同一快照
+    t.register("vm", "read_file", VerbEntry::repeatable());
+    t.register("vm", "inspect", VerbEntry::repeatable());
+    t.register("vm", "copy_out", VerbEntry::repeatable()); // 读入：taint 归数据面
+    t.register("snapshot", "snapshot", held()); // 快照是一笔占盘的持有
+    t.register("mount", "mount", held());
+    t.register("tap", "attach", held());
+    t.register("proc", "spawn", held());
     // 出网：外部发射、可摊销（一次同意批量出网），必经 egress 代理（policy 的 (verb,target) 范围）。
     t.register(
         "vm",
         "net_send",
         VerbEntry::emitting(EmitGrade::External, true),
-    )
-    .unwrap();
+    );
     let t = t.check_all().unwrap();
 
     let mut m = Manifest {
@@ -375,45 +367,39 @@ pub fn rdma() -> Entry {
         t.declare_class(c, RevertGrade::Inverse).unwrap();
     }
     let held = || VerbEntry::consuming(ConsumeGrade::Held);
-    t.register("device", "open_device", held().with_flags(false, true))
-        .unwrap();
-    t.register("pd", "alloc_pd", held()).unwrap();
-    t.register("cq", "create_cq", held()).unwrap();
+    t.register("device", "open_device", held().with_flags(false, true));
+    t.register("pd", "alloc_pd", held());
+    t.register("cq", "create_cq", held());
     t.register(
         "cq",
         "poll_cq",
         VerbEntry::consuming(ConsumeGrade::External),
-    )
-    .unwrap(); // 出队即消耗
-    t.register("mr", "reg_mr", held()).unwrap(); // 本地注册：持有
-    t.register("mr", "bind_mw", held()).unwrap(); // memory window：子区间持有
+    ); // 出队即消耗
+    t.register("mr", "reg_mr", held()); // 本地注册：持有
+    t.register("mr", "bind_mw", held()); // memory window：子区间持有
     // 真正的发射点：把内存暴露给远端。硬清单（不可摊销）——逐次同意；ibverbs 里与 reg_mr 同一
     // 调用，我们的接口拆开——中介点就在这里。
     t.register(
         "mr",
         "grant_remote_access",
         VerbEntry::emitting(EmitGrade::External, false),
-    )
-    .unwrap();
-    t.register("qp", "create_qp", held()).unwrap();
-    t.register("qp", "init", VerbEntry::transforming()).unwrap(); // 状态迁移：界内变换
-    t.register("qp", "rtr", VerbEntry::transforming()).unwrap();
-    t.register("qp", "rts", VerbEntry::transforming()).unwrap();
-    t.register("qp", "post_recv", VerbEntry::transforming())
-        .unwrap(); // 往本地队列放缓冲
+    );
+    t.register("qp", "create_qp", held());
+    t.register("qp", "init", VerbEntry::transforming()); // 状态迁移：界内变换
+    t.register("qp", "rtr", VerbEntry::transforming());
+    t.register("qp", "rts", VerbEntry::transforming());
+    t.register("qp", "post_recv", VerbEntry::transforming()); // 往本地队列放缓冲
     t.register(
         "qp",
         "post_send",
         VerbEntry::emitting(EmitGrade::External, true),
-    )
-    .unwrap(); // RDMA WRITE 到远端
+    ); // RDMA WRITE 到远端
     t.register(
         "qp",
         "rdma_read",
         VerbEntry::emitting(EmitGrade::External, true),
-    )
-    .unwrap(); // 请求出界，数据带 taint 回流
-    t.register("qp", "query", VerbEntry::repeatable()).unwrap();
+    ); // 请求出界，数据带 taint 回流
+    t.register("qp", "query", VerbEntry::repeatable());
     // 协议：QP 状态机。post_send/post_recv 只在 rts 合法；query 不在辖域（任何状态可查）。
     let qp_proto = ProtocolDraft::new("reset")
         .transition("reset", "init", "init")

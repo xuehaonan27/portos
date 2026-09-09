@@ -369,8 +369,8 @@ fn budget_is_per_effect_class_not_a_total() {
 #[test]
 fn repeatable_verbs_cost_zero_via_truth_table() {
     let mut t = Declarations::new();
-    t.register("page", "snapshot", VerbEntry::repeatable()).unwrap();
-    t.register("page", "click", VerbEntry::emitting(EmitGrade::External, true)).unwrap();
+    t.register("page", "snapshot", VerbEntry::repeatable());
+    t.register("page", "click", VerbEntry::emitting(EmitGrade::External, true));
     let t = t.check_all().unwrap();
     let lookup = |h: &str, v: &str| -> Requires {
         let caps: &[&str] = if v == "click" { &["input"] } else { &["dom.read"] };

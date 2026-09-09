@@ -493,7 +493,7 @@ fn names_with_separators_cannot_alias_budgets_or_cleanup_scopes() {
         assert_eq!(s.inflight_seq(id), Some(1));
         assert_eq!(s.total_spent(id, class), 2);
         assert!(!s.firing_pool_closed(id, 1, class));
-        assert!(s.ledger.holding(s.attachments[*id].root).unwrap().state.is_active());
+        assert!(s.ledger.holding(s.attachments[*id].root.id()).unwrap().state.is_active());
     }
     s.invariants().unwrap();
     s.crash();

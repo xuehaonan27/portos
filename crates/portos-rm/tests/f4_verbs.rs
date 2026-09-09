@@ -49,52 +49,44 @@ fn browser_verb_table() -> VerbTable {
 
     // page：持有（attach）＋可重复读（snapshot）＋可摊销外部发射（click/type）
     //       ＋硬清单发射（submit，逐次同意）＋其降档（submit_draft，可补偿）。
-    t.register("page", "attach", held()).unwrap();
-    t.register("page", "snapshot", VerbEntry::repeatable())
-        .unwrap();
-    t.register("page", "click", ext(true)).unwrap();
-    t.register("page", "type", ext(true)).unwrap();
-    t.register("page", "submit", ext(false).degrades_to("submit_draft"))
-        .unwrap();
-    t.register("page", "submit_draft", comp("discard_draft", true))
-        .unwrap();
-    t.register("page", "discard_draft", ext(true)).unwrap();
+    t.register("page", "attach", held());
+    t.register("page", "snapshot", VerbEntry::repeatable());
+    t.register("page", "click", ext(true));
+    t.register("page", "type", ext(true));
+    t.register("page", "submit", ext(false).degrades_to("submit_draft"));
+    t.register("page", "submit_draft", comp("discard_draft", true));
+    t.register("page", "discard_draft", ext(true));
     // 其余持有类各一个获取动词（Consuming/Held）＋零星动作。
-    t.register("proc", "spawn", held()).unwrap();
-    t.register("proc", "signal", ext(true)).unwrap();
-    t.register("tcp-port", "bind", held()).unwrap();
-    t.register("tcp-port", "probe", VerbEntry::repeatable())
-        .unwrap();
-    t.register("workspace", "mkdir", held()).unwrap();
-    t.register("enclosure", "open", held()).unwrap();
-    t.register("reservation", "reserve", held()).unwrap();
+    t.register("proc", "spawn", held());
+    t.register("proc", "signal", ext(true));
+    t.register("tcp-port", "bind", held());
+    t.register("tcp-port", "probe", VerbEntry::repeatable());
+    t.register("workspace", "mkdir", held());
+    t.register("enclosure", "open", held());
+    t.register("reservation", "reserve", held());
     // socket 之教训：同一类下 connect 持有、recv 消耗（外部）、send 发射（外部、可摊销）。
-    t.register("socket", "connect", held()).unwrap();
+    t.register("socket", "connect", held());
     t.register(
         "socket",
         "recv",
         VerbEntry::consuming(ConsumeGrade::External),
-    )
-    .unwrap();
-    t.register("socket", "send", ext(true)).unwrap();
+    );
+    t.register("socket", "send", ext(true));
     // mail：无持有；send 是硬清单（机密跨域出境）⇒ 不可摊销。
-    t.register("mail", "send", ext(false)).unwrap();
+    t.register("mail", "send", ext(false));
     // bus：界内消息，同名 send 可补偿（retract）——D1 的对照组。
-    t.register("bus", "send", comp("retract", true)).unwrap();
-    t.register("bus", "retract", ext(true)).unwrap();
+    t.register("bus", "send", comp("retract", true));
+    t.register("bus", "retract", ext(true));
     // doc：可重复读＋降档声明（F3 attenuate 的表侧来源）。
     t.register(
         "doc",
         "read_full",
         VerbEntry::repeatable().degrades_to("read_preview"),
-    )
-    .unwrap();
-    t.register("doc", "read_preview", VerbEntry::repeatable())
-        .unwrap();
+    );
+    t.register("doc", "read_preview", VerbEntry::repeatable());
     // api：可补偿发射＋其补偿动词。
-    t.register("api", "post", comp("post_cancel", true))
-        .unwrap();
-    t.register("api", "post_cancel", ext(true)).unwrap();
+    t.register("api", "post", comp("post_cancel", true));
+    t.register("api", "post_cancel", ext(true));
     t.check_all().unwrap()
 }
 
@@ -224,13 +216,12 @@ fn coherence_lattice_exhaustive_over_kind_and_flags() {
 fn d1_same_verb_two_handlers_projections_differ() {
     let mut t = browser_verb_table();
     let mut extra = Declarations::new();
-    extra.register("cas", "read", VerbEntry::repeatable()).unwrap();
+    extra.register("cas", "read", VerbEntry::repeatable());
     extra.register(
         "queue",
         "read",
         VerbEntry::consuming(ConsumeGrade::External),
-    )
-    .unwrap();
+    );
     for class in ["cas", "queue"] { t.insert(extra.check_all().unwrap().class(&ClassId::new(class)).unwrap().clone()).unwrap(); }
     assert!(!t.lookup(&ClassId::new("cas"), &VerbId::new("read")).unwrap().bears_budget());
     assert!(
@@ -244,18 +235,18 @@ fn d1_same_verb_two_handlers_projections_differ() {
     );
 
     // B6 墓碑：同名 send 的扣发地位随 handler 而异——按类投影才保得住 D1。
-    assert!(t.derive_handler_policy(&ClassId::new("mail")).unwrap().withhold.contains("send"));
-    assert!(!t.derive_handler_policy(&ClassId::new("bus")).unwrap().withhold.contains("send"));
-    assert!(!t.derive_handler_policy(&ClassId::new("socket")).unwrap().withhold.contains("send"));
+    assert!(t.derive_handler_policy(&ClassId::new("mail")).unwrap().withhold().contains("send"));
+    assert!(!t.derive_handler_policy(&ClassId::new("bus")).unwrap().withhold().contains("send"));
+    assert!(!t.derive_handler_policy(&ClassId::new("socket")).unwrap().withhold().contains("send"));
     for h in ["mail", "bus", "socket"] {
         assert!(
-            t.derive_handler_policy(&ClassId::new(h)).unwrap().budget.contains("send"),
+            t.derive_handler_policy(&ClassId::new(h)).unwrap().budget().contains("send"),
             "{h}.send 都进预算"
         );
     }
     assert_eq!(
         t.derive_handler_policy(&ClassId::new("bus")).unwrap()
-            .compensations
+            .compensations()
             .get("send")
             .map(String::as_str),
         Some("retract")
@@ -344,8 +335,8 @@ fn withhold_iff_non_amortizable_staged_shape_iff_external() {
     assert!(!post.staged_shape() && !post.withhold());
     // 可补偿但在硬清单上（删除→可从回收站恢复）：不是两阶段形状，但仍逐次同意。
     let mut s = Declarations::new();
-    s.register("fs", "delete", comp("restore", false)).unwrap();
-    s.register("fs", "restore", ext(true)).unwrap();
+    s.register("fs", "delete", comp("restore", false));
+    s.register("fs", "restore", ext(true));
     let s = s.check_all().unwrap();
     let del = s.lookup(&ClassId::new("fs"), &VerbId::new("delete")).unwrap();
     assert!(
@@ -361,14 +352,14 @@ fn degrade_declared_and_only_narrows() {
     let t = browser_verb_table(); // 含 read_full→read_preview、submit→submit_draft，check_all 已过
     assert_eq!(
         t.derive_handler_policy(&ClassId::new("doc")).unwrap()
-            .degrade
+            .degrade()
             .get("read_full")
             .map(String::as_str),
         Some("read_preview")
     );
     assert_eq!(
         t.derive_handler_policy(&ClassId::new("page")).unwrap()
-            .degrade
+            .degrade()
             .get("submit")
             .map(String::as_str),
         Some("submit_draft")
@@ -376,14 +367,13 @@ fn degrade_declared_and_only_narrows() {
 
     // 升档伪装成降档：submit_draft（可补偿、可摊销）→ submit（外部、硬清单）——拒。
     let mut u = Declarations::new();
-    u.register("page", "submit", ext(false)).unwrap();
+    u.register("page", "submit", ext(false));
     u.register(
         "page",
         "submit_draft",
         comp("discard", true).degrades_to("submit"),
-    )
-    .unwrap();
-    u.register("page", "discard", ext(true)).unwrap();
+    );
+    u.register("page", "discard", ext(true));
     assert!(
         matches!(u.check_all(), Err(VerbError::Incoherent(_))),
         "降档不得升严重度"
@@ -395,11 +385,9 @@ fn degrade_declared_and_only_narrows() {
         "doc",
         "read_full",
         VerbEntry::repeatable().degrades_to("read_preview"),
-    )
-    .unwrap();
+    );
     assert!(matches!(v.check_all(), Err(VerbError::Incoherent(_))));
-    v.register("other", "read_preview", VerbEntry::repeatable())
-        .unwrap();
+    v.register("other", "read_preview", VerbEntry::repeatable());
     assert!(
         matches!(v.check_all(), Err(VerbError::Incoherent(_))),
         "跨类目标不算"
@@ -411,7 +399,7 @@ fn degrade_declared_and_only_narrows() {
 #[test]
 fn held_requires_declared_class_rho_and_rho_is_immutable() {
     let mut t = Declarations::new();
-    t.register("port", "bind", held()).unwrap();
+    t.register("port", "bind", held());
     assert!(matches!(t.check_all(), Err(VerbError::ClassNotDeclared)));
     t.declare_class("port", RevertGrade::Inverse).unwrap();
     assert_eq!(
@@ -421,9 +409,9 @@ fn held_requires_declared_class_rho_and_rho_is_immutable() {
     assert_eq!(t.check_all().unwrap().derive_holding_grade(&ClassId::new("port")), Some(RevertGrade::Inverse));
     // 补偿动词自己又要补偿——链不闭合，拒。
     let mut c = Declarations::new();
-    c.register("api", "post", comp("cancel", true)).unwrap();
-    c.register("api", "cancel", comp("uncancel", true)).unwrap();
-    c.register("api", "uncancel", ext(true)).unwrap();
+    c.register("api", "post", comp("cancel", true));
+    c.register("api", "cancel", comp("uncancel", true));
+    c.register("api", "uncancel", ext(true));
     assert!(matches!(c.check_all(), Err(VerbError::Incoherent(_))));
 }
 
@@ -524,14 +512,14 @@ fn truth_table_is_shared_source_for_f2_teardown_and_f3_monitor() {
     // ---- 投影到 F3：page handler 的策略 → Policy，跑一批自治动作 ----
     let hp = t.derive_handler_policy(&ClassId::new("page")).unwrap();
     assert_eq!(
-        hp.withhold,
-        ["submit".to_string()].into_iter().collect(),
+        hp.withhold(),
+        &["submit".to_string()].into_iter().collect(),
         "只有硬清单进扣发集"
     );
     assert!(
-        hp.budget.contains("click")
-            && hp.budget.contains("submit")
-            && !hp.budget.contains("snapshot")
+        hp.budget().contains("click")
+            && hp.budget().contains("submit")
+            && !hp.budget().contains("snapshot")
     );
     let mut pol = Policy::from_checked(&hp);
     for v in ["click", "type", "submit", "submit_draft"] {
@@ -565,7 +553,7 @@ fn truth_table_is_shared_source_for_f2_teardown_and_f3_monitor() {
 
     // mail handler：同一张表投影出另一台监督器的扣发集（D1）。
     assert_eq!(
-        t.derive_handler_policy(&ClassId::new("mail")).unwrap().withhold,
-        ["send".to_string()].into_iter().collect()
+        t.derive_handler_policy(&ClassId::new("mail")).unwrap().withhold(),
+        &["send".to_string()].into_iter().collect()
     );
 }

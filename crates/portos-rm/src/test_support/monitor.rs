@@ -94,10 +94,10 @@ pub struct Policy {
     pub degrade: BTreeMap<String, String>,
     /// confine：这些目标的动作改写到替身世界（零真实效应）。
     pub confined_targets: BTreeSet<String>,
-    /// F6 [CEFF]：本 handler 的界内变换动词（F4 `HandlerPolicy.contained` 投影）。
+    /// F6 [CEFF]：本 handler 的界内变换动词（F4 `HandlerPolicy::contained` 投影）。
     /// 它们触及的目标（本类持有）在段回滚时由类 restore 恢复到段起点检查点。
     pub contained: BTreeSet<String>,
-    /// F6 [PROTO]：本 handler 的协议自动机（F4 `HandlerPolicy.protocol` 投影）。
+    /// F6 [PROTO]：本 handler 的协议自动机（F4 `HandlerPolicy::protocol` 投影）。
     /// safety 性质 ⇒ precise 档（截停）精确执行：违规即 fail-stop，交付最长合法前缀。
     pub protocol: Option<crate::protocol::Protocol>,
     /// F6：handler 名（restore 钥匙与效应类键的前缀）。每台监督器一份策略（D1）。
@@ -108,10 +108,10 @@ impl Policy {
     pub fn from_checked(policy: &crate::verbs::HandlerPolicy) -> Self {
         Self {
             handler: policy.class().to_string(),
-            staged_verbs: policy.withhold.clone(),
-            degrade: policy.degrade.clone(),
-            contained: policy.contained.clone(),
-            protocol: policy.protocol.clone(),
+            staged_verbs: policy.withhold().clone(),
+            degrade: policy.degrade().clone(),
+            contained: policy.contained().clone(),
+            protocol: policy.protocol().cloned(),
             ..Self::default()
         }
     }
@@ -305,7 +305,6 @@ pub struct Monitor {
     active_account: Option<AccountId>,
     accounts: BTreeMap<AccountId, BudgetAccount>,
     segment: Segment,
-    used_nonces: BTreeSet<String>,
     /// [SUPPR] 扣发缓冲。演练中在内存：崩溃＝缓冲尽失＝退化的 abort——
     /// 压制的失败方向是"不发射"，对 w-effect 恰是安全侧（偏离申报）。
     buffer: Vec<WAction>,
@@ -346,7 +345,6 @@ impl Monitor {
                 subject: SubjectId::new(format!("{fiber}:seg")),
                 holdings: BTreeMap::new(),
             },
-            used_nonces: BTreeSet::new(),
             buffer: Vec::new(),
             fiber: fiber.into(),
             proto_state: None,
@@ -378,7 +376,7 @@ impl Monitor {
         if c.plan_hash != plan_hash {
             return Err(Refusal::ConsentMismatch);
         }
-        if self.used_nonces.contains(&c.nonce) {
+        if self.accounts.contains_key(&AccountId::new(&c.nonce)) {
             return Err(Refusal::StaleNonce);
         }
         if now > c.ttl_expires_at {
@@ -410,7 +408,6 @@ impl Monitor {
                 spender: SubjectId::new(format!("{}:spent", self.fiber)),
             },
         );
-        self.used_nonces.insert(c.nonce.clone());
         self.active_account = Some(account);
     }
 

@@ -34,14 +34,14 @@ fn workspace_entry_passes_all_frozen_gates() {
 
     let hp = e.table.derive_handler_policy(&ClassId::new("vm")).unwrap();
     assert!(
-        hp.contained.contains("exec") && hp.contained.contains("write_file"),
+        hp.contained().contains("exec") && hp.contained().contains("write_file"),
         "exec/写文件是界内变换"
     );
     assert!(
-        hp.budget.contains("exec") && !hp.withhold.contains("exec"),
+        hp.budget().contains("exec") && !hp.withhold().contains("exec"),
         "变换进预算（fuel）、不扣发"
     );
-    assert!(!hp.budget.contains("read_file"), "可重复读零预算");
+    assert!(!hp.budget().contains("read_file"), "可重复读零预算");
     let ns = e.table.lookup(&ClassId::new("vm"), &VerbId::new("net_send")).unwrap();
     assert!(
         ns.staged_shape() && !ns.withhold(),
@@ -187,8 +187,8 @@ fn workspace_segment_rollback_restores_touched_vm_exactly_once() {
     let hp = e.table.derive_handler_policy(&ClassId::new("vm")).unwrap();
     let mut pol = Policy::default();
     pol.handler = "vm".into();
-    pol.contained = hp.contained.clone();
-    pol.staged_verbs = hp.withhold.clone();
+    pol.contained = hp.contained().clone();
+    pol.staged_verbs = hp.withhold().clone();
     for v in ["exec", "write_file", "net_send"] {
         pol.allow(v, "vm-1");
     }
@@ -284,18 +284,18 @@ fn rdma_entry_passes_all_frozen_gates_with_interval_and_frac() {
     // 投影
     let mr = e.table.derive_handler_policy(&ClassId::new("mr")).unwrap();
     assert_eq!(
-        mr.withhold,
-        ["grant_remote_access".to_string()].into_iter().collect(),
+        mr.withhold(),
+        &["grant_remote_access".to_string()].into_iter().collect(),
         "暴露内存＝硬清单"
     );
     let qp = e.table.derive_handler_policy(&ClassId::new("qp")).unwrap();
-    assert!(qp.protocol.is_some(), "QP 状态机投影给 qp handler");
+    assert!(qp.protocol().is_some(), "QP 状态机投影给 qp handler");
     assert!(
-        qp.contained.contains("init") && qp.contained.contains("rts"),
+        qp.contained().contains("init") && qp.contained().contains("rts"),
         "状态迁移是界内变换"
     );
     assert!(
-        qp.budget.contains("post_send") && !qp.withhold.contains("post_send"),
+        qp.budget().contains("post_send") && !qp.withhold().contains("post_send"),
         "RDMA WRITE 可摊销"
     );
     assert!(matches!(
@@ -511,8 +511,8 @@ fn rdma_qp_protocol_enforced_end_to_end() {
     let hp = e.table.derive_handler_policy(&ClassId::new("qp")).unwrap();
     let mut pol = Policy::default();
     pol.handler = "qp".into();
-    pol.protocol = hp.protocol.clone();
-    pol.contained = hp.contained.clone();
+    pol.protocol = hp.protocol().cloned();
+    pol.contained = hp.contained().clone();
     for v in ["init", "rtr", "rts", "post_send", "query"] {
         pol.allow(v, "qp-1");
     }
@@ -537,7 +537,7 @@ fn rdma_qp_protocol_enforced_end_to_end() {
     assert_eq!(*m.run(10), MonState::Done(MonOutcome::FailStop { at: 1 }));
     assert_eq!(m.world.emitted.len(), 1);
     // 准入期就能预言
-    let proto = hp.protocol.as_ref().unwrap();
+    let proto = hp.protocol().unwrap();
     let plan = Plan::Seq(bad.iter().map(|a| Plan::verb("qp", &a.verb)).collect());
     assert!(proto.check_plan(&plan).is_err());
     let good_plan = Plan::Seq(ok.iter().map(|a| Plan::verb("qp", &a.verb)).collect());

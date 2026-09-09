@@ -89,7 +89,7 @@ use portos_rm::ledger::RevertGrade;
 use portos_rm::protocol::{Protocol, ProtocolDraft};
 use portos_rm::time::{LeaseDuration, LeaseRequest, Timestamp};
 use portos_rm::verbs::{
-    CheckedVerb, ClassDeclarationDraft, ConsumeGrade, EmitGrade, Kind, VerbEntry, VerbTable,
+    CheckedClass, CheckedVerb, ClassDeclarationDraft, ConsumeGrade, EmitGrade, Kind, VerbEntry,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -408,8 +408,8 @@ fn spawn_plugin(
     let client_stream = client.expect("client channel present");
 
     // ---- F4: the verb character the plugin declared, checked at the door.
-    let table = match build_verb_table(&name, &verbs, &tools_meta, &hello) {
-        Ok(t) => t,
+    let class = match check_class_declaration(&name, &verbs, &tools_meta, &hello) {
+        Ok(class) => class,
         Err(e) => {
             let _ = child.kill();
             return Err(KernelError::Denied(format!(
@@ -417,11 +417,7 @@ fn spawn_plugin(
             )));
         }
     };
-    let protocol = table
-        .derive_handler_policy(&ClassId::new(&name))
-        .expect("checked class")
-        .protocol
-        .clone();
+    let protocol = class.protocol().cloned();
 
     // ---- F5: slot admission — every verb's requires must fit the row.
     if let Some(slot) = slot {
@@ -512,7 +508,7 @@ fn spawn_plugin(
         });
         for v in &verbs {
             let meta = &tools_meta[v.as_str()];
-            let entry = table.lookup(&ClassId::new(&name), &VerbId::new(v)).ok();
+            let entry = class.lookup(&VerbId::new(v)).ok();
             let target = meta.get("target").and_then(|t| {
                 Some(TargetSpec {
                     arg: t["arg"].as_str()?.to_string(),
@@ -896,16 +892,15 @@ fn declaration_identity(hello: &Value) -> Result<(String, Vec<String>), String> 
     Ok((name.to_string(), verbs))
 }
 
-/// The plugin's F4 truth table from its hello: class = the plugin (one
-/// handler, one table — D1), verbs keyed by their full `family::verb` name.
-/// Verbs without a declared `kind` are simply not in the table (no
-/// character known; they route as before).
-fn build_verb_table(
+/// Check the plugin's F4 class using the names decoded by `declaration_identity`.
+/// Verbs use their full `family::verb` name. Verbs without a declared `kind`
+/// are absent from the class and retain their legacy routing behavior.
+fn check_class_declaration(
     name: &str,
     verbs: &[String],
     tools_meta: &Value,
     hello: &Value,
-) -> Result<VerbTable, String> {
+) -> Result<CheckedClass, String> {
     if !tools_meta.is_null() && !tools_meta.is_object() {
         return Err("tools must be an object".into());
     }
@@ -918,20 +913,13 @@ fn build_verb_table(
             _ => return Err(format!("unknown holding_rho: {rho}")),
         });
     }
-    let mut seen = std::collections::BTreeSet::new();
     for v in verbs {
-        if v.is_empty() || !seen.insert(v) {
-            return Err("empty or duplicate advertised verb".into());
-        }
         if let Some(entry) = kind_from_meta(&tools_meta[v.as_str()])? {
             draft.verbs.push((VerbId::new(v), entry));
         }
     }
     draft.protocol = protocol_from_json(hello.get("protocol"))?;
-    let checked = draft.check().map_err(|e| format!("{e:?}"))?;
-    let mut table = VerbTable::new();
-    table.insert(checked).map_err(|e| format!("{e:?}"))?;
-    Ok(table)
+    draft.check().map_err(|e| format!("{e:?}"))
 }
 
 fn optional_str<'a>(v: &'a Value, key: &str) -> Result<Option<&'a str>, String> {
@@ -980,7 +968,6 @@ fn kind_from_meta(meta: &Value) -> Result<Option<VerbEntry>, String> {
                 None | Some("held") => ConsumeGrade::Held,
                 Some("compensable") => ConsumeGrade::Compensable {
                     compensate_with: compensate
-                        .clone()
                         .ok_or("consuming/compensable needs compensate_with")?,
                 },
                 Some("external") => ConsumeGrade::External,
@@ -993,7 +980,6 @@ fn kind_from_meta(meta: &Value) -> Result<Option<VerbEntry>, String> {
                 None | Some("external") => EmitGrade::External,
                 Some("compensable") => EmitGrade::Compensable {
                     compensate_with: compensate
-                        .clone()
                         .ok_or("emitting/compensable needs compensate_with")?,
                 },
                 Some(other) => return Err(format!("unknown emitting world {other}")),
@@ -2447,7 +2433,7 @@ mod m3_metadata_tests {
     #[test]
     fn checked_character_preserves_legacy_defaults_and_hard_list() {
         let verbs = vec!["emit".into(), "send".into(), "legacy".into()];
-        let table = build_verb_table(
+        let class = check_class_declaration(
             "p",
             &verbs,
             &json!({
@@ -2456,11 +2442,10 @@ mod m3_metadata_tests {
             &json!({}),
         )
         .unwrap();
-        let class = table.class(&ClassId::new("p")).unwrap();
         assert!(!class.lookup(&VerbId::new("emit")).unwrap().withhold());
         assert!(class.lookup(&VerbId::new("send")).unwrap().withhold());
         assert!(class.lookup(&VerbId::new("legacy")).is_err());
-        assert!(build_verb_table("p", &verbs, &json!({}), &json!({"holding_rho": 1})).is_err());
+        assert!(check_class_declaration("p", &verbs, &json!({}), &json!({"holding_rho": 1})).is_err());
     }
 
     #[test]
@@ -2473,7 +2458,7 @@ mod m3_metadata_tests {
             assert!(protocol_from_json(Some(&protocol)).is_err());
         }
         assert!(
-            build_verb_table(
+            check_class_declaration(
                 "p",
                 &["read".into()],
                 &json!({"read": {"kind": "repeatable", "degrade": "unknown"}}),

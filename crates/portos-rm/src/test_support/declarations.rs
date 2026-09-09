@@ -25,9 +25,8 @@ impl Declarations {
         c.holding_grade = Some(grade);
         Ok(())
     }
-    pub fn register(&mut self, class: &str, verb: &str, entry: VerbEntry) -> Result<(), VerbError> {
+    pub fn register(&mut self, class: &str, verb: &str, entry: VerbEntry) {
         self.class(class).verbs.push((VerbId::new(verb), entry));
-        Ok(())
     }
     pub fn declare_protocol(&mut self, class: &str, protocol: Protocol) -> Result<(), VerbError> {
         let c = self.class(class);

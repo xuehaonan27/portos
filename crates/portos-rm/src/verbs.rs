@@ -342,37 +342,39 @@ impl ClassDeclarationDraft {
         }
         let mut laws = self.laws;
         for law in &laws {
-            if matches!(law.scope, LawScope::Unspecified)
-                || matches!(law.equation, Equation::LegacyCommutationSummary { .. })
-            {
-                return Err(VerbError::Incoherent(
-                    "new equations require an explicit scope and operation pair",
-                ));
-            }
-            let names = match &law.equation {
-                Equation::Idempotent { operation }
-                | Equation::LegacyCommutationSummary { operation } => vec![operation],
-                Equation::Commutes { left, right } => vec![left, right],
-            };
-            if names.iter().any(|v| !entries.contains_key(*v)) {
-                return Err(VerbError::Incoherent(
-                    "equation mentions an unregistered operation",
-                ));
-            }
-            if let LawScope::Declared {
+            let LawScope::Declared {
                 parameters,
                 observations,
                 assumptions,
             } = &law.scope
-            {
-                if [parameters, observations, assumptions]
-                    .iter()
-                    .any(|s| s.trim().is_empty())
-                {
+            else {
+                return Err(VerbError::Incoherent(
+                    "new equations require an explicit scope and operation pair",
+                ));
+            };
+            let registered = match &law.equation {
+                Equation::Idempotent { operation } => entries.contains_key(operation),
+                Equation::Commutes { left, right } => {
+                    entries.contains_key(left) && entries.contains_key(right)
+                }
+                Equation::LegacyCommutationSummary { .. } => {
                     return Err(VerbError::Incoherent(
-                        "a scoped equation needs parameters, observations and assumptions",
+                        "new equations require an explicit scope and operation pair",
                     ));
                 }
+            };
+            if !registered {
+                return Err(VerbError::Incoherent(
+                    "equation mentions an unregistered operation",
+                ));
+            }
+            if [parameters, observations, assumptions]
+                .iter()
+                .any(|s| s.trim().is_empty())
+            {
+                return Err(VerbError::Incoherent(
+                    "a scoped equation needs parameters, observations and assumptions",
+                ));
             }
             let (EvidenceSource::ProviderAssertion(source)
             | EvidenceSource::ReviewedContract(source)) = &law.source;
@@ -452,6 +454,9 @@ impl CheckedClass {
     pub fn holding_grade(&self) -> Option<RevertGrade> {
         self.holding_grade
     }
+    pub fn protocol(&self) -> Option<&Protocol> {
+        self.protocol.as_ref()
+    }
     pub fn lookup(&self, verb: &VerbId) -> Result<&CheckedVerb, VerbError> {
         self.entries.get(verb).ok_or(VerbError::Unknown)
     }
@@ -460,7 +465,15 @@ impl CheckedClass {
         &self.laws
     }
     pub fn handler_policy(&self) -> HandlerPolicy {
-        let mut p = HandlerPolicyData::default();
+        let mut p = HandlerPolicy {
+            class: self.class.clone(),
+            withhold: BTreeSet::new(),
+            budget: BTreeSet::new(),
+            degrade: BTreeMap::new(),
+            compensations: BTreeMap::new(),
+            contained: BTreeSet::new(),
+            protocol: self.protocol.clone(),
+        };
         for (v, e) in &self.entries {
             if e.withhold() {
                 p.withhold.insert(v.to_string());
@@ -478,11 +491,7 @@ impl CheckedClass {
                 p.compensations.insert(v.to_string(), c.to_string());
             }
         }
-        p.protocol = self.protocol.clone();
-        HandlerPolicy {
-            class: self.class.clone(),
-            data: p,
-        }
+        p
     }
 }
 
@@ -490,26 +499,34 @@ impl CheckedClass {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HandlerPolicy {
     class: ClassId,
-    data: HandlerPolicyData,
-}
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
-pub struct HandlerPolicyData {
-    pub withhold: BTreeSet<String>,
-    pub budget: BTreeSet<String>,
-    pub degrade: BTreeMap<String, String>,
-    pub compensations: BTreeMap<String, String>,
-    pub contained: BTreeSet<String>,
-    pub protocol: Option<Protocol>,
+    withhold: BTreeSet<String>,
+    budget: BTreeSet<String>,
+    degrade: BTreeMap<String, String>,
+    compensations: BTreeMap<String, String>,
+    contained: BTreeSet<String>,
+    protocol: Option<Protocol>,
 }
 impl HandlerPolicy {
     pub fn class(&self) -> &ClassId {
         &self.class
     }
-}
-impl std::ops::Deref for HandlerPolicy {
-    type Target = HandlerPolicyData;
-    fn deref(&self) -> &Self::Target {
-        &self.data
+    pub fn withhold(&self) -> &BTreeSet<String> {
+        &self.withhold
+    }
+    pub fn budget(&self) -> &BTreeSet<String> {
+        &self.budget
+    }
+    pub fn degrade(&self) -> &BTreeMap<String, String> {
+        &self.degrade
+    }
+    pub fn compensations(&self) -> &BTreeMap<String, String> {
+        &self.compensations
+    }
+    pub fn contained(&self) -> &BTreeSet<String> {
+        &self.contained
+    }
+    pub fn protocol(&self) -> Option<&Protocol> {
+        self.protocol.as_ref()
     }
 }
 
@@ -562,6 +579,6 @@ impl VerbTable {
 /// ```
 /// ```compile_fail
 /// use portos_rm::verbs::HandlerPolicy;
-/// fn bypass(mut policy: HandlerPolicy) { policy.withhold.clear(); }
+/// fn bypass(policy: HandlerPolicy) { policy.withhold().clear(); }
 /// ```
 const _: () = ();
