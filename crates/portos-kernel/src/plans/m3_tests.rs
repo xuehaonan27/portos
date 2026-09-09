@@ -1,10 +1,11 @@
 use super::*;
 use portos_rm::cleanup::CleanupPolicy;
-use portos_rm::identity::{ClassId, Generation, InstanceId};
+use portos_rm::identity::{ClassId, Generation, InstanceId, SubjectId};
 use portos_rm::ledger::{AlgebraTag, ClassDecl, GrantRequest, RevertGrade};
 use portos_rm::ra::Ex;
 use portos_rm::registry::{Capacity, Claim};
-use portos_rm::time::LeaseRequest;
+use portos_rm::time::{LeaseRequest, Timestamp};
+use rusqlite::params;
 
 #[test]
 fn recovery_uses_the_persisted_segment_association() {

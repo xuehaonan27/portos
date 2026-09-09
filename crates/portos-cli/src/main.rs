@@ -158,7 +158,8 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     "finished" => break,
                     "awaiting_approval" => {
                         let batch = host.plans.withheld_batch(&run_id).unwrap_or_default();
-                        for (verb, target, cost) in &batch {
+                        for effect in &batch {
+                            let (verb, target, cost) = (&effect.verb, &effect.target, effect.cost);
                             println!("[run] withheld: {verb} @ {target} (cost {cost})");
                         }
                         print!("Approve and release this batch? [y/N] ");
@@ -167,8 +168,9 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         stdin.read_line(&mut line)?;
                         if matches!(line.trim(), "y" | "Y" | "yes") {
                             let mut budget = std::collections::BTreeMap::new();
-                            for (verb, _, cost) in &batch {
-                                *budget.entry(verb.clone()).or_insert(0u64) += cost;
+                            for effect in &batch {
+                                *budget.entry(effect.verb.to_string()).or_insert(0u64) +=
+                                    effect.cost;
                             }
                             let approval = signer.sign(&plan_hash, budget, 3600);
                             k.audit.lock().unwrap().append(json!({
@@ -224,12 +226,13 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
             let mut budget = std::collections::BTreeMap::new();
-            for (verb, _, cost) in &batch {
-                *budget.entry(verb.clone()).or_insert(0u64) += cost;
+            for effect in &batch {
+                *budget.entry(effect.verb.to_string()).or_insert(0u64) += effect.cost;
             }
             print!("{}", render_budget(&plan_hash, &budget));
             println!("Withheld effects to release, in order:");
-            for (verb, target, cost) in &batch {
+            for effect in &batch {
+                let (verb, target, cost) = (&effect.verb, &effect.target, effect.cost);
                 println!("  - {verb} @ {target} (cost {cost})");
             }
             print!("Approve and release this batch? [y/N] ");

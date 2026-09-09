@@ -7,7 +7,7 @@ use portos_kernel::consent::ConsentRecord;
 use portos_kernel::host::Host;
 use portos_kernel::ledger::CLASS_FILE_LOCK;
 use portos_kernel::ledger::ExclusiveRequest;
-use portos_kernel::plans::{Outcome, PlanService};
+use portos_kernel::plans::{Outcome, PlanService, RunState};
 use portos_rm::identity::{ClassId, Generation, InstanceId, ResourceKey, SubjectId};
 use portos_rm::time::{LeaseRequest, Timestamp};
 use serde_json::{Value, json};
@@ -76,11 +76,11 @@ fn sign(kernel: &Kernel, plan_hash: &str, budget: &[(&str, u64)], ttl_secs: u64)
         .sign(plan_hash, b, ttl_secs)
 }
 
-fn wait_state(svc: &PlanService, run_id: &str, want: &str) {
+fn wait_state(svc: &PlanService, run_id: &str, want: RunState) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         let state = svc.run_state(run_id).unwrap();
-        if state == want || state == "done" {
+        if state == want || state == RunState::Done {
             return;
         }
         assert!(
@@ -148,7 +148,10 @@ fn wysiwys_tampered_plan_is_refused_with_zero_effects() {
     );
     assert_eq!(emissions(&kernel, &out_a.run_id), 0);
     assert_eq!(emissions(&kernel, &out_b.run_id), 0);
-    assert_eq!(host.plans.run_state(&out_a.run_id).unwrap(), "admitted");
+    assert_eq!(
+        host.plans.run_state(&out_a.run_id).unwrap(),
+        RunState::Admitted
+    );
     host.shutdown_all();
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -265,7 +268,7 @@ fn withheld_batch_is_released_exactly_once_in_order_after_approval() {
     let out = host.plans.submit("user", &emit_times(&["a", "b"])).unwrap();
     let consent = sign(&kernel, &out.plan_hash, &[("echo::emit", 2)], 3600);
     host.plans.start(&out.run_id, &consent).unwrap();
-    wait_state(&host.plans, &out.run_id, "awaiting_approval");
+    wait_state(&host.plans, &out.run_id, RunState::AwaitingApproval);
     assert_eq!(
         emissions(&kernel, &out.run_id),
         0,
@@ -332,7 +335,7 @@ fn ttl_expiry_aborts_awaiting_approval_and_paused_alike() {
         let out = host.plans.submit("user", &emit_once("x")).unwrap();
         let consent = sign(&kernel, &out.plan_hash, &[("echo::emit", 1)], 1);
         host.plans.start(&out.run_id, &consent).unwrap();
-        wait_state(&host.plans, &out.run_id, "awaiting_approval");
+        wait_state(&host.plans, &out.run_id, RunState::AwaitingApproval);
         std::thread::sleep(std::time::Duration::from_millis(2100));
         host.plans.expire(portos_kernel::db::now_unix());
         let outcome = wait_outcome(&host.plans, &out.run_id);
@@ -358,7 +361,7 @@ fn ttl_expiry_aborts_awaiting_approval_and_paused_alike() {
             .unwrap();
         let consent = sign(&kernel, &out.plan_hash, &[("echo::emit", 2)], 1);
         host.plans.start(&out.run_id, &consent).unwrap();
-        wait_state(&host.plans, &out.run_id, "paused");
+        wait_state(&host.plans, &out.run_id, RunState::Paused);
         std::thread::sleep(std::time::Duration::from_millis(2100));
         host.plans.expire(portos_kernel::db::now_unix());
         let outcome = wait_outcome(&host.plans, &out.run_id);
@@ -385,7 +388,7 @@ fn escalate_pauses_and_resumes_exactly_with_fresh_consent() {
         .unwrap();
     let consent = sign(&kernel, &out.plan_hash, &[("echo::emit", 2)], 3600);
     host.plans.start(&out.run_id, &consent).unwrap();
-    wait_state(&host.plans, &out.run_id, "paused");
+    wait_state(&host.plans, &out.run_id, RunState::Paused);
     assert_eq!(
         emissions(&kernel, &out.run_id),
         0,
@@ -397,7 +400,7 @@ fn escalate_pauses_and_resumes_exactly_with_fresh_consent() {
     let inc_empty = sign(&kernel, &out.plan_hash, &[("echo::emit", 0)], 3600);
     host.plans.resume(&out.run_id, &inc_empty).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(400));
-    assert_eq!(host.plans.run_state(&out.run_id).unwrap(), "paused");
+    assert_eq!(host.plans.run_state(&out.run_id).unwrap(), RunState::Paused);
     assert_eq!(
         emissions(&kernel, &out.run_id),
         2,

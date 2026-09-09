@@ -108,6 +108,12 @@ pub enum KernelError {
     Db(rusqlite::Error),
     Corrupt(String),
     Denied(String),
+    NoCapability {
+        subject: portos_rm::identity::SubjectId,
+        resource: String,
+        verb: portos_rm::identity::VerbId,
+    },
+    BudgetExhausted(portos_rm::identity::VerbId),
     NotFound(String),
 }
 
@@ -128,6 +134,17 @@ impl std::fmt::Display for KernelError {
             KernelError::Db(e) => write!(f, "db: {e}"),
             KernelError::Corrupt(s) => write!(f, "corrupt: {s}"),
             KernelError::Denied(s) => write!(f, "denied: {s}"),
+            KernelError::NoCapability {
+                subject,
+                resource,
+                verb,
+            } => {
+                write!(
+                    f,
+                    "denied: no capability: {subject} → {resource} verb {verb}"
+                )
+            }
+            KernelError::BudgetExhausted(verb) => write!(f, "denied: budget exhausted: {verb}"),
             KernelError::NotFound(s) => write!(f, "not found: {s}"),
         }
     }

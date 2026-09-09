@@ -94,6 +94,7 @@ implementation rather than after mistakes.
   `info` for lifecycle, `debug` for internals, `warn` for recoverable issues,
   `error` for unrecoverable failures. Update schemas/config/docs with contract changes.
 - Use Conventional Commit prefixes (`feat:`, `fix:`, `refactor:`, `ci:`, `chore:`).
+- Describe in comment, instead of referencing to documentation section labels.
 
 ## Workspace Codemap
 

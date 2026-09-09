@@ -159,7 +159,7 @@ impl CapStore {
             ) {
                 Ok(_) => {}
                 Err(KernelError::Denied(_)) => {
-                    return Err(KernelError::Denied(format!("budget exhausted: {verb}")));
+                    return Err(KernelError::BudgetExhausted(verb.into()));
                 }
                 Err(e) => return Err(e),
             }
@@ -206,12 +206,11 @@ impl CapStore {
             }
         }
         let candidates = live;
-        if candidates.is_empty() {
-            return Err(KernelError::Denied(format!(
-                "no capability: {subject} → {resource} verb {verb}"
-            )));
-        }
-        let mut last = KernelError::Denied("no capability".into());
+        let mut last = KernelError::NoCapability {
+            subject: subject.into(),
+            resource: resource.into(),
+            verb: verb.into(),
+        };
         for cap in candidates {
             match self.exercise(&cap.cap_id, verb, now) {
                 Ok(()) => return Ok(cap.cap_id),
@@ -345,7 +344,7 @@ mod tests {
         assert!(caps.exercise(&cap.cap_id, "emit", 0).is_ok());
         let e = caps.exercise(&cap.cap_id, "emit", 0);
         assert!(
-            matches!(e, Err(KernelError::Denied(_))),
+            matches!(e, Err(KernelError::BudgetExhausted(_))),
             "third emit must be denied"
         );
         // The declared capacity is untouched; the balance is a fold over
