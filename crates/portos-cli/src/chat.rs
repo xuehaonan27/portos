@@ -77,7 +77,7 @@ enum RenderMode {
     None,
 }
 
-pub fn run(root: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(root: &str, repl: bool) -> Result<(), Box<dyn std::error::Error>> {
     let root = PathBuf::from(root);
     let kernel = Arc::new(Kernel::open(&root)?);
     let host = Host::new(kernel.clone(), &root.join("sock"))?;
@@ -156,6 +156,20 @@ pub fn run(root: &str) -> Result<(), Box<dyn std::error::Error>> {
             None,
         )?;
         println!("[chat] grant: {subject} → {}", g.resource);
+    }
+
+    if !repl {
+        // No REPL: the runtime is up and a front end owns its own sessions
+        // (a bridge plugin's presenter calls `model::start` itself). Parking
+        // here keeps the plugins alive.
+        //
+        // Known gap: a signal kills this process without running `Drop for
+        // Host`, so plugins are orphaned rather than shut down. The fix is
+        // process-group teardown, not a handler here.
+        println!("[chat] runtime up, no REPL — drive it through a front end; Ctrl-C to stop");
+        let (_keep, never) = std::sync::mpsc::channel::<()>();
+        let _ = never.recv();
+        return Ok(());
     }
 
     // One session; deltas render live from its event topic.

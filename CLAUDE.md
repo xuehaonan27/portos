@@ -129,7 +129,7 @@ MCP later is the opposite direction and is fine).
 
 ```sh
 cargo build --workspace
-cargo test --workspace          # 48 tests; all must pass, zero warnings
+cargo test --workspace          # 51 tests; all must pass, zero warnings
 cargo fmt --all
 ```
 
@@ -143,6 +143,10 @@ The end-to-end tests are the ones that matter and they are hermetic:
   before believing a green run.
 - `crates/portos-echo/tests/abi_v2.rs` — plugin ABI conformance.
 - `crates/portos-broker/tests/egress.rs` — allowlist, injection, sanitizing.
+- `crates/portos-echo/tests/bridge.rs` — the extensibility claim itself: a
+  plugin carrying the event plane and the invoke path over HTTP, written
+  against the published ABI with no kernel change. If a change here starts
+  needing one, that is the finding, not an inconvenience.
 
 Run the narrowest relevant test first, then the full workspace before
 reporting done. Never claim a driver works from unit tests alone — the
@@ -181,7 +185,9 @@ walking skeleton test is what proves the wiring.
       The kernel depends on neither; it must not know these families exist.
     - Implementations: `model` (Rust — neutral agentic loop in `core.rs`,
       providers under `backends/`), `browser` (JS/Playwright), `render-tty`
-      (renderer reference).
+      (renderer reference), `bridge-http` (the event plane and the invoke
+      path over HTTP/SSE, so a presenter can live off-box; transport and
+      presentation are separate files on purpose).
 - `docs`: does not exist yet. Solid documentation goes here only after human
   approval; until then everything lives in `.dev`.
 - `.dev` (gitignored): temporal development space, never added into git worktree.

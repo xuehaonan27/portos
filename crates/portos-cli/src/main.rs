@@ -6,7 +6,7 @@
 //!   portos meta <root> <artifact-id>
 //!   portos get <root> <artifact-id> <out-file>
 //!   portos audit-verify <root>
-//!   portos chat <root>
+//!   portos chat <root> [--no-repl]
 
 mod chat;
 
@@ -65,7 +65,8 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         "chat" => {
             let root = need(args, 2, "root")?;
-            chat::run(&root)?;
+            let repl = !args.iter().any(|a| a == "--no-repl");
+            chat::run(&root, repl)?;
         }
         _ => {
             println!("portos — AgentOS M0 CLI");
