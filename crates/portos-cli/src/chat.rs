@@ -129,7 +129,9 @@ pub fn run(root: &str) -> Result<(), Box<dyn std::error::Error>> {
                             .collect()
                     })
                     .unwrap_or_default();
-                kernel.caps.mint(&subject, resource, verbs, Default::default(), None)?;
+                kernel
+                    .caps
+                    .mint(&subject, resource, verbs, Default::default(), None)?;
                 println!("[chat] grant: {subject} → {resource}");
             }
         }
@@ -162,7 +164,11 @@ pub fn run(root: &str) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Some("tool_result") if render_builtin => {
                     let ok = d["ok"].as_bool().unwrap_or(false);
-                    println!("[tool{}] {}", if ok { "✓" } else { "✗" }, d["verb"].as_str().unwrap_or("?"));
+                    println!(
+                        "[tool{}] {}",
+                        if ok { "✓" } else { "✗" },
+                        d["verb"].as_str().unwrap_or("?")
+                    );
                     let _ = std::io::stdout().flush();
                 }
                 Some("done") => {
@@ -187,7 +193,11 @@ pub fn run(root: &str) -> Result<(), Box<dyn std::error::Error>> {
         if text == "/exit" || text == "/quit" {
             break;
         }
-        match host.call(&modeld, "model::send", json!({"session": sid, "text": text})) {
+        match host.call(
+            &modeld,
+            "model::send",
+            json!({"session": sid, "text": text}),
+        ) {
             Ok(_) => {
                 // Let the render thread finish printing this turn's events.
                 let _ = done_rx.recv_timeout(std::time::Duration::from_secs(2));

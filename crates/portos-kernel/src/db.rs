@@ -29,11 +29,6 @@ pub fn open(root: &Path) -> Result<Connection, rusqlite::Error> {
             parent  TEXT,
             revoked INTEGER NOT NULL DEFAULT 0
         );
-        CREATE TABLE IF NOT EXISTS consents (
-            nonce      TEXT PRIMARY KEY,
-            json       TEXT NOT NULL,
-            created_at INTEGER NOT NULL
-        );
         "#,
     )?;
     Ok(conn)

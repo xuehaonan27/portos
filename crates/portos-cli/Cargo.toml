@@ -11,4 +11,3 @@ path = "src/main.rs"
 serde_json = { workspace = true }
 portos-kernel = { path = "../portos-kernel" }
 portos-proto = { path = "../portos-proto" }
-portos-compute = { path = "../portos-compute" }

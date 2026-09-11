@@ -121,12 +121,7 @@ fn expect_ok(resp: Value) -> Result<Value, String> {
 /// `on_event` receives subscribed events **on a dedicated thread** fed by the
 /// events channel, so events keep flowing while a call handler is blocked —
 /// which is what lets a handler await an event stream mid-call.
-pub fn serve<F, G>(
-    name: &str,
-    verbs: &[&str],
-    on_call: F,
-    on_event: G,
-) -> std::io::Result<()>
+pub fn serve<F, G>(name: &str, verbs: &[&str], on_call: F, on_event: G) -> std::io::Result<()>
 where
     F: FnMut(&str, &Value, &std::sync::Arc<KernelClient>) -> Result<Value, String>,
     G: FnMut(&str, &Value) + Send + 'static,
@@ -149,8 +144,9 @@ where
     F: FnMut(&str, &Value, &std::sync::Arc<KernelClient>) -> Result<Value, String>,
     G: FnMut(&str, &Value) + Send + 'static,
 {
-    let sock = std::env::var("PORTOS_PLUGIN_SOCK")
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "PORTOS_PLUGIN_SOCK unset"))?;
+    let sock = std::env::var("PORTOS_PLUGIN_SOCK").map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "PORTOS_PLUGIN_SOCK unset")
+    })?;
     let token = std::env::var("PORTOS_PLUGIN_TOKEN").unwrap_or_default();
 
     let serve_stream = UnixStream::connect(&sock)?;

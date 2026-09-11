@@ -1,8 +1,7 @@
 //! Capabilities with counting constraints.
 //!
-//! A budget minted by user consent IS a counting capability. `counts` maps
-//! verb-class to remaining balance; excercise decrementstransactionally
-//! and never overdraws.
+//! A budget IS a counting capability. `counts` maps verb-class to remaining
+//! balance; exercise decrements transactionally and never overdraws.
 
 use std::collections::{BTreeMap, BTreeSet};
 

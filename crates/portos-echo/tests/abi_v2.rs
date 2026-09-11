@@ -2,8 +2,8 @@
 //! chunked artifact streaming (D25), capability-gated invoke (D23/D26),
 //! the event bus, ephemeral refs, and the JS protocol client.
 
-use portos_kernel::host::Host;
 use portos_kernel::Kernel;
+use portos_kernel::host::Host;
 use portos_proto::cap::Constraints;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -22,12 +22,8 @@ fn setup(tag: &str) -> (Arc<Kernel>, Host, PathBuf) {
 }
 
 fn spawn_echo(host: &Host, family: &str) -> String {
-    host.spawn(
-        Path::new(ECHO_BIN),
-        &[],
-        &[("PORTOS_ECHO_FAMILY", family)],
-    )
-    .unwrap()
+    host.spawn(Path::new(ECHO_BIN), &[], &[("PORTOS_ECHO_FAMILY", family)])
+        .unwrap()
 }
 
 fn pattern(n: usize) -> Vec<u8> {
@@ -52,9 +48,7 @@ fn call_stream_digest_and_ephemeral_refs() {
             "test",
         )
         .unwrap();
-    let out = host
-        .call(&name, "echo::digest", json!([meta.id]))
-        .unwrap();
+    let out = host.call(&name, "echo::digest", json!([meta.id])).unwrap();
     assert_eq!(out["bytes"].as_u64(), Some(payload.len() as u64));
     let head_hex: String = payload[..32].iter().map(|b| format!("{b:02x}")).collect();
     assert_eq!(out["head_hex"].as_str(), Some(head_hex.as_str()));
@@ -90,9 +84,7 @@ fn accept_zero_context_data_plane() {
     let n = mb * 1024 * 1024;
 
     // Plugin streams n bytes INTO the CAS through its client channel…
-    let stored = host
-        .call(&name, "echo::put_pattern", json!([n]))
-        .unwrap();
+    let stored = host.call(&name, "echo::put_pattern", json!([n])).unwrap();
     let id = stored["meta"]["id"].as_str().unwrap().to_string();
     assert_eq!(stored["meta"]["size"].as_u64(), Some(n));
     // …and reads them back out for the digest.
@@ -104,7 +96,11 @@ fn accept_zero_context_data_plane() {
         "health metric: context={context}B data={data}B ratio={:.2e}",
         context as f64 / data as f64
     );
-    assert!(data >= 2 * n, "both directions count as data: {data} < {}", 2 * n);
+    assert!(
+        data >= 2 * n,
+        "both directions count as data: {data} < {}",
+        2 * n
+    );
     assert!(
         context < 8 * 1024,
         "control-plane bytes stay tiny: {context}"
@@ -154,8 +150,7 @@ fn invoke_is_capability_gated_routed_and_audited() {
 
     // Both outcomes are on the audit chain.
     drop(host);
-    let entries =
-        portos_kernel::audit::AuditLog::verify(&root.join("audit.log")).unwrap();
+    let entries = portos_kernel::audit::AuditLog::verify(&root.join("audit.log")).unwrap();
     let events: Vec<&str> = entries
         .iter()
         .filter_map(|e| e["body"]["event"].as_str())
@@ -271,7 +266,10 @@ fn wildcard_topics_and_grants_introspection() {
         .find(|g| g["verb"] == "echob::emit")
         .expect("granted verb introspected");
     assert!(
-        emit["description"].as_str().unwrap().contains("Print a line"),
+        emit["description"]
+            .as_str()
+            .unwrap()
+            .contains("Print a line"),
         "driver-advertised description joined in"
     );
     assert!(emit["schema"]["properties"]["text"].is_object());
@@ -281,7 +279,10 @@ fn wildcard_topics_and_grants_introspection() {
         .find(|g| g["verb"] == "echob::digest")
         .expect("verb without advertised metadata still listed");
     assert_eq!(digest["schema"], json!({"type": "object"}));
-    assert!(digest.get("counts_left").is_none(), "uncounted grant is unlimited");
+    assert!(
+        digest.get("counts_left").is_none(),
+        "uncounted grant is unlimited"
+    );
     assert_eq!(list.len(), 2, "only granted verbs appear");
     drop(b);
 

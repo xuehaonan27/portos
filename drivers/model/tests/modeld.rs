@@ -115,29 +115,65 @@ fn agentic_loop_end_to_end_with_tool_call() {
     // Turn 1: some text, then a tool call. Turn 2: the wrap-up.
     let turn1 = sse(&[
         ("message_start", json!({"type": "message_start"})),
-        ("content_block_start", json!({"type": "content_block_start", "index": 0,
-            "content_block": {"type": "text", "text": ""}})),
-        ("content_block_delta", json!({"type": "content_block_delta", "index": 0,
-            "delta": {"type": "text_delta", "text": "Let me "}})),
-        ("content_block_delta", json!({"type": "content_block_delta", "index": 0,
-            "delta": {"type": "text_delta", "text": "make a ref."}})),
-        ("content_block_stop", json!({"type": "content_block_stop", "index": 0})),
-        ("content_block_start", json!({"type": "content_block_start", "index": 1,
-            "content_block": {"type": "tool_use", "id": "toolu_1", "name": "echoa__make_ref", "input": {}}})),
-        ("content_block_delta", json!({"type": "content_block_delta", "index": 1,
-            "delta": {"type": "input_json_delta", "partial_json": "{}"}})),
-        ("content_block_stop", json!({"type": "content_block_stop", "index": 1})),
-        ("message_delta", json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}})),
+        (
+            "content_block_start",
+            json!({"type": "content_block_start", "index": 0,
+            "content_block": {"type": "text", "text": ""}}),
+        ),
+        (
+            "content_block_delta",
+            json!({"type": "content_block_delta", "index": 0,
+            "delta": {"type": "text_delta", "text": "Let me "}}),
+        ),
+        (
+            "content_block_delta",
+            json!({"type": "content_block_delta", "index": 0,
+            "delta": {"type": "text_delta", "text": "make a ref."}}),
+        ),
+        (
+            "content_block_stop",
+            json!({"type": "content_block_stop", "index": 0}),
+        ),
+        (
+            "content_block_start",
+            json!({"type": "content_block_start", "index": 1,
+            "content_block": {"type": "tool_use", "id": "toolu_1", "name": "echoa__make_ref", "input": {}}}),
+        ),
+        (
+            "content_block_delta",
+            json!({"type": "content_block_delta", "index": 1,
+            "delta": {"type": "input_json_delta", "partial_json": "{}"}}),
+        ),
+        (
+            "content_block_stop",
+            json!({"type": "content_block_stop", "index": 1}),
+        ),
+        (
+            "message_delta",
+            json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}}),
+        ),
         ("message_stop", json!({"type": "message_stop"})),
     ]);
     let turn2 = sse(&[
         ("message_start", json!({"type": "message_start"})),
-        ("content_block_start", json!({"type": "content_block_start", "index": 0,
-            "content_block": {"type": "text", "text": ""}})),
-        ("content_block_delta", json!({"type": "content_block_delta", "index": 0,
-            "delta": {"type": "text_delta", "text": "Ref created."}})),
-        ("content_block_stop", json!({"type": "content_block_stop", "index": 0})),
-        ("message_delta", json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}})),
+        (
+            "content_block_start",
+            json!({"type": "content_block_start", "index": 0,
+            "content_block": {"type": "text", "text": ""}}),
+        ),
+        (
+            "content_block_delta",
+            json!({"type": "content_block_delta", "index": 0,
+            "delta": {"type": "text_delta", "text": "Ref created."}}),
+        ),
+        (
+            "content_block_stop",
+            json!({"type": "content_block_stop", "index": 0}),
+        ),
+        (
+            "message_delta",
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}}),
+        ),
         ("message_stop", json!({"type": "message_stop"})),
     ]);
     let (port, captured) = mock_provider(vec![turn1, turn2]);
@@ -149,7 +185,10 @@ fn agentic_loop_end_to_end_with_tool_call() {
         &json!({"allow": [{"host": "127.0.0.1", "insecure_http": true,
                             "inject": {"x-api-key": "k1"}}]}),
     );
-    write_json(&broker_dir.join("secrets.json"), &json!({"k1": "fake-test-key"}));
+    write_json(
+        &broker_dir.join("secrets.json"),
+        &json!({"k1": "fake-test-key"}),
+    );
     host.spawn(
         &broker_bin,
         &[],
@@ -249,7 +288,10 @@ fn agentic_loop_end_to_end_with_tool_call() {
     assert!(reqs[0].contains("please make a ref"));
     assert!(reqs[1].contains("tool_result"));
     assert!(reqs[1].contains("toolu_1"));
-    assert!(reqs[1].contains("e1"), "echo's ref value reached the provider");
+    assert!(
+        reqs[1].contains("e1"),
+        "echo's ref value reached the provider"
+    );
 
     host.shutdown_all();
     let _ = std::fs::remove_dir_all(&root);
@@ -280,24 +322,48 @@ fn introspected_tools_and_artifact_read() {
 
     let turn1 = sse(&[
         ("message_start", json!({"type": "message_start"})),
-        ("content_block_start", json!({"type": "content_block_start", "index": 0,
+        (
+            "content_block_start",
+            json!({"type": "content_block_start", "index": 0,
             "content_block": {"type": "tool_use", "id": "toolu_r", "name": "artifact__read",
-                               "input": {}}})),
-        ("content_block_delta", json!({"type": "content_block_delta", "index": 0,
+                               "input": {}}}),
+        ),
+        (
+            "content_block_delta",
+            json!({"type": "content_block_delta", "index": 0,
             "delta": {"type": "input_json_delta",
-                       "partial_json": json!({"id": meta.id}).to_string()}})),
-        ("content_block_stop", json!({"type": "content_block_stop", "index": 0})),
-        ("message_delta", json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}})),
+                       "partial_json": json!({"id": meta.id}).to_string()}}),
+        ),
+        (
+            "content_block_stop",
+            json!({"type": "content_block_stop", "index": 0}),
+        ),
+        (
+            "message_delta",
+            json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}}),
+        ),
         ("message_stop", json!({"type": "message_stop"})),
     ]);
     let turn2 = sse(&[
         ("message_start", json!({"type": "message_start"})),
-        ("content_block_start", json!({"type": "content_block_start", "index": 0,
-            "content_block": {"type": "text", "text": ""}})),
-        ("content_block_delta", json!({"type": "content_block_delta", "index": 0,
-            "delta": {"type": "text_delta", "text": "Read it."}})),
-        ("content_block_stop", json!({"type": "content_block_stop", "index": 0})),
-        ("message_delta", json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}})),
+        (
+            "content_block_start",
+            json!({"type": "content_block_start", "index": 0,
+            "content_block": {"type": "text", "text": ""}}),
+        ),
+        (
+            "content_block_delta",
+            json!({"type": "content_block_delta", "index": 0,
+            "delta": {"type": "text_delta", "text": "Read it."}}),
+        ),
+        (
+            "content_block_stop",
+            json!({"type": "content_block_stop", "index": 0}),
+        ),
+        (
+            "message_delta",
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}}),
+        ),
         ("message_stop", json!({"type": "message_stop"})),
     ]);
     let (port, captured) = mock_provider(vec![turn1, turn2]);
@@ -308,8 +374,12 @@ fn introspected_tools_and_artifact_read() {
         &json!({"allow": [{"host": "127.0.0.1", "insecure_http": true}]}),
     );
     write_json(&broker_dir.join("secrets.json"), &json!({}));
-    host.spawn(&broker_bin, &[], &[("PORTOS_BROKER_DIR", broker_dir.to_str().unwrap())])
-        .unwrap();
+    host.spawn(
+        &broker_bin,
+        &[],
+        &[("PORTOS_BROKER_DIR", broker_dir.to_str().unwrap())],
+    )
+    .unwrap();
     host.spawn(&echo_bin, &[], &[("PORTOS_ECHO_FAMILY", "echoa")])
         .unwrap();
 
@@ -351,7 +421,11 @@ fn introspected_tools_and_artifact_read() {
     let started = host.call(&modeld, "model::start", json!({})).unwrap();
     let sid = started["session"].as_str().unwrap().to_string();
     let out = host
-        .call(&modeld, "model::send", json!({"session": sid, "text": "read the artifact"}))
+        .call(
+            &modeld,
+            "model::send",
+            json!({"session": sid, "text": "read the artifact"}),
+        )
         .unwrap();
     assert_eq!(out["text"].as_str(), Some("Read it."));
 
@@ -360,9 +434,18 @@ fn introspected_tools_and_artifact_read() {
     // Tool surface: introspected echo verb with the driver's own description,
     // plus the built-in reader — and egress stays plumbing, never a tool.
     assert!(reqs[0].contains("echoa__emit"), "introspected tool present");
-    assert!(reqs[0].contains("Print a line"), "driver-advertised description flowed through");
-    assert!(reqs[0].contains("artifact__read"), "built-in reader present");
-    assert!(!reqs[0].contains("egress__"), "egress must not surface as a model tool");
+    assert!(
+        reqs[0].contains("Print a line"),
+        "driver-advertised description flowed through"
+    );
+    assert!(
+        reqs[0].contains("artifact__read"),
+        "built-in reader present"
+    );
+    assert!(
+        !reqs[0].contains("egress__"),
+        "egress must not surface as a model tool"
+    );
     // The artifact's full content reached the provider via artifact::read.
     assert!(reqs[1].contains("tool_result"));
     assert!(reqs[1].contains("quick brown artifact"));
@@ -375,7 +458,10 @@ fn introspected_tools_and_artifact_read() {
 fn unknown_session_and_lifecycle() {
     let (_k, host, root) = setup("life");
     let modeld_dir = root.join("modeld");
-    write_json(&modeld_dir.join("config.json"), &json!({"backend": "anthropic"}));
+    write_json(
+        &modeld_dir.join("config.json"),
+        &json!({"backend": "anthropic"}),
+    );
     let modeld = host
         .spawn(
             Path::new(MODELD_BIN),
@@ -384,14 +470,22 @@ fn unknown_session_and_lifecycle() {
         )
         .unwrap();
 
-    let err = host.call(&modeld, "model::send", json!({"session": "nope", "text": "x"}));
+    let err = host.call(
+        &modeld,
+        "model::send",
+        json!({"session": "nope", "text": "x"}),
+    );
     assert!(err.unwrap_err().to_string().contains("unknown session"));
 
     let s = host.call(&modeld, "model::start", json!({})).unwrap();
     let sid = s["session"].as_str().unwrap().to_string();
-    let ended = host.call(&modeld, "model::end", json!({"session": sid})).unwrap();
+    let ended = host
+        .call(&modeld, "model::end", json!({"session": sid}))
+        .unwrap();
     assert_eq!(ended["ended"].as_bool(), Some(true));
-    let again = host.call(&modeld, "model::end", json!({"session": "s1"})).unwrap();
+    let again = host
+        .call(&modeld, "model::end", json!({"session": "s1"}))
+        .unwrap();
     assert_eq!(again["ended"].as_bool(), Some(false));
 
     host.shutdown_all();

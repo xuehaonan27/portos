@@ -17,13 +17,11 @@
 //!
 //! Responses are sanitized: `set-cookie` (plus per-rule strip lists) never
 //! reaches the caller. Config lives in `$PORTOS_BROKER_DIR/config.json`,
-//! secrets in `$PORTOS_BROKER_DIR/secrets.json` (0600 file stub — same
-//! discipline as consent.key: the store is a stub, the data flow is real;
-//! the macOS Keychain backend comes later). Missing config = empty
-//! allowlist = deny everything.
+//! secrets in `$PORTOS_BROKER_DIR/secrets.json` (0600 file stub — the store
+//! is a stub, the data flow is real; a keychain backend comes later).
+//! Missing config = empty allowlist = deny everything.
 //!
-//! Per D31, this process knows nothing of the plan language or interpreter:
-//! it faces the Host ABI only.
+//! This process faces the Host ABI only.
 
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -248,10 +246,7 @@ fn main() -> std::io::Result<()> {
             // caller-named topic as {"chunk"} events, closed by {"done"} (or
             // {"error"}). The caller subscribes before invoking.
             "egress::http_stream" => {
-                let topic = args["topic"]
-                    .as_str()
-                    .ok_or("missing topic")?
-                    .to_string();
+                let topic = args["topic"].as_str().ok_or("missing topic")?.to_string();
                 let sent = send(&agent, &cfg, args, None)?;
                 let status = sent.resp.status();
                 let headers = sanitize_headers(&sent.resp, &sent.strip);

@@ -1,39 +1,30 @@
 //! # portos-kernel
 //! kernel library for PortOS.
 //!
-//! ## Documentation
-//! ### docs/architecture-v0.md §3.2
-//! Four responsibilities and nothing else.
-//!   1. capabilities and policy: [`caps`], [`plancheck`]
-//!   2. objects and handles: [`cas`]
-//!   3. plugin lifecycle and IPC: [`host`]
-//!   4. audit: [`audit`]
-//!
-//! ### M0 stage implementations
-//! Other components:
-//!   - a prototype of effect-plan interpreter ([`interp`]).
-//!   - consent quadruple ([`consent`]).
+//! Four responsibilities and nothing else:
+//!   1. capabilities: who may invoke which verb ([`caps`]) — also the join
+//!      that builds the model's tool surface, since a granted verb plus the
+//!      driver's advertised metadata is a tool definition.
+//!   2. objects and handles: the content-addressed store ([`cas`]) behind
+//!      the data plane, so payloads never travel through model context.
+//!   3. plugin lifecycle and IPC ([`host`]): spawn, verb routing, the event
+//!      bus, chunked artifact streaming.
+//!   4. audit ([`audit`]): a hash-chained record of what was invoked.
 //!
 //! Plugin domain knowledges MUST NOT appear in this crate, which is an
 //! architectural invariant.
 //!
-//! #### m0-kernel-v0.md
 //! TODO:
 //! - Currently no sandbox (container, microVM, etc) used, only plain child
 //! processes.
-//! - CLI consent with a local keyed-MAC stub.
-//! - No egress proxy (trait stub only).
 //! - Using threads, should be replaced with async later.
 
 pub mod audit;
 pub mod caps;
 pub mod cas;
-pub mod consent;
 pub mod db;
 pub mod host;
-pub mod interp;
 pub mod metrics;
-pub mod plancheck;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -46,7 +37,6 @@ pub struct Kernel {
     /// Capability table
     pub caps: caps::CapStore,
     pub audit: Arc<Mutex<audit::AuditLog>>,
-    pub consent_key: consent::ConsentKey,
 }
 
 impl Kernel {
@@ -57,13 +47,11 @@ impl Kernel {
         let cas = cas::Cas::new(root, db.clone())?;
         let caps = caps::CapStore::new(db.clone());
         let audit = Arc::new(Mutex::new(audit::AuditLog::open(root)?));
-        let consent_key = consent::ConsentKey::load_or_create(root)?;
         Ok(Kernel {
             root: root.to_path_buf(),
             cas,
             caps,
             audit,
-            consent_key,
         })
     }
 }

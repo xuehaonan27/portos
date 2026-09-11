@@ -34,8 +34,7 @@
 //!
 //! Known M0 limitation: the invoke graph must be acyclic. A cycle (A invokes
 //! B while B's serve loop is blocked invoking A) deadlocks; v0 flows
-//! (cli → model driver → {broker, browser}) are acyclic by construction, and
-//! the effect-plan world later makes call structure explicit.
+//! (cli → model driver → {broker, browser}) are acyclic by construction.
 
 use crate::{Kernel, KernelError};
 use portos_proto::{Label, chunk, frame};
@@ -49,8 +48,8 @@ use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 
 /// Bounded event queue per subscriber. A subscriber that falls this far
-/// behind is cut off (m0-kernel-v0.md §3: slow consumers must not stall the
-/// kernel): plugin subscribers are disconnected, local subscribers dropped.
+/// behind is cut off, because a slow consumer must never stall the kernel:
+/// plugin subscribers are disconnected, local subscribers dropped.
 pub const EVENT_QUEUE: usize = 256;
 
 const SPAWN_DEADLINE_MS: u64 = 10_000;
@@ -149,55 +148,55 @@ impl Host {
         // The serve connection comes first and declares which extra channels
         // follow ("client" always; "events" optionally). Bad token or an
         // undeclared/duplicate role is fatal for the spawn.
-        let accept_hello = |child: &mut std::process::Child| -> Result<(UnixStream, Value), KernelError> {
-            let mut stream = accept_with_deadline(&listener, child, SPAWN_DEADLINE_MS)?;
-            let hello = frame::read_frame(&mut stream)
-                .map_err(|e| KernelError::Corrupt(format!("hello: {e}")))?;
-            if hello["hello"]["token"].as_str() != Some(token.as_str()) {
-                let _ = frame::write_frame(&mut stream, &json!({"err": "bad token"}));
-                return Err(KernelError::Denied("plugin hello: bad token".into()));
-            }
-            frame::write_frame(&mut stream, &json!({"ok": {}}))
-                .map_err(|e| KernelError::Corrupt(format!("hello ack: {e}")))?;
-            Ok((stream, hello["hello"].clone()))
-        };
-
-        let (serve_stream, name, verbs, tools_meta, mut expected) =
-            match accept_hello(&mut child) {
-                Ok((stream, h)) if h["role"] == "serve" => {
-                    let name = h["name"].as_str().unwrap_or("?").to_string();
-                    let verbs: Vec<String> = h["verbs"]
-                        .as_array()
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    // Optional per-verb tool metadata (description + schema),
-                    // joined into `grants` introspection responses.
-                    let tools_meta = h["tools"].clone();
-                    let channels: Vec<String> = h["channels"]
-                        .as_array()
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                                .collect()
-                        })
-                        .unwrap_or_else(|| vec!["client".to_string()]);
-                    (stream, name, verbs, tools_meta, channels)
+        let accept_hello =
+            |child: &mut std::process::Child| -> Result<(UnixStream, Value), KernelError> {
+                let mut stream = accept_with_deadline(&listener, child, SPAWN_DEADLINE_MS)?;
+                let hello = frame::read_frame(&mut stream)
+                    .map_err(|e| KernelError::Corrupt(format!("hello: {e}")))?;
+                if hello["hello"]["token"].as_str() != Some(token.as_str()) {
+                    let _ = frame::write_frame(&mut stream, &json!({"err": "bad token"}));
+                    return Err(KernelError::Denied("plugin hello: bad token".into()));
                 }
-                Ok(_) => {
-                    let _ = child.kill();
-                    return Err(KernelError::Corrupt(
-                        "plugin hello: first connection must be role serve".into(),
-                    ));
-                }
-                Err(e) => {
-                    let _ = child.kill();
-                    return Err(e);
-                }
+                frame::write_frame(&mut stream, &json!({"ok": {}}))
+                    .map_err(|e| KernelError::Corrupt(format!("hello ack: {e}")))?;
+                Ok((stream, hello["hello"].clone()))
             };
+
+        let (serve_stream, name, verbs, tools_meta, mut expected) = match accept_hello(&mut child) {
+            Ok((stream, h)) if h["role"] == "serve" => {
+                let name = h["name"].as_str().unwrap_or("?").to_string();
+                let verbs: Vec<String> = h["verbs"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                // Optional per-verb tool metadata (description + schema),
+                // joined into `grants` introspection responses.
+                let tools_meta = h["tools"].clone();
+                let channels: Vec<String> = h["channels"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_else(|| vec!["client".to_string()]);
+                (stream, name, verbs, tools_meta, channels)
+            }
+            Ok(_) => {
+                let _ = child.kill();
+                return Err(KernelError::Corrupt(
+                    "plugin hello: first connection must be role serve".into(),
+                ));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                return Err(e);
+            }
+        };
         if !expected.iter().any(|c| c == "client") {
             let _ = child.kill();
             return Err(KernelError::Corrupt(
@@ -290,9 +289,8 @@ impl Host {
         Ok(name)
     }
 
-    /// Kernel-initiated verb call on a named plugin (no capability check:
-    /// kernel-side callers act with root authority; user-session grants come
-    /// later via consent).
+    /// Kernel-initiated verb call on a named plugin. No capability check:
+    /// kernel-side callers act with root authority.
     pub fn call(&self, plugin: &str, verb: &str, args: Value) -> Result<Value, KernelError> {
         let handle = self
             .inner
@@ -407,8 +405,8 @@ fn call_on(handle: &PluginHandle, verb: &str, args: Value) -> Result<Value, Kern
     let mut s = handle.serve.lock().unwrap();
     frame::write_frame(&mut *s, &json!({"op": "call", "verb": verb, "args": args}))
         .map_err(|e| KernelError::Corrupt(format!("call write: {e}")))?;
-    let resp = frame::read_frame(&mut *s)
-        .map_err(|e| KernelError::Corrupt(format!("call read: {e}")))?;
+    let resp =
+        frame::read_frame(&mut *s).map_err(|e| KernelError::Corrupt(format!("call read: {e}")))?;
     if let Some(err) = resp.get("err").and_then(|e| e.as_str()) {
         return Err(KernelError::Denied(format!("plugin error: {err}")));
     }
@@ -582,7 +580,10 @@ fn handle_client_op(
             let short = verb.rsplit("::").next().unwrap_or(verb);
             let subject = format!("plugin:{name}");
             let resource = format!("driver:{family}");
-            let cap = match kernel.caps.find_and_exercise(&subject, &resource, short, now) {
+            let cap = match kernel
+                .caps
+                .find_and_exercise(&subject, &resource, short, now)
+            {
                 Ok(id) => id,
                 Err(e) => {
                     let _ = kernel.audit.lock().unwrap().append(json!({

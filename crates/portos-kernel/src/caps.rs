@@ -140,7 +140,9 @@ impl CapStore {
                 .collect::<Result<_, _>>()?;
             rows.iter()
                 .filter_map(|j| serde_json::from_str::<Capability>(j).ok())
-                .filter(|c| c.subject == subject && c.resource == resource && c.verbs.contains(verb))
+                .filter(|c| {
+                    c.subject == subject && c.resource == resource && c.verbs.contains(verb)
+                })
                 .collect()
         };
         if candidates.is_empty() {
@@ -170,8 +172,7 @@ impl CapStore {
             .iter()
             .filter_map(|j| serde_json::from_str::<Capability>(j).ok())
             .filter(|c| {
-                c.subject == subject
-                    && c.constraints.expires_at.map(|e| now <= e).unwrap_or(true)
+                c.subject == subject && c.constraints.expires_at.map(|e| now <= e).unwrap_or(true)
             })
             .collect())
     }

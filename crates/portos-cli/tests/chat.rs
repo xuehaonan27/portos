@@ -16,11 +16,18 @@ use std::sync::{Arc, Mutex};
 const CLI_BIN: &str = env!("CARGO_BIN_EXE_portos");
 
 fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap()
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap()
 }
 
 fn browser_ready() -> Option<(PathBuf, PathBuf)> {
-    if std::process::Command::new("node").arg("--version").output().is_err() {
+    if std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
         eprintln!("skipping: node not found");
         return None;
     }
@@ -30,7 +37,10 @@ fn browser_ready() -> Option<(PathBuf, PathBuf)> {
         eprintln!("skipping: browser driver not installed (npm install in drivers/browser)");
         return None;
     }
-    Some((plugin, repo_root().join("drivers/browser/test/fixture.html")))
+    Some((
+        plugin,
+        repo_root().join("drivers/browser/test/fixture.html"),
+    ))
 }
 
 fn setup(tag: &str) -> (Arc<Kernel>, Host, PathBuf) {
@@ -73,7 +83,9 @@ fn serve_html(n: usize, html: String) -> u16 {
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
         for _ in 0..n {
-            let Ok((mut conn, _)) = listener.accept() else { return };
+            let Ok((mut conn, _)) = listener.accept() else {
+                return;
+            };
             let _ = read_request(&mut conn);
             let head = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -100,7 +112,9 @@ fn mock_provider(bodies: Vec<String>) -> (u16, Arc<Mutex<Vec<String>>>) {
     let cap = captured.clone();
     std::thread::spawn(move || {
         for body in bodies {
-            let Ok((mut conn, _)) = listener.accept() else { return };
+            let Ok((mut conn, _)) = listener.accept() else {
+                return;
+            };
             let req = read_request(&mut conn);
             cap.lock().unwrap().push(req);
             let head = format!(
@@ -123,7 +137,9 @@ fn write_json(path: &Path, v: &Value) {
 /// kernel mode, screenshot-as-artifact, and origin taint labels.
 #[test]
 fn browser_adapter_serves_verbs_and_data_plane() {
-    let Some((plugin, fixture)) = browser_ready() else { return };
+    let Some((plugin, fixture)) = browser_ready() else {
+        return;
+    };
     let (kernel, host, root) = setup("adapter");
     let profile = root.join("profile");
 
@@ -143,9 +159,14 @@ fn browser_adapter_serves_verbs_and_data_plane() {
     assert_eq!(name, "portos-browser");
 
     let url = format!("file://{}", fixture.display());
-    let snap = host.call(&name, "browser::open", json!({"url": url})).unwrap();
+    let snap = host
+        .call(&name, "browser::open", json!({"url": url}))
+        .unwrap();
     assert!(snap["title"].as_str().unwrap().contains("Workshop Fixture"));
-    assert!(snap["elements"].as_array().unwrap().len() >= 3, "inline snapshot keeps the element table");
+    assert!(
+        snap["elements"].as_array().unwrap().len() >= 3,
+        "inline snapshot keeps the element table"
+    );
 
     let shot = host.call(&name, "browser::screenshot", json!({})).unwrap();
     let handle = shot["handle"].as_str().unwrap().to_string();
@@ -173,7 +194,9 @@ fn browser_adapter_serves_verbs_and_data_plane() {
     let out = host
         .call(&name, "browser::open", json!({"url": format!("{origin}/")}))
         .unwrap();
-    let handle = out["handle"].as_str().expect("oversized snapshot becomes a handle");
+    let handle = out["handle"]
+        .as_str()
+        .expect("oversized snapshot becomes a handle");
     assert!(!out["preview"].as_str().unwrap().is_empty());
     let meta = kernel.cas.meta(&handle.to_string()).unwrap();
     assert_eq!(meta.r#type, "web/page-snapshot");
@@ -191,14 +214,20 @@ fn browser_adapter_serves_verbs_and_data_plane() {
 /// `model::session::*` owns the terminal output.
 #[test]
 fn portos_chat_with_renderer_plugin() {
-    if std::process::Command::new("node").arg("--version").output().is_err() {
+    if std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
         eprintln!("skipping: node not found");
         return;
     }
     let renderer = repo_root().join("drivers/render-tty/render.mjs");
     assert!(renderer.exists());
     let cli = Path::new(CLI_BIN);
-    if !cli.with_file_name("portos-broker").exists() || !cli.with_file_name("portos-modeld").exists() {
+    if !cli.with_file_name("portos-broker").exists()
+        || !cli.with_file_name("portos-modeld").exists()
+    {
         eprintln!("skipping: sibling binaries not built");
         return;
     }
@@ -209,12 +238,24 @@ fn portos_chat_with_renderer_plugin() {
 
     let turn = sse(&[
         ("message_start", json!({"type": "message_start"})),
-        ("content_block_start", json!({"type": "content_block_start", "index": 0,
-            "content_block": {"type": "text", "text": ""}})),
-        ("content_block_delta", json!({"type": "content_block_delta", "index": 0,
-            "delta": {"type": "text_delta", "text": "Hello from the renderer"}})),
-        ("content_block_stop", json!({"type": "content_block_stop", "index": 0})),
-        ("message_delta", json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}})),
+        (
+            "content_block_start",
+            json!({"type": "content_block_start", "index": 0,
+            "content_block": {"type": "text", "text": ""}}),
+        ),
+        (
+            "content_block_delta",
+            json!({"type": "content_block_delta", "index": 0,
+            "delta": {"type": "text_delta", "text": "Hello from the renderer"}}),
+        ),
+        (
+            "content_block_stop",
+            json!({"type": "content_block_stop", "index": 0}),
+        ),
+        (
+            "message_delta",
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}}),
+        ),
         ("message_stop", json!({"type": "message_stop"})),
     ]);
     let (port, _captured) = mock_provider(vec![turn]);
@@ -251,13 +292,23 @@ fn portos_chat_with_renderer_plugin() {
     let pid = child.id();
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_secs(120));
-        let _ = std::process::Command::new("kill").args(["-9", &pid.to_string()]).output();
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .output();
     });
-    child.stdin.take().unwrap().write_all(b"hi\n/exit\n").unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"hi\n/exit\n")
+        .unwrap();
     let out = child.wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "chat exited badly.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        out.status.success(),
+        "chat exited badly.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
 
     assert!(
         stdout.contains("Hello from the renderer"),
@@ -278,7 +329,9 @@ fn portos_chat_with_renderer_plugin() {
 /// The whole runtime through the real CLI binary and a scripted provider.
 #[test]
 fn portos_chat_end_to_end() {
-    let Some((plugin, fixture)) = browser_ready() else { return };
+    let Some((plugin, fixture)) = browser_ready() else {
+        return;
+    };
     let cli = Path::new(CLI_BIN);
     let have = |n: &str| cli.with_file_name(n).exists();
     if !have("portos-broker") || !have("portos-modeld") {
@@ -293,29 +346,62 @@ fn portos_chat_end_to_end() {
 
     let turn1 = sse(&[
         ("message_start", json!({"type": "message_start"})),
-        ("content_block_start", json!({"type": "content_block_start", "index": 0,
-            "content_block": {"type": "text", "text": ""}})),
-        ("content_block_delta", json!({"type": "content_block_delta", "index": 0,
-            "delta": {"type": "text_delta", "text": "Opening the page."}})),
-        ("content_block_stop", json!({"type": "content_block_stop", "index": 0})),
-        ("content_block_start", json!({"type": "content_block_start", "index": 1,
+        (
+            "content_block_start",
+            json!({"type": "content_block_start", "index": 0,
+            "content_block": {"type": "text", "text": ""}}),
+        ),
+        (
+            "content_block_delta",
+            json!({"type": "content_block_delta", "index": 0,
+            "delta": {"type": "text_delta", "text": "Opening the page."}}),
+        ),
+        (
+            "content_block_stop",
+            json!({"type": "content_block_stop", "index": 0}),
+        ),
+        (
+            "content_block_start",
+            json!({"type": "content_block_start", "index": 1,
             "content_block": {"type": "tool_use", "id": "toolu_1", "name": "browser__open",
-                               "input": {}}})),
-        ("content_block_delta", json!({"type": "content_block_delta", "index": 1,
+                               "input": {}}}),
+        ),
+        (
+            "content_block_delta",
+            json!({"type": "content_block_delta", "index": 1,
             "delta": {"type": "input_json_delta",
-                       "partial_json": json!({"url": fixture_url}).to_string()}})),
-        ("content_block_stop", json!({"type": "content_block_stop", "index": 1})),
-        ("message_delta", json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}})),
+                       "partial_json": json!({"url": fixture_url}).to_string()}}),
+        ),
+        (
+            "content_block_stop",
+            json!({"type": "content_block_stop", "index": 1}),
+        ),
+        (
+            "message_delta",
+            json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}}),
+        ),
         ("message_stop", json!({"type": "message_stop"})),
     ]);
     let turn2 = sse(&[
         ("message_start", json!({"type": "message_start"})),
-        ("content_block_start", json!({"type": "content_block_start", "index": 0,
-            "content_block": {"type": "text", "text": ""}})),
-        ("content_block_delta", json!({"type": "content_block_delta", "index": 0,
-            "delta": {"type": "text_delta", "text": "Opened: done"}})),
-        ("content_block_stop", json!({"type": "content_block_stop", "index": 0})),
-        ("message_delta", json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}})),
+        (
+            "content_block_start",
+            json!({"type": "content_block_start", "index": 0,
+            "content_block": {"type": "text", "text": ""}}),
+        ),
+        (
+            "content_block_delta",
+            json!({"type": "content_block_delta", "index": 0,
+            "delta": {"type": "text_delta", "text": "Opened: done"}}),
+        ),
+        (
+            "content_block_stop",
+            json!({"type": "content_block_stop", "index": 0}),
+        ),
+        (
+            "message_delta",
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}}),
+        ),
         ("message_stop", json!({"type": "message_stop"})),
     ]);
     let (port, captured) = mock_provider(vec![turn1, turn2]);
@@ -326,7 +412,10 @@ fn portos_chat_end_to_end() {
         &json!({"allow": [{"host": "127.0.0.1", "insecure_http": true,
                             "inject": {"x-api-key": "k1"}}]}),
     );
-    write_json(&root.join("broker/secrets.json"), &json!({"k1": "fake-test-key"}));
+    write_json(
+        &root.join("broker/secrets.json"),
+        &json!({"k1": "fake-test-key"}),
+    );
     write_json(
         &root.join("modeld/config.json"),
         &json!({
@@ -366,7 +455,9 @@ fn portos_chat_end_to_end() {
     let pid = child.id();
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_secs(120));
-        let _ = std::process::Command::new("kill").args(["-9", &pid.to_string()]).output();
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .output();
     });
     child
         .stdin
@@ -377,12 +468,27 @@ fn portos_chat_end_to_end() {
     let out = child.wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "chat exited badly.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        out.status.success(),
+        "chat exited badly.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
 
-    assert!(stdout.contains("Opening the page."), "first-turn deltas streamed:\n{stdout}");
-    assert!(stdout.contains("[tool→] browser::open"), "tool call surfaced:\n{stdout}");
-    assert!(stdout.contains("[tool✓] browser::open"), "tool result surfaced:\n{stdout}");
-    assert!(stdout.contains("Opened: done"), "final turn streamed:\n{stdout}");
+    assert!(
+        stdout.contains("Opening the page."),
+        "first-turn deltas streamed:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("[tool→] browser::open"),
+        "tool call surfaced:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("[tool✓] browser::open"),
+        "tool result surfaced:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Opened: done"),
+        "final turn streamed:\n{stdout}"
+    );
 
     // The provider saw the injected key, the tool definition, and — in turn
     // two — the browser's actual snapshot riding in the tool result.

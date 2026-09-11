@@ -76,7 +76,11 @@ fn main() -> std::io::Result<()> {
                 // bytes and stream them into the CAS.
                 "put_pattern" => {
                     let n = arg(0).as_u64().unwrap_or(0);
-                    let meta = client.put(PatternReader { left: n, pos: 0 }, "test/pattern", Value::Null)?;
+                    let meta = client.put(
+                        PatternReader { left: n, pos: 0 },
+                        "test/pattern",
+                        Value::Null,
+                    )?;
                     Ok(json!({ "meta": meta }))
                 }
                 // invoke another plugin's verb through the kernel (cap-gated
