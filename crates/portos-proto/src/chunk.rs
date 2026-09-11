@@ -15,26 +15,13 @@ pub const CHUNK_MAX: u32 = 4 * 1024 * 1024;
 /// Size writers aim for. Anything ≤ CHUNK_MAX is legal on the wire.
 pub const CHUNK_SIZE: usize = 1024 * 1024;
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ChunkError {
-    Io(std::io::Error),
+    #[error("chunk io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("chunk too large: {0}")]
     TooLarge(u32),
 }
-
-impl From<std::io::Error> for ChunkError {
-    fn from(e: std::io::Error) -> Self {
-        ChunkError::Io(e)
-    }
-}
-impl std::fmt::Display for ChunkError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ChunkError::Io(e) => write!(f, "chunk io: {e}"),
-            ChunkError::TooLarge(n) => write!(f, "chunk too large: {n}"),
-        }
-    }
-}
-impl std::error::Error for ChunkError {}
 
 /// Write one chunk. Empty slices are illegal (the empty chunk is the
 /// terminator); use [`finish`] to end the stream.

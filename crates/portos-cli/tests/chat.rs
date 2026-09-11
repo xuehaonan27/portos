@@ -13,6 +13,32 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+// --- test boundary ------------------------------------------------------
+// A test owns the domain meaning of what it sends and asserts, so it works
+// in plain JSON. These wrappers convert at that boundary, which is exactly
+// where the typed kernel API expects it to happen.
+
+fn vb(s: &str) -> portos_proto::ids::Verb {
+    portos_proto::ids::Verb::parse(s).expect("test verb")
+}
+
+fn pl(v: &serde_json::Value) -> portos_proto::wire::Payload {
+    portos_proto::wire::Payload::of(v).expect("test payload")
+}
+
+fn js(p: &portos_proto::wire::Payload) -> serde_json::Value {
+    p.parse().expect("test payload is json")
+}
+
+fn call(
+    host: &Host,
+    plugin: &portos_proto::ids::PluginName,
+    verb: &str,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, portos_kernel::KernelError> {
+    host.call(plugin, &vb(verb), pl(&args)).map(|p| js(&p))
+}
+
 const CLI_BIN: &str = env!("CARGO_BIN_EXE_portos");
 
 fn repo_root() -> PathBuf {
@@ -156,19 +182,17 @@ fn browser_adapter_serves_verbs_and_data_plane() {
             ],
         )
         .unwrap();
-    assert_eq!(name, "portos-browser");
+    assert_eq!(name.as_str(), "portos-browser");
 
     let url = format!("file://{}", fixture.display());
-    let snap = host
-        .call(&name, "browser::open", json!({"url": url}))
-        .unwrap();
+    let snap = call(&host, &name, "browser::open", json!({"url": url})).unwrap();
     assert!(snap["title"].as_str().unwrap().contains("Workshop Fixture"));
     assert!(
         snap["elements"].as_array().unwrap().len() >= 3,
         "inline snapshot keeps the element table"
     );
 
-    let shot = host.call(&name, "browser::screenshot", json!({})).unwrap();
+    let shot = call(&host, &name, "browser::screenshot", json!({})).unwrap();
     let handle = shot["handle"].as_str().unwrap().to_string();
     let meta = kernel.cas.meta(&handle).unwrap();
     assert_eq!(meta.r#type, "image/png");
@@ -191,9 +215,13 @@ fn browser_adapter_serves_verbs_and_data_plane() {
             ],
         )
         .unwrap();
-    let out = host
-        .call(&name, "browser::open", json!({"url": format!("{origin}/")}))
-        .unwrap();
+    let out = call(
+        &host,
+        &name,
+        "browser::open",
+        json!({"url": format!("{origin}/")}),
+    )
+    .unwrap();
     let handle = out["handle"]
         .as_str()
         .expect("oversized snapshot becomes a handle");

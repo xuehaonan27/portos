@@ -1,10 +1,11 @@
 [package]
-name = "portos-sdk"
+name = "portos-model-api"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-portos-proto = { path = "../portos-proto" }
+portos-proto = { path = "../../crates/portos-proto" }
 serde = { workspace = true }
+
+[dev-dependencies]
 serde_json = { workspace = true }
-thiserror = { workspace = true }

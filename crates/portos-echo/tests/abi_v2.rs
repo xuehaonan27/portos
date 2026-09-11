@@ -10,6 +10,36 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+// --- test boundary ------------------------------------------------------
+// A test owns the domain meaning of what it sends and asserts, so it works
+// in plain JSON. These wrappers convert at that boundary, which is exactly
+// where the typed kernel API expects it to happen.
+
+fn vb(s: &str) -> portos_proto::ids::Verb {
+    portos_proto::ids::Verb::parse(s).expect("test verb")
+}
+
+fn tp(s: &str) -> portos_proto::ids::Topic {
+    portos_proto::ids::Topic::parse(s).expect("test topic")
+}
+
+fn pl(v: &serde_json::Value) -> portos_proto::wire::Payload {
+    portos_proto::wire::Payload::of(v).expect("test payload")
+}
+
+fn js(p: &portos_proto::wire::Payload) -> serde_json::Value {
+    p.parse().expect("test payload is json")
+}
+
+fn call(
+    host: &Host,
+    plugin: &portos_proto::ids::PluginName,
+    verb: &str,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, portos_kernel::KernelError> {
+    host.call(plugin, &vb(verb), pl(&args)).map(|p| js(&p))
+}
+
 const ECHO_BIN: &str = env!("CARGO_BIN_EXE_portos-echo");
 
 fn setup(tag: &str) -> (Arc<Kernel>, Host, PathBuf) {
@@ -21,7 +51,7 @@ fn setup(tag: &str) -> (Arc<Kernel>, Host, PathBuf) {
     (kernel, host, root)
 }
 
-fn spawn_echo(host: &Host, family: &str) -> String {
+fn spawn_echo(host: &Host, family: &str) -> portos_proto::ids::PluginName {
     host.spawn(Path::new(ECHO_BIN), &[], &[("PORTOS_ECHO_FAMILY", family)])
         .unwrap()
 }
@@ -34,7 +64,7 @@ fn pattern(n: usize) -> Vec<u8> {
 fn call_stream_digest_and_ephemeral_refs() {
     let (kernel, host, root) = setup("digest");
     let name = spawn_echo(&host, "echo");
-    assert_eq!(name, "portos-echo");
+    assert_eq!(name.as_str(), "portos-echo");
 
     // 4 MiB in through the kernel, digested by the plugin over the chunked
     // read path — the payload never rides in a JSON frame.
@@ -48,7 +78,7 @@ fn call_stream_digest_and_ephemeral_refs() {
             "test",
         )
         .unwrap();
-    let out = host.call(&name, "echo::digest", json!([meta.id])).unwrap();
+    let out = call(&host, &name, "echo::digest", json!([meta.id])).unwrap();
     assert_eq!(out["bytes"].as_u64(), Some(payload.len() as u64));
     let head_hex: String = payload[..32].iter().map(|b| format!("{b:02x}")).collect();
     assert_eq!(out["head_hex"].as_str(), Some(head_hex.as_str()));
@@ -58,11 +88,11 @@ fn call_stream_digest_and_ephemeral_refs() {
     );
 
     // Two-layer naming: ephemeral refs are plugin-local and go stale there.
-    let r = host.call(&name, "echo::make_ref", json!([])).unwrap();
+    let r = call(&host, &name, "echo::make_ref", json!([])).unwrap();
     let rid = r["ref"].as_str().unwrap().to_string();
-    let used = host.call(&name, "echo::use_ref", json!([rid])).unwrap();
+    let used = call(&host, &name, "echo::use_ref", json!([rid])).unwrap();
     assert!(used["used"].is_string());
-    let stale = host.call(&name, "echo::use_ref", json!(["e999"]));
+    let stale = call(&host, &name, "echo::use_ref", json!(["e999"]));
     assert!(stale.is_err(), "stale ephemeral ref must be rejected");
 
     host.shutdown_all();
@@ -84,11 +114,11 @@ fn accept_zero_context_data_plane() {
     let n = mb * 1024 * 1024;
 
     // Plugin streams n bytes INTO the CAS through its client channel…
-    let stored = host.call(&name, "echo::put_pattern", json!([n])).unwrap();
+    let stored = call(&host, &name, "echo::put_pattern", json!([n])).unwrap();
     let id = stored["meta"]["id"].as_str().unwrap().to_string();
     assert_eq!(stored["meta"]["size"].as_u64(), Some(n));
     // …and reads them back out for the digest.
-    let out = host.call(&name, "echo::digest", json!([id])).unwrap();
+    let out = call(&host, &name, "echo::digest", json!([id])).unwrap();
     assert_eq!(out["bytes"].as_u64(), Some(n));
 
     let (context, data) = host.meter();
@@ -136,7 +166,7 @@ fn invoke_is_capability_gated_routed_and_audited() {
         )
         .unwrap();
 
-    let relay = |args: Value| host.call(&a, "echoa::relay", args);
+    let relay = |args: Value| call(&host, &a, "echoa::relay", args);
 
     // Two invokes pass, the third exhausts the counting budget.
     assert!(relay(json!(["echob::emit", ["one"]])).is_ok());
@@ -167,26 +197,29 @@ fn events_flow_to_local_and_plugin_subscribers() {
     let b = spawn_echo(&host, "echob");
 
     // A local (in-process) subscriber and a plugin subscriber on one topic.
-    let (_sub, rx) = host.subscribe_local("echoa::ping");
-    host.call(&b, "echob::subscribe", json!(["echoa::ping"]))
-        .unwrap();
+    let (_sub, rx) = host.subscribe_local(&tp("echoa::ping"));
+    call(&host, &b, "echob::subscribe", json!(["echoa::ping"])).unwrap();
 
-    let out = host
-        .call(&a, "echoa::publish", json!(["echoa::ping", {"k": 1}]))
-        .unwrap();
+    let out = call(
+        &host,
+        &a,
+        "echoa::publish",
+        json!(["echoa::ping", {"k": 1}]),
+    )
+    .unwrap();
     assert_eq!(out["delivered"].as_u64(), Some(2));
 
     let ev = rx
         .recv_timeout(std::time::Duration::from_secs(5))
         .expect("local subscriber receives the event");
-    assert_eq!(ev["topic"].as_str(), Some("echoa::ping"));
-    assert_eq!(ev["data"]["k"].as_u64(), Some(1));
+    assert_eq!(ev.topic.as_str(), "echoa::ping");
+    assert_eq!(js(&ev.data)["k"].as_u64(), Some(1));
 
     // The plugin subscriber sees it on its serve channel (poll: delivery is
     // asynchronous through the bounded queue).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        let evs = host.call(&b, "echob::events", json!([])).unwrap();
+        let evs = call(&host, &b, "echob::events", json!([])).unwrap();
         if let Some(list) = evs.as_array() {
             if list
                 .iter()
@@ -211,17 +244,20 @@ fn slow_local_subscriber_is_dropped_not_wedged() {
     let (_kernel, host, root) = setup("overflow");
     // Subscribe and never drain: the bounded queue fills, the subscriber is
     // dropped, and later emits simply deliver to nobody.
-    let (_sub, rx) = host.subscribe_local("noisy::topic");
+    let (_sub, rx) = host.subscribe_local(&tp("noisy::topic"));
     let mut dropped = false;
     for i in 0..(portos_kernel::host::EVENT_QUEUE + 16) {
-        let delivered = host.emit("noisy::topic", json!({"i": i}));
+        let delivered = host.emit(&tp("noisy::topic"), pl(&json!({"i": i})));
         if delivered == 0 {
             dropped = true;
             break;
         }
     }
     assert!(dropped, "overflowing subscriber must be dropped");
-    assert_eq!(host.emit("noisy::topic", json!({"late": true})), 0);
+    assert_eq!(
+        host.emit(&tp("noisy::topic"), pl(&json!({"late": true}))),
+        0
+    );
     // Whatever was queued before the drop is still readable.
     assert!(rx.try_recv().is_ok());
     let _ = std::fs::remove_dir_all(&root);
@@ -234,13 +270,18 @@ fn wildcard_topics_and_grants_introspection() {
     let b = spawn_echo(&host, "echob");
 
     // Wildcard subscription: a prefix pattern sees every matching topic.
-    let (_sub, rx) = host.subscribe_local("echoa::*");
-    host.call(&a, "echoa::publish", json!(["echoa::anything", {"n": 9}]))
-        .unwrap();
+    let (_sub, rx) = host.subscribe_local(&tp("echoa::*"));
+    call(
+        &host,
+        &a,
+        "echoa::publish",
+        json!(["echoa::anything", {"n": 9}]),
+    )
+    .unwrap();
     let ev = rx
         .recv_timeout(std::time::Duration::from_secs(5))
         .expect("wildcard subscriber receives the event");
-    assert_eq!(ev["topic"].as_str(), Some("echoa::anything"));
+    assert_eq!(ev.topic.as_str(), "echoa::anything");
 
     // Grants introspection: A's live caps joined with B's advertised verb
     // metadata — a ready-made tool definition, no config duplication.
@@ -259,7 +300,7 @@ fn wildcard_topics_and_grants_introspection() {
             None,
         )
         .unwrap();
-    let grants = host.call(&a, "echoa::grants", json!([])).unwrap();
+    let grants = call(&host, &a, "echoa::grants", json!([])).unwrap();
     let list = grants.as_array().unwrap();
     let emit = list
         .iter()
@@ -305,16 +346,14 @@ fn js_plugin_speaks_abi_v2() {
     let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/js-plugin.mjs");
     let (kernel, host, root) = setup("js");
     let name = host.spawn(Path::new("node"), &[fixture], &[]).unwrap();
-    assert_eq!(name, "portos-jse");
+    assert_eq!(name.as_str(), "portos-jse");
 
     // call
-    let out = host.call(&name, "jse::ping", json!(["hi", 2])).unwrap();
+    let out = call(&host, &name, "jse::ping", json!(["hi", 2])).unwrap();
     assert_eq!(out["pong"], json!(["hi", 2]));
 
     // plugin put → kernel-side readback
-    let stored = host
-        .call(&name, "jse::store", json!(["chunked hello from js"]))
-        .unwrap();
+    let stored = call(&host, &name, "jse::store", json!(["chunked hello from js"])).unwrap();
     let id = stored["meta"]["id"].as_str().unwrap().to_string();
     let mut f = kernel.cas.open_read(&id).unwrap();
     let mut s = String::new();
@@ -332,19 +371,17 @@ fn js_plugin_speaks_abi_v2() {
             "test",
         )
         .unwrap();
-    let fetched = host.call(&name, "jse::fetch", json!([meta.id])).unwrap();
+    let fetched = call(&host, &name, "jse::fetch", json!([meta.id])).unwrap();
     assert_eq!(fetched["text"].as_str(), Some("kernel says hi"));
 
     // plugin emit → local subscriber
-    let (_sub, rx) = host.subscribe_local("jse::tick");
-    let pub_out = host
-        .call(&name, "jse::publish", json!(["jse::tick", {"n": 7}]))
-        .unwrap();
+    let (_sub, rx) = host.subscribe_local(&tp("jse::tick"));
+    let pub_out = call(&host, &name, "jse::publish", json!(["jse::tick", {"n": 7}])).unwrap();
     assert_eq!(pub_out["delivered"].as_u64(), Some(1));
     let ev = rx
         .recv_timeout(std::time::Duration::from_secs(5))
         .expect("event from js plugin");
-    assert_eq!(ev["data"]["n"].as_u64(), Some(7));
+    assert_eq!(js(&ev.data)["n"].as_u64(), Some(7));
 
     host.shutdown_all();
     let _ = std::fs::remove_dir_all(&root);

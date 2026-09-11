@@ -1,10 +1,12 @@
 //! Capability table. Currently using SQLite to store it.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
 };
 
+use portos_proto::ids::Verb;
+use portos_proto::wire::{Grant, Payload, ToolMeta};
 use portos_proto::{Capability, Constraints};
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -177,6 +179,58 @@ impl CapStore {
             .collect())
     }
 
+    /// What `subject` may invoke right now, as ready-made tool definitions.
+    ///
+    /// The capability table supplies the verbs and the remaining budget; the
+    /// caller supplies `meta`, which looks a verb up in the route table for
+    /// whatever its driver advertised. Several capabilities may cover the
+    /// same verb, so budgets merge: an unlimited grant beats a counted one,
+    /// and among counted grants the largest balance wins — matching
+    /// `find_and_exercise`, which falls through an exhausted grant to a
+    /// fresh one.
+    pub fn grants_for(
+        &self,
+        subject: &str,
+        now: u64,
+        meta: impl Fn(&Verb) -> Option<ToolMeta>,
+    ) -> Result<Vec<Grant>, KernelError> {
+        let mut merged: BTreeMap<Verb, Option<u64>> = BTreeMap::new();
+        for cap in self.list_live(subject, now)? {
+            let Some(family) = cap.resource.strip_prefix("driver:") else {
+                continue;
+            };
+            for short in &cap.verbs {
+                // A capability row naming a verb this kernel cannot parse is
+                // unroutable anyway; leave it out rather than fail the call.
+                let Ok(verb) = Verb::new(family, short) else {
+                    continue;
+                };
+                let this = cap.constraints.counts.get(short).copied();
+                merged
+                    .entry(verb)
+                    .and_modify(|acc| {
+                        *acc = match (*acc, this) {
+                            (None, _) | (_, None) => None, // unlimited wins
+                            (Some(a), Some(b)) => Some(a.max(b)),
+                        }
+                    })
+                    .or_insert(this);
+            }
+        }
+        Ok(merged
+            .into_iter()
+            .map(|(verb, counts_left)| {
+                let m = meta(&verb).unwrap_or_default();
+                Grant {
+                    description: m.description,
+                    schema: m.schema.unwrap_or_else(empty_object_schema),
+                    verb,
+                    counts_left,
+                }
+            })
+            .collect())
+    }
+
     /// Revoke a capability and everything attenuated from it.
     pub fn revoke(&self, cap_id: &str) -> Result<u64, KernelError> {
         let mut frontier = vec![cap_id.to_string()];
@@ -201,6 +255,12 @@ impl CapStore {
     }
 }
 
+/// What a verb's schema defaults to when its driver advertised none: an
+/// object with no declared properties, which every provider accepts.
+fn empty_object_schema() -> Payload {
+    Payload::of(&serde_json::json!({"type": "object"})).expect("constant schema serializes")
+}
+
 fn rand_id() -> String {
     use rand::RngCore;
     let mut b = [0u8; 8];
@@ -211,7 +271,6 @@ fn rand_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
     fn store(tag: &str) -> (CapStore, std::path::PathBuf) {
         let root = std::env::temp_dir().join(format!("portos-caps-{}-{}", tag, std::process::id()));

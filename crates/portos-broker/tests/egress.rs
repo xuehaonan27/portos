@@ -14,6 +14,36 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+// --- test boundary ------------------------------------------------------
+// A test owns the domain meaning of what it sends and asserts, so it works
+// in plain JSON. These wrappers convert at that boundary, which is exactly
+// where the typed kernel API expects it to happen.
+
+fn vb(s: &str) -> portos_proto::ids::Verb {
+    portos_proto::ids::Verb::parse(s).expect("test verb")
+}
+
+fn tp(s: &str) -> portos_proto::ids::Topic {
+    portos_proto::ids::Topic::parse(s).expect("test topic")
+}
+
+fn pl(v: &serde_json::Value) -> portos_proto::wire::Payload {
+    portos_proto::wire::Payload::of(v).expect("test payload")
+}
+
+fn js(p: &portos_proto::wire::Payload) -> serde_json::Value {
+    p.parse().expect("test payload is json")
+}
+
+fn call(
+    host: &Host,
+    plugin: &portos_proto::ids::PluginName,
+    verb: &str,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, portos_kernel::KernelError> {
+    host.call(plugin, &vb(verb), pl(&args)).map(|p| js(&p))
+}
+
 const BROKER_BIN: &str = env!("CARGO_BIN_EXE_portos-broker");
 
 fn setup(tag: &str) -> (Arc<Kernel>, Host, PathBuf) {
@@ -26,7 +56,12 @@ fn setup(tag: &str) -> (Arc<Kernel>, Host, PathBuf) {
 }
 
 /// Write broker config + secrets under `root/broker` and spawn the broker.
-fn spawn_broker(host: &Host, root: &Path, allow: Value, secrets: Value) -> String {
+fn spawn_broker(
+    host: &Host,
+    root: &Path,
+    allow: Value,
+    secrets: Value,
+) -> portos_proto::ids::PluginName {
     let dir = root.join("broker");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
@@ -116,7 +151,8 @@ fn denies_unlisted_host_and_plain_http() {
         json!({}),
     );
 
-    let unlisted = host.call(
+    let unlisted = call(
+        &host,
         &name,
         "egress::http",
         json!({"url": "http://127.0.0.1:9/x"}),
@@ -126,7 +162,8 @@ fn denies_unlisted_host_and_plain_http() {
         "unlisted host must be denied before any connection is attempted"
     );
 
-    let plain = host.call(
+    let plain = call(
+        &host,
         &name,
         "egress::http",
         json!({"url": "http://allowed.example/x"}),
@@ -159,20 +196,20 @@ fn injects_secret_and_sanitizes_response() {
         json!({"k1": "sekrit-value-123"}),
     );
 
-    let out = host
-        .call(
-            &name,
-            "egress::http",
-            json!({
-                "method": "POST",
-                "url": format!("http://127.0.0.1:{port}/p"),
-                // The caller tries to smuggle its own value into the injected
-                // header — the injection point must own it.
-                "headers": {"x-test-key": "attacker-value", "x-custom": "ok"},
-                "body": "hello upstream",
-            }),
-        )
-        .unwrap();
+    let out = call(
+        &host,
+        &name,
+        "egress::http",
+        json!({
+            "method": "POST",
+            "url": format!("http://127.0.0.1:{port}/p"),
+            // The caller tries to smuggle its own value into the injected
+            // header — the injection point must own it.
+            "headers": {"x-test-key": "attacker-value", "x-custom": "ok"},
+            "body": "hello upstream",
+        }),
+    )
+    .unwrap();
 
     assert_eq!(out["status"].as_u64(), Some(200));
     let wire = out["body"].as_str().unwrap();
@@ -228,14 +265,14 @@ fn streams_body_as_events() {
         json!({}),
     );
 
-    let (_sub, rx) = host.subscribe_local("sse::t1");
-    let head = host
-        .call(
-            &name,
-            "egress::http_stream",
-            json!({"url": format!("http://127.0.0.1:{port}/sse"), "topic": "sse::t1"}),
-        )
-        .unwrap();
+    let (_sub, rx) = host.subscribe_local(&tp("sse::t1"));
+    let head = call(
+        &host,
+        &name,
+        "egress::http_stream",
+        json!({"url": format!("http://127.0.0.1:{port}/sse"), "topic": "sse::t1"}),
+    )
+    .unwrap();
     assert_eq!(head["status"].as_u64(), Some(200));
 
     let mut collected = String::new();
@@ -243,14 +280,15 @@ fn streams_body_as_events() {
         let ev = rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("stream event");
-        let data = &ev["data"];
+        let data = js(&ev.data);
+        let data = &data;
         if let Some(c) = data["chunk"].as_str() {
             collected.push_str(c);
         } else if data["done"].as_bool() == Some(true) {
             assert_eq!(data["bytes"].as_u64(), Some(collected.len() as u64));
             break;
         } else {
-            panic!("unexpected stream event: {ev}");
+            panic!("unexpected stream event: {}", js(&ev.data));
         }
     }
     assert_eq!(collected, "data: one\n\ndata: two\n\ndata: done\n\n");
@@ -262,7 +300,7 @@ fn streams_body_as_events() {
 #[test]
 fn secret_stays_out_of_responses_and_audit() {
     let (kernel, host, root) = setup("noleak");
-    host.audit_topic("egress::log");
+    host.audit_topic(&tp("egress::log"));
     let port = upstream(1, |_req| http_response("", b"ok"));
     let name = spawn_broker(
         &host,
@@ -271,13 +309,13 @@ fn secret_stays_out_of_responses_and_audit() {
         json!({"k1": "sekrit-value-123"}),
     );
 
-    let out = host
-        .call(
-            &name,
-            "egress::http",
-            json!({"url": format!("http://127.0.0.1:{port}/q")}),
-        )
-        .unwrap();
+    let out = call(
+        &host,
+        &name,
+        "egress::http",
+        json!({"url": format!("http://127.0.0.1:{port}/q")}),
+    )
+    .unwrap();
     assert_eq!(out["body"].as_str(), Some("ok"));
     assert!(
         !serde_json::to_string(&out).unwrap().contains("sekrit"),
@@ -340,7 +378,7 @@ fn plugin_invoke_reaches_broker_capability_gated() {
         json!([{"host": "127.0.0.1", "insecure_http": true}]),
         json!({}),
     );
-    assert_eq!(broker, "portos-broker");
+    assert_eq!(broker.as_str(), "portos-broker");
     let caller = host
         .spawn(&echo_bin, &[], &[("PORTOS_ECHO_FAMILY", "echoa")])
         .unwrap();
@@ -358,17 +396,18 @@ fn plugin_invoke_reaches_broker_capability_gated() {
         .unwrap();
 
     let url = format!("http://127.0.0.1:{port}/via-invoke");
-    let out = host
-        .call(
-            &caller,
-            "echoa::relay",
-            json!(["egress::http", {"url": url}]),
-        )
-        .unwrap();
+    let out = call(
+        &host,
+        &caller,
+        "echoa::relay",
+        json!(["egress::http", {"url": url}]),
+    )
+    .unwrap();
     assert_eq!(out["status"].as_u64(), Some(200));
     assert_eq!(out["body"].as_str(), Some("pong"));
 
-    let denied = host.call(
+    let denied = call(
+        &host,
         &caller,
         "echoa::relay",
         json!(["egress::http_stream", {"url": "http://127.0.0.1:1/", "topic": "t"}]),

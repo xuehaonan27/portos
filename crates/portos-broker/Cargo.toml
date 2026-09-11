@@ -8,6 +8,8 @@ name = "portos-broker"
 path = "src/main.rs"
 
 [dependencies]
+portos-egress-api = { path = "../../drivers/egress-api" }
+portos-proto = { path = "../portos-proto" }
 portos-sdk = { path = "../portos-sdk" }
 serde_json = { workspace = true }
 ureq = { workspace = true }
@@ -15,4 +17,5 @@ url = { workspace = true }
 
 [dev-dependencies]
 portos-kernel = { path = "../portos-kernel" }
+portos-egress-api = { path = "../../drivers/egress-api" }
 portos-proto = { path = "../portos-proto" }

@@ -1,6 +1,6 @@
 //! Model-driver end-to-end: the full standalone-runtime chain, hermetic.
 //!
-//!   host.call(model::send)
+//!   call(&host, model::send)
 //!     → modeld (neutral core, anthropic backend)
 //!       → invoke egress::http_stream → broker (injects the API key modeld
 //!         never holds) → mock provider (scripted SSE)
@@ -20,6 +20,36 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+// --- test boundary ------------------------------------------------------
+// A test owns the domain meaning of what it sends and asserts, so it works
+// in plain JSON. These wrappers convert at that boundary, which is exactly
+// where the typed kernel API expects it to happen.
+
+fn vb(s: &str) -> portos_proto::ids::Verb {
+    portos_proto::ids::Verb::parse(s).expect("test verb")
+}
+
+fn tp(s: &str) -> portos_proto::ids::Topic {
+    portos_proto::ids::Topic::parse(s).expect("test topic")
+}
+
+fn pl(v: &serde_json::Value) -> portos_proto::wire::Payload {
+    portos_proto::wire::Payload::of(v).expect("test payload")
+}
+
+fn js(p: &portos_proto::wire::Payload) -> serde_json::Value {
+    p.parse().expect("test payload is json")
+}
+
+fn call(
+    host: &Host,
+    plugin: &portos_proto::ids::PluginName,
+    verb: &str,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, portos_kernel::KernelError> {
+    host.call(plugin, &vb(verb), pl(&args)).map(|p| js(&p))
+}
 
 const MODELD_BIN: &str = env!("CARGO_BIN_EXE_portos-modeld");
 
@@ -222,7 +252,7 @@ fn agentic_loop_end_to_end_with_tool_call() {
             &[("PORTOS_MODELD_DIR", modeld_dir.to_str().unwrap())],
         )
         .unwrap();
-    assert_eq!(modeld, "portos-modeld");
+    assert_eq!(modeld.as_str(), "portos-modeld");
 
     // Grants: egress for the LLM call, one echo verb for the tool.
     for (resource, verbs) in [
@@ -241,17 +271,17 @@ fn agentic_loop_end_to_end_with_tool_call() {
             .unwrap();
     }
 
-    let started = host.call(&modeld, "model::start", json!({})).unwrap();
+    let started = call(&host, &modeld, "model::start", json!({})).unwrap();
     let sid = started["session"].as_str().unwrap().to_string();
-    let (_sub, rx) = host.subscribe_local(&format!("model::session::{sid}"));
+    let (_sub, rx) = host.subscribe_local(&tp(&format!("model::session::{sid}")));
 
-    let out = host
-        .call(
-            &modeld,
-            "model::send",
-            json!({"session": sid, "text": "please make a ref"}),
-        )
-        .unwrap();
+    let out = call(
+        &host,
+        &modeld,
+        "model::send",
+        json!({"session": sid, "text": "please make a ref"}),
+    )
+    .unwrap();
     assert_eq!(out["text"].as_str(), Some("Ref created."));
 
     // The event stream told the story live: deltas, the tool call, its
@@ -262,7 +292,8 @@ fn agentic_loop_end_to_end_with_tool_call() {
         let ev = rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("session event");
-        let d = &ev["data"];
+        let d = js(&ev.data);
+        let d = &d;
         let kind = d["kind"].as_str().unwrap_or("?").to_string();
         if kind == "delta" {
             deltas.push_str(d["text"].as_str().unwrap_or(""));
@@ -418,15 +449,15 @@ fn introspected_tools_and_artifact_read() {
             .unwrap();
     }
 
-    let started = host.call(&modeld, "model::start", json!({})).unwrap();
+    let started = call(&host, &modeld, "model::start", json!({})).unwrap();
     let sid = started["session"].as_str().unwrap().to_string();
-    let out = host
-        .call(
-            &modeld,
-            "model::send",
-            json!({"session": sid, "text": "read the artifact"}),
-        )
-        .unwrap();
+    let out = call(
+        &host,
+        &modeld,
+        "model::send",
+        json!({"session": sid, "text": "read the artifact"}),
+    )
+    .unwrap();
     assert_eq!(out["text"].as_str(), Some("Read it."));
 
     let reqs = captured.lock().unwrap();
@@ -470,22 +501,19 @@ fn unknown_session_and_lifecycle() {
         )
         .unwrap();
 
-    let err = host.call(
+    let err = call(
+        &host,
         &modeld,
         "model::send",
         json!({"session": "nope", "text": "x"}),
     );
     assert!(err.unwrap_err().to_string().contains("unknown session"));
 
-    let s = host.call(&modeld, "model::start", json!({})).unwrap();
+    let s = call(&host, &modeld, "model::start", json!({})).unwrap();
     let sid = s["session"].as_str().unwrap().to_string();
-    let ended = host
-        .call(&modeld, "model::end", json!({"session": sid}))
-        .unwrap();
+    let ended = call(&host, &modeld, "model::end", json!({"session": sid})).unwrap();
     assert_eq!(ended["ended"].as_bool(), Some(true));
-    let again = host
-        .call(&modeld, "model::end", json!({"session": "s1"}))
-        .unwrap();
+    let again = call(&host, &modeld, "model::end", json!({"session": "s1"})).unwrap();
     assert_eq!(again["ended"].as_bool(), Some(false));
 
     host.shutdown_all();

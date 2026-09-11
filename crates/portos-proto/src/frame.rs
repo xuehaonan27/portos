@@ -3,52 +3,54 @@
 //! peer. Frames carry control-plane JSON only; payload bytes ride after a
 //! frame as a chunked byte stream (see [`crate::chunk`]) and never inside
 //! JSON.
+//!
+//! Reading and writing are generic over the frame type, so callers name the
+//! message they expect (see [`crate::wire`]) and a frame that is not that
+//! message fails here rather than downstream. [`read_bytes`] is the escape
+//! hatch for a caller that must measure or inspect the raw frame before
+//! deciding how to parse it.
 
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use std::io::{Read, Write};
 
 pub const MAX_FRAME: u32 = 8 * 1024 * 1024; // 8 MiB of JSON is already absurd
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum FrameError {
-    Io(std::io::Error),
+    #[error("frame io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("frame too large: {0}")]
     TooLarge(u32),
-    Json(serde_json::Error),
+    #[error("frame json: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
-impl From<std::io::Error> for FrameError {
-    fn from(e: std::io::Error) -> Self {
-        FrameError::Io(e)
-    }
-}
-impl From<serde_json::Error> for FrameError {
-    fn from(e: serde_json::Error) -> Self {
-        FrameError::Json(e)
-    }
-}
-impl std::fmt::Display for FrameError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FrameError::Io(e) => write!(f, "frame io: {e}"),
-            FrameError::TooLarge(n) => write!(f, "frame too large: {n}"),
-            FrameError::Json(e) => write!(f, "frame json: {e}"),
-        }
-    }
-}
-impl std::error::Error for FrameError {}
-
-pub fn write_frame<W: Write>(w: &mut W, payload: &serde_json::Value) -> Result<(), FrameError> {
+/// Write one frame. Returns the number of JSON bytes written, which is what
+/// the context meter counts.
+pub fn write_frame<W: Write, T: Serialize + ?Sized>(
+    w: &mut W,
+    payload: &T,
+) -> Result<u64, FrameError> {
     let bytes = serde_json::to_vec(payload)?;
+    write_bytes(w, &bytes)?;
+    Ok(bytes.len() as u64)
+}
+
+/// Write an already-serialized frame body.
+pub fn write_bytes<W: Write>(w: &mut W, bytes: &[u8]) -> Result<(), FrameError> {
     let len = bytes.len() as u32;
     if len > MAX_FRAME {
         return Err(FrameError::TooLarge(len));
     }
     w.write_all(&len.to_le_bytes())?;
-    w.write_all(&bytes)?;
+    w.write_all(bytes)?;
     w.flush()?;
     Ok(())
 }
 
-pub fn read_frame<R: Read>(r: &mut R) -> Result<serde_json::Value, FrameError> {
+/// Read one frame's bytes without interpreting them.
+pub fn read_bytes<R: Read>(r: &mut R) -> Result<Vec<u8>, FrameError> {
     let mut lenb = [0u8; 4];
     r.read_exact(&mut lenb)?;
     let len = u32::from_le_bytes(lenb);
@@ -57,7 +59,12 @@ pub fn read_frame<R: Read>(r: &mut R) -> Result<serde_json::Value, FrameError> {
     }
     let mut buf = vec![0u8; len as usize];
     r.read_exact(&mut buf)?;
-    Ok(serde_json::from_slice(&buf)?)
+    Ok(buf)
+}
+
+/// Read one frame and parse it as `T`.
+pub fn read_frame<R: Read, T: DeserializeOwned>(r: &mut R) -> Result<T, FrameError> {
+    Ok(serde_json::from_slice(&read_bytes(r)?)?)
 }
 
 #[cfg(test)]
@@ -69,8 +76,10 @@ mod tests {
     fn roundtrip() {
         let v = serde_json::json!({"m": "hello", "n": 42});
         let mut buf = Vec::new();
-        write_frame(&mut buf, &v).unwrap();
-        let out = read_frame(&mut Cursor::new(buf)).unwrap();
+        let n = write_frame(&mut buf, &v).unwrap();
+        assert_eq!(n, serde_json::to_vec(&v).unwrap().len() as u64);
+        assert_eq!(buf.len() as u64, n + 4); // length prefix
+        let out: serde_json::Value = read_frame(&mut Cursor::new(buf)).unwrap();
         assert_eq!(v, out);
     }
 
@@ -79,8 +88,20 @@ mod tests {
         let mut buf = Vec::new();
         buf.extend_from_slice(&(MAX_FRAME + 1).to_le_bytes());
         assert!(matches!(
-            read_frame(&mut Cursor::new(buf)),
+            read_bytes(&mut Cursor::new(buf)),
             Err(FrameError::TooLarge(_))
         ));
+    }
+
+    #[test]
+    fn a_frame_of_the_wrong_shape_fails_at_the_read() {
+        #[derive(serde::Deserialize)]
+        struct Expected {
+            #[allow(dead_code)]
+            wanted: u32,
+        }
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &serde_json::json!({"other": 1})).unwrap();
+        assert!(read_frame::<_, Expected>(&mut Cursor::new(buf)).is_err());
     }
 }

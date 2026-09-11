@@ -3,20 +3,84 @@
 //! A plugin is a plain process that connects to `$PORTOS_PLUGIN_SOCK`
 //! **twice**, authenticating each connection with `$PORTOS_PLUGIN_TOKEN`:
 //! a `serve` connection on which it declares its verbs and answers kernel
-//! calls (and receives event deliveries), and a `client` connection through
-//! which it reaches the kernel — `invoke` (call another plugin's verb,
-//! capability-checked kernel-side), `emit`/`subscribe` (event bus), and
-//! `put`/`read` (artifact dereference as chunked byte streams; payloads
-//! never ride inside JSON frames — decisions-v1.md D25).
+//! calls, and a `client` connection through which it reaches the kernel —
+//! `invoke` (call another plugin's verb, capability-checked kernel-side),
+//! `emit`/`subscribe` (event bus), and `put`/`read` (artifact dereference as
+//! chunked byte streams; payloads never ride inside JSON frames). A plugin
+//! may also open an `events` connection so subscribed events keep arriving
+//! while one of its own calls is in flight.
 //!
 //! Plugins start with ZERO capabilities; `invoke` succeeds only for verbs
 //! the kernel has been told to grant this plugin.
+//!
+//! Arguments and results are [`Payload`] — opaque on the wire, typed the
+//! moment a plugin parses one into a shape it owns. The kernel never does.
 
-use portos_proto::{ABI_VERSION, chunk, frame};
-use serde_json::{Value, json};
+use portos_proto::ids::{IdError, PluginName, SubId, Topic, Verb};
+use portos_proto::wire::{
+    self, ChannelRole, ClientOp, EmitReply, Grant, GrantsReply, Hello, HelloFrame, Payload,
+    PutReply, ReadReply, Reply, ServeMsg, SubscribeReply, ToolMeta, UnsubscribeReply,
+};
+use portos_proto::{ABI_VERSION, ArtifactMeta, Label, chunk, frame};
+use serde::de::DeserializeOwned;
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+/// What can go wrong talking to the kernel. Callers can tell a refusal
+/// (no capability, no route) from a broken channel or a malformed payload,
+/// which a single `String` never allowed.
+#[derive(Debug, thiserror::Error)]
+pub enum PluginError {
+    #[error("kernel refused: {0}")]
+    Refused(String),
+    #[error(transparent)]
+    Frame(#[from] frame::FrameError),
+    #[error("payload: {0}")]
+    Payload(#[from] serde_json::Error),
+    #[error(transparent)]
+    Chunk(#[from] chunk::ChunkError),
+    #[error(transparent)]
+    Id(#[from] IdError),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// The error a verb handler reports. It becomes the `err` string of one
+/// reply frame, so it is a message by construction; `?` still works from
+/// anything that displays.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct CallError(String);
+
+impl From<&str> for CallError {
+    fn from(s: &str) -> CallError {
+        CallError(s.to_string())
+    }
+}
+impl From<String> for CallError {
+    fn from(s: String) -> CallError {
+        CallError(s)
+    }
+}
+impl From<serde_json::Error> for CallError {
+    fn from(e: serde_json::Error) -> CallError {
+        CallError(e.to_string())
+    }
+}
+impl From<PluginError> for CallError {
+    fn from(e: PluginError) -> CallError {
+        CallError(e.to_string())
+    }
+}
+impl From<IdError> for CallError {
+    fn from(e: IdError) -> CallError {
+        CallError(e.to_string())
+    }
+}
+
+pub type CallResult = Result<Payload, CallError>;
 
 /// The plugin's connection to the kernel (the client channel). Safe to share
 /// across threads; each operation holds the channel for one request/response
@@ -26,58 +90,71 @@ pub struct KernelClient {
 }
 
 impl KernelClient {
-    fn request(&self, req: &Value) -> Result<Value, String> {
+    fn request<T: DeserializeOwned>(&self, op: &ClientOp) -> Result<T, PluginError> {
         let mut s = self.stream.lock().unwrap();
-        frame::write_frame(&mut *s, req).map_err(|e| e.to_string())?;
-        expect_ok(frame::read_frame(&mut *s).map_err(|e| e.to_string())?)
+        frame::write_frame(&mut *s, op)?;
+        let reply: Reply<T> = frame::read_frame(&mut *s)?;
+        reply.into_result().map_err(PluginError::Refused)
     }
 
     /// Call another plugin's verb through the kernel. The kernel checks this
     /// plugin's capabilities, audits, and routes.
-    pub fn invoke(&self, verb: &str, args: Value) -> Result<Value, String> {
-        self.request(&json!({"op": "invoke", "verb": verb, "args": args}))
+    pub fn invoke(&self, verb: &Verb, args: Payload) -> Result<Payload, PluginError> {
+        self.request(&ClientOp::Invoke(wire::Invoke {
+            verb: verb.clone(),
+            args,
+        }))
     }
 
     /// Publish an event. Returns the number of subscribers it reached.
-    pub fn emit(&self, topic: &str, data: Value) -> Result<u64, String> {
-        let ok = self.request(&json!({"op": "emit", "topic": topic, "data": data}))?;
-        Ok(ok["delivered"].as_u64().unwrap_or(0))
+    pub fn emit(&self, topic: &Topic, data: Payload) -> Result<u64, PluginError> {
+        let r: EmitReply = self.request(&ClientOp::Emit(wire::Emit {
+            topic: topic.clone(),
+            data,
+        }))?;
+        Ok(r.delivered)
     }
 
-    /// Subscribe to a topic. Matching events later arrive on the events
-    /// channel and are handed to the plugin's event handler.
-    pub fn subscribe(&self, topic: &str) -> Result<u64, String> {
-        let ok = self.request(&json!({"op": "subscribe", "topic": topic}))?;
-        ok["sub"].as_u64().ok_or_else(|| "no sub id".into())
+    /// Subscribe to a topic pattern. Matching events later arrive on the
+    /// events channel and are handed to the plugin's event handler.
+    pub fn subscribe(&self, pattern: &Topic) -> Result<SubId, PluginError> {
+        let r: SubscribeReply = self.request(&ClientOp::Subscribe(wire::Subscribe {
+            topic: pattern.clone(),
+        }))?;
+        Ok(r.sub)
     }
 
     /// Drop one of this plugin's subscriptions.
-    pub fn unsubscribe(&self, sub: u64) -> Result<bool, String> {
-        let ok = self.request(&json!({"op": "unsubscribe", "sub": sub}))?;
-        Ok(ok["removed"].as_bool().unwrap_or(false))
+    pub fn unsubscribe(&self, sub: SubId) -> Result<bool, PluginError> {
+        let r: UnsubscribeReply =
+            self.request(&ClientOp::Unsubscribe(wire::Unsubscribe { sub }))?;
+        Ok(r.removed)
     }
 
     /// What this plugin may invoke right now: live grants joined with the
-    /// target verbs' advertised metadata — each entry
-    /// `{verb, description, schema, counts_left?}`, ready to become a tool
-    /// definition.
-    pub fn grants(&self) -> Result<Vec<Value>, String> {
-        let ok = self.request(&json!({"op": "grants"}))?;
-        Ok(ok["grants"].as_array().cloned().unwrap_or_default())
+    /// target verbs' advertised metadata, ready to become tool definitions.
+    pub fn grants(&self) -> Result<Vec<Grant>, PluginError> {
+        let r: GrantsReply = self.request(&ClientOp::Grants)?;
+        Ok(r.grants)
     }
 
     /// Ingest a payload into the kernel CAS, streaming (never buffered whole,
-    /// never inside a JSON frame). Returns the ArtifactMeta as JSON.
-    pub fn put<R: Read>(&self, mut r: R, r#type: &str, labels: Value) -> Result<Value, String> {
+    /// never inside a JSON frame).
+    pub fn put<R: Read>(
+        &self,
+        mut r: R,
+        content_type: &str,
+        labels: Option<Label>,
+    ) -> Result<ArtifactMeta, PluginError> {
         let mut s = self.stream.lock().unwrap();
-        frame::write_frame(
-            &mut *s,
-            &json!({"op": "put", "type": r#type, "labels": labels}),
-        )
-        .map_err(|e| e.to_string())?;
-        chunk::copy_into_chunks(&mut r, &mut *s).map_err(|e| e.to_string())?;
-        let ok = expect_ok(frame::read_frame(&mut *s).map_err(|e| e.to_string())?)?;
-        Ok(ok["meta"].clone())
+        let op = ClientOp::Put(wire::Put {
+            content_type: content_type.to_string(),
+            labels,
+        });
+        frame::write_frame(&mut *s, &op)?;
+        chunk::copy_into_chunks(&mut r, &mut *s)?;
+        let reply: Reply<PutReply> = frame::read_frame(&mut *s)?;
+        Ok(reply.into_result().map_err(PluginError::Refused)?.meta)
     }
 
     /// Dereference (a range of) an artifact into `w`. Returns bytes moved.
@@ -87,94 +164,114 @@ impl KernelClient {
         offset: u64,
         len: Option<u64>,
         w: &mut W,
-    ) -> Result<u64, String> {
+    ) -> Result<u64, PluginError> {
         let mut s = self.stream.lock().unwrap();
-        let mut req = json!({"op": "read", "id": id, "offset": offset});
-        if let Some(l) = len {
-            req["len"] = json!(l);
-        }
-        frame::write_frame(&mut *s, &req).map_err(|e| e.to_string())?;
-        expect_ok(frame::read_frame(&mut *s).map_err(|e| e.to_string())?)?;
-        chunk::copy_from_chunks(&mut *s, w).map_err(|e| e.to_string())
+        let op = ClientOp::Read(wire::Read {
+            id: id.to_string(),
+            offset,
+            len,
+        });
+        frame::write_frame(&mut *s, &op)?;
+        let reply: Reply<ReadReply> = frame::read_frame(&mut *s)?;
+        reply.into_result().map_err(PluginError::Refused)?;
+        Ok(chunk::copy_from_chunks(&mut *s, w)?)
     }
 
     /// Convenience: dereference a whole artifact into memory. Only for
     /// payloads the caller knows are small; streaming is the norm.
-    pub fn read_bytes(&self, id: &str) -> Result<Vec<u8>, String> {
+    pub fn read_bytes(&self, id: &str) -> Result<Vec<u8>, PluginError> {
         let mut out = Vec::new();
         self.read_to(id, 0, None, &mut out)?;
         Ok(out)
     }
 }
 
-fn expect_ok(resp: Value) -> Result<Value, String> {
-    if let Some(err) = resp.get("err").and_then(|e| e.as_str()) {
-        return Err(err.to_string());
+/// What a plugin declares about itself at startup.
+pub struct Plugin<'a> {
+    pub name: &'a str,
+    pub verbs: &'a [&'a str],
+    /// Per-verb metadata the kernel joins into `grants` introspection, so a
+    /// caller holding the capability gets a ready-made tool definition.
+    pub tools: BTreeMap<&'a str, ToolMeta>,
+}
+
+impl<'a> Plugin<'a> {
+    pub fn new(name: &'a str, verbs: &'a [&'a str]) -> Plugin<'a> {
+        Plugin {
+            name,
+            verbs,
+            tools: BTreeMap::new(),
+        }
     }
-    Ok(resp.get("ok").cloned().unwrap_or(Value::Null))
+
+    pub fn with_tools(mut self, tools: BTreeMap<&'a str, ToolMeta>) -> Plugin<'a> {
+        self.tools = tools;
+        self
+    }
+
+    fn hello(&self, role: ChannelRole, token: &str) -> Result<HelloFrame, IdError> {
+        let verbs = self
+            .verbs
+            .iter()
+            .map(|v| Verb::parse(v))
+            .collect::<Result<Vec<_>, _>>()?;
+        let tools = if self.tools.is_empty() {
+            None
+        } else {
+            Some(
+                self.tools
+                    .iter()
+                    .map(|(v, m)| Ok((Verb::parse(v)?, m.clone())))
+                    .collect::<Result<BTreeMap<_, _>, IdError>>()?,
+            )
+        };
+        let serving = role == ChannelRole::Serve;
+        Ok(HelloFrame {
+            hello: Hello {
+                name: PluginName::parse(self.name)?,
+                abi: ABI_VERSION.to_string(),
+                role,
+                token: token.to_string(),
+                verbs: if serving { verbs } else { Vec::new() },
+                channels: serving.then(|| vec![ChannelRole::Client, ChannelRole::Events]),
+                tools: if serving { tools } else { None },
+            },
+        })
+    }
 }
 
-/// Connect all channels, declare `verbs`, and serve until the kernel says
-/// shutdown (or goes away). `on_call` answers kernel calls and may use the
-/// [`KernelClient`] it is handed — shared as an `Arc` so a handler can move a
-/// clone into a background thread (e.g. to stream events after returning).
-/// `on_event` receives subscribed events **on a dedicated thread** fed by the
-/// events channel, so events keep flowing while a call handler is blocked —
-/// which is what lets a handler await an event stream mid-call.
-pub fn serve<F, G>(name: &str, verbs: &[&str], on_call: F, on_event: G) -> std::io::Result<()>
+/// Connect all channels, declare the plugin, and serve until the kernel says
+/// shutdown (or goes away).
+///
+/// `on_call` answers kernel calls and may use the [`KernelClient`] it is
+/// handed — shared as an `Arc` so a handler can move a clone into a
+/// background thread. `on_event` receives subscribed events **on a dedicated
+/// thread** fed by the events channel, so events keep flowing while a call
+/// handler is blocked, which is what lets a handler await an event stream
+/// mid-call.
+pub fn serve<F, G>(plugin: Plugin<'_>, mut on_call: F, mut on_event: G) -> std::io::Result<()>
 where
-    F: FnMut(&str, &Value, &std::sync::Arc<KernelClient>) -> Result<Value, String>,
-    G: FnMut(&str, &Value) + Send + 'static,
-{
-    serve_full(name, verbs, Value::Null, on_call, on_event)
-}
-
-/// Like [`serve`], additionally advertising per-verb tool metadata —
-/// `{"family::verb": {"description": …, "schema": {…}}}` — which the kernel
-/// stores with the routes and joins into `grants` introspection, so callers
-/// holding a capability get ready-made tool definitions.
-pub fn serve_full<F, G>(
-    name: &str,
-    verbs: &[&str],
-    tools_meta: Value,
-    mut on_call: F,
-    mut on_event: G,
-) -> std::io::Result<()>
-where
-    F: FnMut(&str, &Value, &std::sync::Arc<KernelClient>) -> Result<Value, String>,
-    G: FnMut(&str, &Value) + Send + 'static,
+    F: FnMut(&Verb, &Payload, &Arc<KernelClient>) -> CallResult,
+    G: FnMut(&Topic, &Payload) + Send + 'static,
 {
     let sock = std::env::var("PORTOS_PLUGIN_SOCK").map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::NotFound, "PORTOS_PLUGIN_SOCK unset")
     })?;
     let token = std::env::var("PORTOS_PLUGIN_TOKEN").unwrap_or_default();
+    let hello_for = |role| plugin.hello(role, &token).map_err(std::io::Error::other);
 
     let serve_stream = UnixStream::connect(&sock)?;
     let mut rd = serve_stream.try_clone()?;
     let mut wr = serve_stream.try_clone()?;
-    let mut h = json!({"hello": {
-        "name": name, "abi": ABI_VERSION, "role": "serve",
-        "token": token, "verbs": verbs,
-        "channels": ["client", "events"],
-    }});
-    if !tools_meta.is_null() {
-        h["hello"]["tools"] = tools_meta;
-    }
-    hello(&mut wr, &mut rd, &h)?;
+    handshake(&mut wr, &mut rd, &hello_for(ChannelRole::Serve)?)?;
 
     let client_stream = UnixStream::connect(&sock)?;
     {
         let mut crd = client_stream.try_clone()?;
         let mut cwr = client_stream.try_clone()?;
-        hello(
-            &mut cwr,
-            &mut crd,
-            &json!({"hello": {
-                "name": name, "abi": ABI_VERSION, "role": "client", "token": token,
-            }}),
-        )?;
+        handshake(&mut cwr, &mut crd, &hello_for(ChannelRole::Client)?)?;
     }
-    let client = std::sync::Arc::new(KernelClient {
+    let client = Arc::new(KernelClient {
         stream: Mutex::new(client_stream),
     });
 
@@ -182,61 +279,45 @@ where
     {
         let mut erd = events_stream.try_clone()?;
         let mut ewr = events_stream.try_clone()?;
-        hello(
-            &mut ewr,
-            &mut erd,
-            &json!({"hello": {
-                "name": name, "abi": ABI_VERSION, "role": "events", "token": token,
-            }}),
-        )?;
+        handshake(&mut ewr, &mut erd, &hello_for(ChannelRole::Events)?)?;
     }
     std::thread::spawn(move || {
         let mut erd = events_stream;
         loop {
-            let msg = match frame::read_frame(&mut erd) {
-                Ok(m) => m,
+            let bytes = match frame::read_bytes(&mut erd) {
+                Ok(b) => b,
                 Err(_) => return, // kernel went away
             };
-            if msg["op"] == "event" {
-                on_event(msg["topic"].as_str().unwrap_or(""), &msg["data"]);
+            if let Ok(ServeMsg::Event(ev)) = ServeMsg::from_slice(&bytes) {
+                on_event(&ev.topic, &ev.data);
             }
         }
     });
 
     loop {
-        let msg = match frame::read_frame(&mut rd) {
-            Ok(m) => m,
+        let bytes = match frame::read_bytes(&mut rd) {
+            Ok(b) => b,
             Err(_) => return Ok(()), // kernel went away; exit quietly
         };
-        match msg["op"].as_str() {
-            Some("shutdown") | None => return Ok(()),
-            Some("call") => {
-                let verb = msg["verb"].as_str().unwrap_or("");
-                let args = msg.get("args").cloned().unwrap_or(Value::Null);
-                let resp = match on_call(verb, &args, &client) {
-                    Ok(v) => json!({"ok": v}),
-                    Err(e) => json!({"err": e}),
+        match ServeMsg::from_slice(&bytes) {
+            Ok(ServeMsg::Shutdown) | Err(_) => return Ok(()),
+            Ok(ServeMsg::Call(call)) => {
+                let reply = match on_call(&call.verb, &call.args, &client) {
+                    Ok(v) => Reply::Ok(v),
+                    Err(e) => Reply::Err(e.to_string()),
                 };
-                frame::write_frame(&mut wr, &resp).map_err(io_err)?;
+                frame::write_frame(&mut wr, &reply).map_err(std::io::Error::other)?;
             }
-            Some("event") => {} // events ride their own channel; tolerate strays
-            Some(other) => {
-                frame::write_frame(&mut wr, &json!({"err": format!("unknown op {other}")}))
-                    .map_err(io_err)?;
-            }
+            // Events ride their own channel here; tolerate strays.
+            Ok(ServeMsg::Event(_)) => {}
         }
     }
 }
 
-fn hello<W: Write, R: Read>(wr: &mut W, rd: &mut R, h: &Value) -> std::io::Result<()> {
-    frame::write_frame(wr, h).map_err(io_err)?;
-    let ack = frame::read_frame(rd).map_err(io_err)?;
-    if let Some(err) = ack.get("err").and_then(|e| e.as_str()) {
-        return Err(std::io::Error::other(format!("hello rejected: {err}")));
-    }
+fn handshake<W: Write, R: Read>(wr: &mut W, rd: &mut R, h: &HelloFrame) -> std::io::Result<()> {
+    frame::write_frame(wr, h).map_err(std::io::Error::other)?;
+    let ack: Reply<Payload> = frame::read_frame(rd).map_err(std::io::Error::other)?;
+    ack.into_result()
+        .map_err(|e| std::io::Error::other(format!("hello rejected: {e}")))?;
     Ok(())
-}
-
-fn io_err(e: frame::FrameError) -> std::io::Error {
-    std::io::Error::other(e.to_string())
 }

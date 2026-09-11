@@ -1,32 +1,48 @@
 //! The neutral core of the model driver: session transcripts, tool
 //! definitions, and the agentic loop. **Nothing in this module knows any
-//! provider** — a provider is a [`Backend`] implementation chosen by config
-//! (the same seam discipline as the browser driver's `driver.js`:
-//! interface here, `backends/*` behind it). Nothing here knows the plan
-//! language either (decisions-v1.md D31): the loop faces the Host ABI only,
-//! through the `emit`/`invoke` closures its caller wires up.
+//! provider** — a provider is a [`Backend`] implementation chosen by config.
+//! Nothing here knows the kernel either: the loop faces the `emit`/`invoke`
+//! closures its caller wires up.
+//!
+//! One thing here is deliberately untyped and stays that way: a provider's
+//! own JSON, carried as [`TurnResult::raw`]. It is an external, evolving
+//! schema that we replay **verbatim** so multi-turn context (thinking
+//! blocks, signatures) survives a round trip. Modelling it would mean
+//! dropping whatever we failed to model.
 
-use serde_json::{Value, json};
+use portos_egress_api::{EgressRequest, StreamEvent};
+use portos_model_api::SessionEvent;
+use portos_proto::ids::Verb;
+use portos_proto::wire::Payload;
+use serde_json::Value;
 use std::sync::mpsc::Receiver;
 
-/// A tool the model may call: a kernel verb plus what the model needs to
-/// understand it. The verb is the identity; provider wire names are derived
-/// by [`mangle`] at the provider boundary (D29) and never stored.
-#[derive(Clone, Debug)]
-pub struct ToolDef {
-    pub verb: String,
-    pub description: String,
-    pub schema: Value,
+#[derive(Debug, thiserror::Error)]
+pub enum ModelError {
+    #[error("provider: {0}")]
+    Provider(String),
+    #[error("gateway: {0}")]
+    Gateway(String),
+    #[error("payload: {0}")]
+    Payload(#[from] serde_json::Error),
+    #[error("max turns exceeded ({0})")]
+    MaxTurns(u32),
 }
 
-/// `family::verb` → provider-safe tool name and back. Providers commonly
-/// restrict tool names to `[A-Za-z0-9_-]`, so `::` maps to `__`; tool verbs
-/// therefore must not contain `__` themselves (validated at config load).
-pub fn mangle(verb: &str) -> String {
-    verb.replace("::", "__")
+impl From<portos_proto::ids::IdError> for ModelError {
+    fn from(e: portos_proto::ids::IdError) -> ModelError {
+        ModelError::Provider(e.to_string())
+    }
 }
-pub fn unmangle(name: &str) -> String {
-    name.replace("__", "::")
+
+/// A tool the model may call: a kernel verb plus what the model needs to
+/// understand it. The verb is the identity; the provider-facing name is
+/// derived by [`Verb::tool_name`] at the provider boundary and never stored.
+#[derive(Clone, Debug)]
+pub struct ToolDef {
+    pub verb: Verb,
+    pub description: String,
+    pub schema: Payload,
 }
 
 #[derive(Clone, Debug)]
@@ -39,8 +55,8 @@ pub enum Part {
 pub struct ToolCall {
     /// Provider-issued call id, echoed back with the result.
     pub id: String,
-    pub verb: String,
-    pub args: Value,
+    pub verb: Verb,
+    pub args: Payload,
 }
 
 #[derive(Clone, Debug)]
@@ -53,9 +69,9 @@ pub struct ToolResultMsg {
 /// A neutral transcript message. The assistant variant carries the parts the
 /// core interprets (text, tool calls) plus an optional provider-opaque `raw`
 /// payload tagged with the backend that produced it — so that backend can
-/// replay its own wire format faithfully (thinking blocks, signatures, …)
-/// while any *other* backend falls back to reconstructing from the neutral
-/// parts. The core never looks inside `raw`.
+/// replay its own wire format faithfully while any *other* backend falls
+/// back to reconstructing from the neutral parts. The core never looks
+/// inside `raw`.
 #[derive(Clone, Debug)]
 pub enum Msg {
     User(String),
@@ -76,8 +92,7 @@ pub enum StopKind {
 /// What a backend returns for one model turn.
 pub struct TurnResult {
     pub parts: Vec<Part>,
-    /// Provider-opaque payload for faithful replay (stored tagged with the
-    /// backend name).
+    /// Provider-opaque payload for faithful replay.
     pub raw: Value,
     pub stop: StopKind,
 }
@@ -93,21 +108,19 @@ pub trait TurnSink {
     fn text_delta(&mut self, s: &str);
 }
 
-/// A live egress response stream: the head (`{status, headers}`) plus broker
-/// events (`{"chunk"}* → {"done"} | {"error"}`) as they arrive.
+/// A live egress response stream: the status the gateway reported plus the
+/// body frames as they arrive.
 pub struct EgressStream {
-    pub head: Value,
-    pub rx: Receiver<Value>,
+    pub status: u16,
+    pub rx: Receiver<StreamEvent>,
 }
 
 /// The network a backend is allowed to see: the kernel-mediated egress
-/// chokepoint, nothing else. Credentials are injected broker-side; a backend
-/// never holds a key. (`http` is the buffered variant for backends without
-/// streaming responses; current backends stream.)
+/// chokepoint, nothing else. Credentials are injected gateway-side; a
+/// backend never holds a key — there is no field in [`EgressRequest`]
+/// through which one could travel.
 pub trait Gateway {
-    #[allow(dead_code)]
-    fn http(&self, args: Value) -> Result<Value, String>;
-    fn http_stream(&self, args: Value) -> Result<EgressStream, String>;
+    fn http_stream(&self, req: EgressRequest) -> Result<EgressStream, ModelError>;
 }
 
 /// One model provider. Stateless: the whole conversation rides in the
@@ -119,7 +132,7 @@ pub trait Backend {
         gw: &dyn Gateway,
         req: &TurnRequest,
         sink: &mut dyn TurnSink,
-    ) -> Result<TurnResult, String>;
+    ) -> Result<TurnResult, ModelError>;
 }
 
 pub struct Session {
@@ -128,11 +141,14 @@ pub struct Session {
 }
 
 struct EmitSink<'a> {
-    emit: &'a dyn Fn(Value),
+    emit: &'a dyn Fn(SessionEvent),
 }
+
 impl TurnSink for EmitSink<'_> {
     fn text_delta(&mut self, s: &str) {
-        (self.emit)(json!({"kind": "delta", "text": s}));
+        (self.emit)(SessionEvent::Delta {
+            text: s.to_string(),
+        });
     }
 }
 
@@ -140,8 +156,7 @@ impl TurnSink for EmitSink<'_> {
 /// kernel invoke → results → next turn)* → final text. Tool failures feed
 /// back to the model as `is_error` results rather than aborting the loop;
 /// the kernel's capability gate on `invoke` is what actually bounds what the
-/// model can do (enforcement below the model, never prompt discipline).
-#[allow(clippy::too_many_arguments)]
+/// model can do — enforcement below the model, never prompt discipline.
 pub fn run_send(
     backend: &dyn Backend,
     gw: &dyn Gateway,
@@ -149,9 +164,9 @@ pub fn run_send(
     tools: &[ToolDef],
     user_text: String,
     max_turns: u32,
-    emit: &dyn Fn(Value),
-    invoke: &dyn Fn(&str, Value) -> Result<Value, String>,
-) -> Result<String, String> {
+    emit: &dyn Fn(SessionEvent),
+    invoke: &dyn Fn(&Verb, Payload) -> Result<Payload, String>,
+) -> Result<String, ModelError> {
     session.messages.push(Msg::User(user_text));
     for _ in 0..max_turns {
         let req = TurnRequest {
@@ -183,18 +198,23 @@ pub fn run_send(
         });
 
         if turn.stop != StopKind::ToolUse || calls.is_empty() {
-            emit(json!({"kind": "done", "text": text}));
+            emit(SessionEvent::Done { text: text.clone() });
             return Ok(text);
         }
 
         let mut results = Vec::with_capacity(calls.len());
         for call in calls {
-            emit(json!({"kind": "tool_call", "verb": call.verb, "args": call.args}));
-            let (content, is_error) = match invoke(&call.verb, call.args.clone()) {
-                Ok(v) => (serde_json::to_string(&v).unwrap_or_default(), false),
+            emit(SessionEvent::ToolCall {
+                verb: call.verb.clone(),
+            });
+            let (content, is_error) = match invoke(&call.verb, call.args) {
+                Ok(v) => (v.as_raw().to_string(), false),
                 Err(e) => (e, true),
             };
-            emit(json!({"kind": "tool_result", "verb": call.verb, "ok": !is_error}));
+            emit(SessionEvent::ToolResult {
+                verb: call.verb,
+                ok: !is_error,
+            });
             results.push(ToolResultMsg {
                 call_id: call.id,
                 content,
@@ -203,5 +223,5 @@ pub fn run_send(
         }
         session.messages.push(Msg::ToolResults(results));
     }
-    Err(format!("max turns exceeded ({max_turns})"))
+    Err(ModelError::MaxTurns(max_turns))
 }

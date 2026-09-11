@@ -23,7 +23,12 @@
 //!
 //! This process faces the Host ABI only.
 
-use serde_json::{Value, json};
+use portos_egress_api::{
+    EgressLog, EgressRequest, HttpReply, LOG, Method, StreamEvent, StreamHead,
+};
+use portos_proto::wire::Payload;
+use portos_sdk::{CallError, CallResult, Plugin};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::sync::Arc;
@@ -123,7 +128,7 @@ fn find_rule<'a>(cfg: &'a Config, url: &url::Url) -> Result<&'a Rule, String> {
 /// errors; only transport failures error out.
 struct Sent {
     resp: ureq::Response,
-    method: &'static str,
+    method: Method,
     host: String,
     injected: Vec<String>,
     strip: Vec<String>,
@@ -132,36 +137,22 @@ struct Sent {
 fn send(
     agent: &ureq::Agent,
     cfg: &Config,
-    args: &Value,
+    r: &EgressRequest,
     overall_timeout: Option<Duration>,
 ) -> Result<Sent, String> {
-    let url_s = args["url"].as_str().ok_or("missing url")?;
-    let url = url::Url::parse(url_s).map_err(|e| format!("bad url: {e}"))?;
+    let url = url::Url::parse(&r.url).map_err(|e| format!("bad url: {e}"))?;
     let rule = find_rule(cfg, &url)?;
-    let method = match args["method"].as_str().unwrap_or("GET") {
-        m if m.eq_ignore_ascii_case("GET") => "GET",
-        m if m.eq_ignore_ascii_case("POST") => "POST",
-        m if m.eq_ignore_ascii_case("PUT") => "PUT",
-        m if m.eq_ignore_ascii_case("DELETE") => "DELETE",
-        m if m.eq_ignore_ascii_case("PATCH") => "PATCH",
-        m if m.eq_ignore_ascii_case("HEAD") => "HEAD",
-        m => return Err(format!("method not allowed: {m}")),
-    };
 
-    let mut req = agent.request(method, url_s);
+    let mut req = agent.request(r.method.as_str(), &r.url);
     if let Some(t) = overall_timeout {
         req = req.timeout(t);
     }
-    if let Some(headers) = args["headers"].as_object() {
-        for (k, v) in headers {
-            let kl = k.to_ascii_lowercase();
-            if FORBIDDEN_CALLER_HEADERS.contains(&kl.as_str()) || rule.inject.contains_key(&kl) {
-                continue; // injection point owns these
-            }
-            if let Some(vs) = v.as_str() {
-                req = req.set(k, vs);
-            }
+    for (k, v) in &r.headers {
+        let kl = k.to_ascii_lowercase();
+        if FORBIDDEN_CALLER_HEADERS.contains(&kl.as_str()) || rule.inject.contains_key(&kl) {
+            continue; // injection point owns these
         }
+        req = req.set(k, v);
     }
     let mut injected = Vec::new();
     for (header, secret_name) in &rule.inject {
@@ -173,7 +164,7 @@ fn send(
         injected.push(header.clone());
     }
 
-    let result = match args["body"].as_str() {
+    let result = match &r.body {
         Some(body) => req.send_string(body),
         None => req.call(),
     };
@@ -184,25 +175,25 @@ fn send(
     };
     Ok(Sent {
         resp,
-        method,
+        method: r.method,
         host: url.host_str().unwrap_or("?").to_string(),
         injected,
         strip: rule.strip_response.clone(),
     })
 }
 
-fn sanitize_headers(resp: &ureq::Response, strip: &[String]) -> Value {
-    let mut out = serde_json::Map::new();
+fn sanitize_headers(resp: &ureq::Response, strip: &[String]) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
     for name in resp.headers_names() {
         let lower = name.to_ascii_lowercase();
         if lower == "set-cookie" || strip.contains(&lower) {
             continue;
         }
         if let Some(v) = resp.header(&name) {
-            out.insert(lower, json!(v));
+            out.insert(lower, v.to_string());
         }
     }
-    Value::Object(out)
+    out
 }
 
 fn main() -> std::io::Result<()> {
@@ -215,74 +206,95 @@ fn main() -> std::io::Result<()> {
         .build();
 
     portos_sdk::serve(
-        "portos-broker",
-        &["egress::http", "egress::http_stream"],
-        move |verb, args, client| match verb {
-            "egress::http" => {
-                let sent = send(&agent, &cfg, args, Some(Duration::from_secs(60)))?;
-                let status = sent.resp.status();
-                let headers = sanitize_headers(&sent.resp, &sent.strip);
-                let mut body = Vec::new();
-                sent.resp
-                    .into_reader()
-                    .take((BODY_MAX + 1) as u64)
-                    .read_to_end(&mut body)
-                    .map_err(|e| format!("egress body: {e}"))?;
-                if body.len() > BODY_MAX {
-                    return Err("response too large: use egress::http_stream".into());
+        Plugin::new("portos-broker", &["egress::http", "egress::http_stream"]),
+        move |verb, args, client| -> CallResult {
+            let req: EgressRequest = args.parse()?;
+            match verb.short() {
+                "http" => {
+                    let sent = send(&agent, &cfg, &req, Some(Duration::from_secs(60)))?;
+                    let status = sent.resp.status();
+                    let headers = sanitize_headers(&sent.resp, &sent.strip);
+                    let mut body = Vec::new();
+                    sent.resp
+                        .into_reader()
+                        .take((BODY_MAX + 1) as u64)
+                        .read_to_end(&mut body)
+                        .map_err(|e| CallError::from(format!("egress body: {e}")))?;
+                    if body.len() > BODY_MAX {
+                        return Err("response too large: use egress::http_stream".into());
+                    }
+                    let _ = client.emit(
+                        &LOG,
+                        Payload::of(&EgressLog {
+                            verb: "http".to_string(),
+                            method: sent.method,
+                            host: sent.host,
+                            status,
+                            injected: sent.injected,
+                        })?,
+                    );
+                    Ok(Payload::of(&HttpReply {
+                        status,
+                        headers,
+                        body: String::from_utf8_lossy(&body).into_owned(),
+                    })?)
                 }
-                let _ = client.emit(
-                    "egress::log",
-                    json!({"verb": "http", "method": sent.method, "host": sent.host,
-                           "status": status, "injected": sent.injected}),
-                );
-                Ok(json!({
-                    "status": status,
-                    "headers": headers,
-                    "body": String::from_utf8_lossy(&body),
-                }))
-            }
-            // Returns {status, headers} immediately; the body streams to the
-            // caller-named topic as {"chunk"} events, closed by {"done"} (or
-            // {"error"}). The caller subscribes before invoking.
-            "egress::http_stream" => {
-                let topic = args["topic"].as_str().ok_or("missing topic")?.to_string();
-                let sent = send(&agent, &cfg, args, None)?;
-                let status = sent.resp.status();
-                let headers = sanitize_headers(&sent.resp, &sent.strip);
-                let _ = client.emit(
-                    "egress::log",
-                    json!({"verb": "http_stream", "method": sent.method, "host": sent.host,
-                           "status": status, "injected": sent.injected}),
-                );
-                let client = client.clone();
-                std::thread::spawn(move || {
-                    let mut reader = sent.resp.into_reader();
-                    let mut buf = vec![0u8; STREAM_CHUNK];
-                    let mut total: u64 = 0;
-                    loop {
-                        match reader.read(&mut buf) {
-                            Ok(0) => {
-                                let _ = client.emit(&topic, json!({"done": true, "bytes": total}));
-                                return;
-                            }
-                            Ok(n) => {
-                                total += n as u64;
-                                let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
-                                if client.emit(&topic, json!({"chunk": chunk})).is_err() {
-                                    return; // kernel went away
+                // Returns {status, headers} immediately; the body streams to
+                // the caller-named topic as chunk events, closed by done (or
+                // error). The caller subscribes before invoking.
+                "http_stream" => {
+                    let topic = req.topic.clone().ok_or("missing topic")?;
+                    let sent = send(&agent, &cfg, &req, None)?;
+                    let status = sent.resp.status();
+                    let headers = sanitize_headers(&sent.resp, &sent.strip);
+                    let _ = client.emit(
+                        &LOG,
+                        Payload::of(&EgressLog {
+                            verb: "http_stream".to_string(),
+                            method: sent.method,
+                            host: sent.host,
+                            status,
+                            injected: sent.injected,
+                        })?,
+                    );
+                    let client = client.clone();
+                    std::thread::spawn(move || {
+                        let publish = |ev: &StreamEvent| match Payload::of(ev) {
+                            Ok(p) => client.emit(&topic, p).is_ok(),
+                            Err(_) => false,
+                        };
+                        let mut reader = sent.resp.into_reader();
+                        let mut buf = vec![0u8; STREAM_CHUNK];
+                        let mut total: u64 = 0;
+                        loop {
+                            match reader.read(&mut buf) {
+                                Ok(0) => {
+                                    publish(&StreamEvent::Done {
+                                        done: true,
+                                        bytes: total,
+                                    });
+                                    return;
+                                }
+                                Ok(n) => {
+                                    total += n as u64;
+                                    let chunk = String::from_utf8_lossy(&buf[..n]).into_owned();
+                                    if !publish(&StreamEvent::Chunk { chunk }) {
+                                        return; // kernel went away
+                                    }
+                                }
+                                Err(e) => {
+                                    publish(&StreamEvent::Error {
+                                        error: e.to_string(),
+                                    });
+                                    return;
                                 }
                             }
-                            Err(e) => {
-                                let _ = client.emit(&topic, json!({"error": e.to_string()}));
-                                return;
-                            }
                         }
-                    }
-                });
-                Ok(json!({"status": status, "headers": headers}))
+                    });
+                    Ok(Payload::of(&StreamHead { status, headers })?)
+                }
+                other => Err(CallError::from(format!("unknown verb: {other}"))),
             }
-            other => Err(format!("unknown verb: {other}")),
         },
         |_, _| {},
     )

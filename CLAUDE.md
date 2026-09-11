@@ -101,6 +101,12 @@ theoretical elegance is not. Current state and build order live in
   domain knowledge lives in plugins; a driver family interface is defined
   outside the kernel. This is where extensibility comes from — adding a new
   kind of plugin must never require a new kernel mechanism.
+- **Types at the boundary, opacity inside.** A frame's envelope is a typed
+  enum the kernel must be able to reject; a verb's payload is `Payload`,
+  raw bytes with no accessor. `serde_json::Value` is right in exactly three
+  places and wrong everywhere else: a provider's own evolving wire format
+  (kept verbatim so replay is faithful), the append-only audit log, and
+  operator-edited config files. Anywhere else, name the type.
 - **Capabilities double as the tool surface.** A granted verb joined with the
   metadata its driver advertised in `hello` is a tool definition; the model
   driver builds its tool list from `grants` introspection. Capabilities are a
@@ -123,7 +129,7 @@ MCP later is the opposite direction and is fine).
 
 ```sh
 cargo build --workspace
-cargo test --workspace          # 31 tests; all must pass, zero warnings
+cargo test --workspace          # 48 tests; all must pass, zero warnings
 cargo fmt --all
 ```
 
@@ -156,17 +162,26 @@ walking skeleton test is what proves the wiring.
       and the join that builds the tool surface), `cas` (data plane),
       `host` (ABI v2: spawn, verb routing, event bus, chunked streaming),
       `audit`. Domain vocabulary here is an architectural violation.
-    - `portos-proto`: shared wire types (frame codec, chunk streaming,
-      `Handle`, `Capability`, `Label`, artifact metadata).
+    - `portos-proto`: the wire. `wire` holds the protocol as types — the
+      envelope is an enum so a malformed frame is refused rather than
+      defaulted, and `Payload` is unparsed JSON the kernel forwards without
+      being able to read it. `ids` holds `Verb`/`Topic`/`PluginName`/`SubId`,
+      which parse once so their accessors are total. Also the frame codec,
+      chunk streaming, `Capability`, `Label`, artifact metadata.
     - `portos-sdk`: the Rust plugin side; `sdk/js/client.js` is its JS twin.
     - `portos-broker`: the egress chokepoint. Trusted, kernel-spawned, not a
       driver.
     - `portos-cli`: `portos init|put|meta|get|audit-verify|chat`. Links the
       kernel as a library; daemonization is deferred to W4.
     - `portos-echo`: the toy plugin the ABI conformance tests drive.
-- `drivers`: driver plugins and family-interface libraries. Today: `model`
-  (Rust — neutral agentic loop in `core.rs`, providers under `backends/`),
-  `browser` (JS/Playwright), `render-tty` (renderer reference).
+- `drivers`: driver plugins and family-interface libraries.
+    - Family interfaces — the contract between an implementation and its
+      callers, depended on by both so a wire shape is never written twice:
+      `egress-api` (`portos-egress-api`), `model-api` (`portos-model-api`).
+      The kernel depends on neither; it must not know these families exist.
+    - Implementations: `model` (Rust — neutral agentic loop in `core.rs`,
+      providers under `backends/`), `browser` (JS/Playwright), `render-tty`
+      (renderer reference).
 - `docs`: does not exist yet. Solid documentation goes here only after human
   approval; until then everything lives in `.dev`.
 - `.dev` (gitignored): temporal development space, never added into git worktree.

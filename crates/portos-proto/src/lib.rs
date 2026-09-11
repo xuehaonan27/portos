@@ -4,7 +4,9 @@ pub mod artifact;
 pub mod cap;
 pub mod chunk;
 pub mod frame;
+pub mod ids;
 pub mod label;
+pub mod wire;
 
 /// Wire ABI version, sent in every hello. ABI v2 (decisions-v1.md D23–D25,
 /// D29): two connections per plugin (serve + client roles), plugin→kernel
@@ -13,7 +15,9 @@ pub const ABI_VERSION: &str = "0.2";
 
 pub use artifact::{ArtifactId, ArtifactMeta};
 pub use cap::{Capability, Constraints};
+pub use ids::{IdError, PluginName, SubId, Topic, Verb};
 pub use label::Label;
+pub use wire::Payload;
 
 /// An unforgeable reference minted by the kernel. Bound to a subject, so
 /// leaking the string to another plugin is useless. The kernel-side table

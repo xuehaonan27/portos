@@ -10,9 +10,12 @@
 //! from the same accumulator.
 
 use crate::core::{
-    Backend, EgressStream, Gateway, Msg, Part, StopKind, ToolCall, TurnRequest, TurnResult,
-    TurnSink, mangle, unmangle,
+    Backend, EgressStream, Gateway, ModelError, Msg, Part, StopKind, ToolCall, TurnRequest,
+    TurnResult, TurnSink,
 };
+use portos_egress_api::{EgressRequest, StreamEvent};
+use portos_proto::ids::Verb;
+use portos_proto::wire::Payload;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
@@ -59,7 +62,7 @@ impl Anthropic {
                             Part::Text(t) => json!({"type": "text", "text": t}),
                             Part::ToolCall(c) => json!({
                                 "type": "tool_use", "id": c.id,
-                                "name": mangle(&c.verb), "input": c.args,
+                                "name": c.verb.tool_name(), "input": c.args,
                             }),
                         })
                         .collect();
@@ -97,7 +100,7 @@ impl Backend for Anthropic {
         gw: &dyn Gateway,
         req: &TurnRequest,
         sink: &mut dyn TurnSink,
-    ) -> Result<TurnResult, String> {
+    ) -> Result<TurnResult, ModelError> {
         let mut body = json!({
             "model": self.model,
             "max_tokens": self.max_tokens,
@@ -113,7 +116,7 @@ impl Backend for Anthropic {
                     .iter()
                     .map(|t| {
                         json!({
-                            "name": mangle(&t.verb),
+                            "name": t.verb.tool_name(),
                             "description": t.description,
                             "input_schema": t.schema,
                         })
@@ -122,21 +125,19 @@ impl Backend for Anthropic {
             );
         }
 
-        let stream = gw.http_stream(json!({
-            "method": "POST",
-            "url": format!("{}/v1/messages", self.base),
-            "headers": {
-                "content-type": "application/json",
-                "anthropic-version": self.version,
-                "accept": "text/event-stream",
-            },
-            "body": body.to_string(),
-        }))?;
+        let stream = gw.http_stream(
+            EgressRequest::post(format!("{}/v1/messages", self.base), body.to_string())
+                .header("content-type", "application/json")
+                .header("anthropic-version", &self.version)
+                .header("accept", "text/event-stream"),
+        )?;
 
-        let status = stream.head["status"].as_u64().unwrap_or(0);
-        if status != 200 {
+        if stream.status != 200 {
             let body = drain_body(&stream);
-            return Err(format!("anthropic api status {status}: {body}"));
+            return Err(ModelError::Provider(format!(
+                "anthropic api status {}: {body}",
+                stream.status
+            )));
         }
 
         let mut sse = SseParser::default();
@@ -145,15 +146,17 @@ impl Backend for Anthropic {
             let ev = stream
                 .rx
                 .recv_timeout(std::time::Duration::from_secs(360))
-                .map_err(|_| "egress stream stalled".to_string())?;
-            if let Some(chunk) = ev["chunk"].as_str() {
-                for (event, data) in sse.feed(chunk) {
-                    acc.handle(&event, &data, sink)?;
+                .map_err(|_| ModelError::Gateway("egress stream stalled".into()))?;
+            match ev {
+                StreamEvent::Chunk { chunk } => {
+                    for (event, data) in sse.feed(&chunk) {
+                        acc.handle(&event, &data, sink)?;
+                    }
                 }
-            } else if ev["done"].as_bool() == Some(true) {
-                break;
-            } else if let Some(e) = ev["error"].as_str() {
-                return Err(format!("egress stream error: {e}"));
+                StreamEvent::Done { .. } => break,
+                StreamEvent::Error { error } => {
+                    return Err(ModelError::Gateway(format!("egress stream error: {error}")));
+                }
             }
         }
         acc.finish()
@@ -162,12 +165,10 @@ impl Backend for Anthropic {
 
 fn drain_body(stream: &EgressStream) -> String {
     let mut out = String::new();
-    while let Ok(ev) = stream.rx.recv_timeout(std::time::Duration::from_secs(10)) {
-        if let Some(c) = ev["chunk"].as_str() {
-            out.push_str(c);
-        } else {
-            break;
-        }
+    while let Ok(StreamEvent::Chunk { chunk }) =
+        stream.rx.recv_timeout(std::time::Duration::from_secs(10))
+    {
+        out.push_str(&chunk);
     }
     out
 }
@@ -215,15 +216,22 @@ struct MsgAcc {
 }
 
 impl MsgAcc {
-    fn handle(&mut self, event: &str, data: &str, sink: &mut dyn TurnSink) -> Result<(), String> {
+    fn handle(
+        &mut self,
+        event: &str,
+        data: &str,
+        sink: &mut dyn TurnSink,
+    ) -> Result<(), ModelError> {
         if event == "ping" {
             return Ok(());
         }
         if event == "error" {
-            return Err(format!("anthropic stream error: {data}"));
+            return Err(ModelError::Provider(format!(
+                "anthropic stream error: {data}"
+            )));
         }
-        let v: Value =
-            serde_json::from_str(data).map_err(|e| format!("sse data json ({event}): {e}"))?;
+        let v: Value = serde_json::from_str(data)
+            .map_err(|e| ModelError::Provider(format!("sse data json ({event}): {e}")))?;
         match event {
             "content_block_start" => {
                 let idx = v["index"].as_u64().unwrap_or(0) as usize;
@@ -271,7 +279,7 @@ impl MsgAcc {
                         json!({})
                     } else {
                         serde_json::from_str(&partial)
-                            .map_err(|e| format!("tool input json: {e}"))?
+                            .map_err(|e| ModelError::Provider(format!("tool input json: {e}")))?
                     };
                     if let Some(block) = self.raw_blocks.get_mut(idx) {
                         block["input"] = input;
@@ -288,7 +296,7 @@ impl MsgAcc {
         Ok(())
     }
 
-    fn finish(self) -> Result<TurnResult, String> {
+    fn finish(self) -> Result<TurnResult, ModelError> {
         let mut parts = Vec::new();
         for block in &self.raw_blocks {
             match block["type"].as_str() {
@@ -296,10 +304,14 @@ impl MsgAcc {
                     parts.push(Part::Text(block["text"].as_str().unwrap_or("").to_string()));
                 }
                 Some("tool_use") => {
+                    // A provider that names a tool we never offered is a
+                    // protocol error, not something to paper over with a
+                    // half-formed verb.
+                    let name = block["name"].as_str().unwrap_or_default();
                     parts.push(Part::ToolCall(ToolCall {
                         id: block["id"].as_str().unwrap_or("").to_string(),
-                        verb: unmangle(block["name"].as_str().unwrap_or("")),
-                        args: block["input"].clone(),
+                        verb: Verb::from_tool_name(name)?,
+                        args: Payload::of(&block["input"])?,
                     }));
                 }
                 _ => {} // thinking etc. ride in raw only
@@ -365,8 +377,8 @@ mod tests {
         assert_eq!(out.parts.len(), 2);
         match &out.parts[1] {
             Part::ToolCall(c) => {
-                assert_eq!(c.verb, "echo::emit");
-                assert_eq!(c.args, json!({"x": 1}));
+                assert_eq!(c.verb.as_str(), "echo::emit");
+                assert_eq!(c.args.parse::<Value>().unwrap(), json!({"x": 1}));
             }
             other => panic!("expected tool call, got {other:?}"),
         }

@@ -1,18 +1,33 @@
 //! portos-echo: the toy driver. Exists to exercise kernel mechanisms end to
 //! end over ABI v2 — verb calls, chunked artifact streaming (put/read),
 //! capability-gated invoke, the event bus, and the two-layer naming rule
-//! (ephemeral refs live here, NOT in the kernel handle table;
-//! browser-driver-v0.md §14-7).
+//! (ephemeral refs live here, NOT in the kernel handle table).
 //!
 //! The verb family is `PORTOS_ECHO_FAMILY` (default "echo"), so one binary
 //! can be spawned as several distinct plugins — which is exactly what the
 //! invoke tests need (a plugin cannot invoke itself: single-threaded serve
-//! loop, and invoke cycles deadlock by design in M0).
+//! loop, and invoke cycles deadlock by design).
+//!
+//! Its verbs take positional arguments, so each one parses the opaque
+//! payload into a tuple of exactly the types it wants. That is the shape
+//! every driver takes: the kernel moved bytes it could not read, and the
+//! plugin that owns the meaning is the one that names the types.
 
-use serde_json::{Value, json};
-use std::collections::HashSet;
+use portos_proto::ids::{Topic, Verb};
+use portos_proto::wire::{Payload, ToolMeta};
+use portos_sdk::{CallError, CallResult, Plugin};
+use serde::Serialize;
+use serde_json::json;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
+
+/// One event this plugin received, kept so a test can ask for them back.
+#[derive(Clone, Serialize)]
+struct Received {
+    topic: String,
+    data: Payload,
+}
 
 fn main() -> std::io::Result<()> {
     let family = std::env::var("PORTOS_ECHO_FAMILY").unwrap_or_else(|_| "echo".into());
@@ -33,105 +48,108 @@ fn main() -> std::io::Result<()> {
     .map(|v| format!("{family}::{v}"))
     .collect();
     let verb_refs: Vec<&str> = verbs.iter().map(|s| s.as_str()).collect();
+
     // Advertise metadata for one verb so grants introspection has something
     // to join against in tests.
-    let tools_meta = json!({
-        format!("{family}::emit"): {
-            "description": "Print a line to the echo driver's stdout.",
-            "schema": {"type": "object", "properties": {"text": {"type": "string"}}},
+    let emit_verb = format!("{family}::emit");
+    let mut tools = BTreeMap::new();
+    tools.insert(
+        emit_verb.as_str(),
+        ToolMeta {
+            description: "Print a line to the echo driver's stdout.".to_string(),
+            schema: Payload::of(&json!({
+                "type": "object", "properties": {"text": {"type": "string"}},
+            }))
+            .ok(),
         },
-    });
+    );
 
     let mut ephemeral: HashSet<String> = HashSet::new();
     let mut next_ref = 0u32;
-    let received: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let received: Arc<Mutex<Vec<Received>>> = Arc::new(Mutex::new(Vec::new()));
     let received_by_call = received.clone();
 
-    let prefix = format!("{family}::");
-    portos_sdk::serve_full(
-        &name,
-        &verb_refs,
-        tools_meta,
-        move |verb, args, client| {
-            let short = verb.strip_prefix(&prefix).unwrap_or(verb);
-            let arg = |i: usize| args.get(i).cloned().unwrap_or(Value::Null);
-            match short {
+    portos_sdk::serve(
+        Plugin::new(&name, &verb_refs).with_tools(tools),
+        move |verb, args, client| -> CallResult {
+            match verb.short() {
                 // toy effect: visible side channel for tests (stdout)
                 "emit" => {
-                    let s = arg(0).as_str().unwrap_or("").to_string();
-                    println!("emit: {s}");
-                    Ok(Value::Null)
+                    let (text,): (String,) = args.parse()?;
+                    println!("emit: {text}");
+                    Ok(Payload::null())
                 }
                 // observation over the data plane: the payload streams in as
                 // chunks through the client channel, never inside a JSON
                 // frame. Returns a bounded digest (control-plane preview
                 // discipline, not a payload copy).
                 "digest" => {
-                    let id = arg(0).as_str().unwrap_or("").to_string();
+                    let (id,): (String,) = args.parse()?;
                     let mut sink = DigestSink::default();
                     let n = client.read_to(&id, 0, None, &mut sink)?;
-                    Ok(json!({ "bytes": n, "head_hex": hex_of(&sink.head) }))
+                    payload(&json!({ "bytes": n, "head_hex": hex_of(&sink.head) }))
                 }
                 // data-plane ingest from the plugin side: generate n pattern
                 // bytes and stream them into the CAS.
                 "put_pattern" => {
-                    let n = arg(0).as_u64().unwrap_or(0);
-                    let meta = client.put(
-                        PatternReader { left: n, pos: 0 },
-                        "test/pattern",
-                        Value::Null,
-                    )?;
-                    Ok(json!({ "meta": meta }))
+                    let (n,): (u64,) = args.parse()?;
+                    let meta =
+                        client.put(PatternReader { left: n, pos: 0 }, "test/pattern", None)?;
+                    payload(&json!({ "meta": meta }))
                 }
                 // invoke another plugin's verb through the kernel (cap-gated
                 // there; this plugin holds no authority of its own).
                 "relay" => {
-                    let target = arg(0).as_str().unwrap_or("").to_string();
-                    client.invoke(&target, arg(1))
+                    let (target, inner): (String, Payload) = args.parse()?;
+                    Ok(client.invoke(&Verb::parse(&target)?, inner)?)
                 }
                 // event bus, both directions
                 "publish" => {
-                    let topic = arg(0).as_str().unwrap_or("").to_string();
-                    let delivered = client.emit(&topic, arg(1))?;
-                    Ok(json!({ "delivered": delivered }))
+                    let (topic, data): (String, Payload) = args.parse()?;
+                    let delivered = client.emit(&Topic::parse(&topic)?, data)?;
+                    payload(&json!({ "delivered": delivered }))
                 }
                 "subscribe" => {
-                    let topic = arg(0).as_str().unwrap_or("").to_string();
-                    let sub = client.subscribe(&topic)?;
-                    Ok(json!({ "sub": sub }))
+                    let (topic,): (String,) = args.parse()?;
+                    let sub = client.subscribe(&Topic::parse(&topic)?)?;
+                    payload(&json!({ "sub": sub }))
                 }
                 "events" => {
-                    let evs = received_by_call.lock().unwrap();
-                    Ok(json!(evs.clone()))
+                    let evs = received_by_call.lock().unwrap().clone();
+                    payload(&evs)
                 }
                 // expose grants introspection for tests
-                "grants" => Ok(json!(client.grants()?)),
+                "grants" => payload(&client.grants()?),
                 // two-layer naming demo: refs are driver-session-local,
                 // volatile, and never enter the kernel handle table.
                 "make_ref" => {
                     next_ref += 1;
                     let r = format!("e{next_ref}");
                     ephemeral.insert(r.clone());
-                    Ok(json!({ "ref": r }))
+                    payload(&json!({ "ref": r }))
                 }
                 "use_ref" => {
-                    let r = arg(0).as_str().unwrap_or("").to_string();
+                    let (r,): (String,) = args.parse()?;
                     if ephemeral.contains(&r) {
-                        Ok(json!({ "used": r }))
+                        payload(&json!({ "used": r }))
                     } else {
-                        Err(format!("stale ephemeral ref: {r}"))
+                        Err(CallError::from(format!("stale ephemeral ref: {r}")))
                     }
                 }
-                other => Err(format!("unknown verb: {other}")),
+                other => Err(CallError::from(format!("unknown verb: {other}"))),
             }
         },
         move |topic, data| {
-            received
-                .lock()
-                .unwrap()
-                .push(json!({ "topic": topic, "data": data }));
+            received.lock().unwrap().push(Received {
+                topic: topic.to_string(),
+                data: data.clone(),
+            });
         },
     )
+}
+
+fn payload<T: Serialize>(v: &T) -> CallResult {
+    Ok(Payload::of(v)?)
 }
 
 /// Counts bytes and keeps the first 32 — the digest is a bounded preview,
