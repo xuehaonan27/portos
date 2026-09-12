@@ -1,8 +1,29 @@
-//! Anthropic Messages API backend — one implementation behind the neutral
-//! [`Backend`] seam, never the driver itself.
+//! The Anthropic Messages API **as a protocol**, not as a vendor.
 //!
-//! All traffic goes through the egress gateway (the broker injects
-//! `x-api-key`; this process never holds the key). Responses stream via SSE:
+//! This backend speaks the Messages wire format to whatever endpoint it is
+//! pointed at: Anthropic's own, a gateway, a proxy, a local server, or any
+//! of the providers that expose an Anthropic-compatible surface. Nothing
+//! here names a host, and there is no default that quietly picks one —
+//! `base_url` and `model` are required, because a wrong guess about which
+//! provider you meant is worse than an error at startup.
+//!
+//! What is configurable, and why each one has to be:
+//!
+//! | key | default | why it varies |
+//! |---|---|---|
+//! | `base_url` | **required** | the endpoint |
+//! | `model` | **required** | no cross-provider default exists |
+//! | `path` | `/v1/messages` | gateways mount the API under a prefix |
+//! | `headers` | `{"anthropic-version": …}` | compatible endpoints differ on which protocol headers they want; an empty object sends none |
+//! | `max_tokens` | 64000 | tuning, not identity |
+//!
+//! **Credentials are not in that table and cannot be.** Authentication is
+//! the broker's job: its per-host `inject` rule decides the header name, so
+//! `x-api-key` and `Authorization: Bearer` are both a matter of broker
+//! config, and the key exists in no other process. A `headers` entry that
+//! collides with an injected one is refused there by design.
+//!
+//! All traffic goes through the egress gateway. Responses stream via SSE:
 //! broker chunks arrive at arbitrary byte boundaries, so parsing is
 //! incremental. Assistant content blocks are accumulated **verbatim**
 //! (thinking blocks and signatures included) into the provider-opaque `raw`
@@ -19,28 +40,53 @@ use portos_proto::wire::Payload;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-pub struct Anthropic {
+/// The protocol header every Anthropic-compatible endpoint has historically
+/// wanted. It is a default rather than a constant precisely because some
+/// compatible endpoints do not.
+const DEFAULT_API_VERSION: &str = "2023-06-01";
+const DEFAULT_PATH: &str = "/v1/messages";
+const DEFAULT_MAX_TOKENS: u64 = 64000;
+
+pub struct AnthropicCompatible {
     base: String,
+    path: String,
     model: String,
     max_tokens: u64,
-    version: String,
+    headers: BTreeMap<String, String>,
 }
 
-impl Anthropic {
-    pub fn from_config(cfg: &Value) -> Anthropic {
-        Anthropic {
-            base: cfg["base_url"]
-                .as_str()
-                .unwrap_or("https://api.anthropic.com")
-                .trim_end_matches('/')
-                .to_string(),
-            model: cfg["model"].as_str().unwrap_or("claude-opus-5").to_string(),
-            max_tokens: cfg["max_tokens"].as_u64().unwrap_or(64000),
-            version: cfg["api_version"]
-                .as_str()
-                .unwrap_or("2023-06-01")
-                .to_string(),
-        }
+impl AnthropicCompatible {
+    pub fn from_config(cfg: &Value) -> Result<AnthropicCompatible, String> {
+        let base = cfg["base_url"].as_str().ok_or(
+            "modeld config: `base_url` is required — this backend speaks the \
+             Anthropic Messages API to whichever endpoint you name",
+        )?;
+        let model = cfg["model"]
+            .as_str()
+            .ok_or("modeld config: `model` is required — providers do not share model names")?;
+        // An explicit `{}` sends no protocol headers at all, which is the
+        // escape hatch for an endpoint that rejects the ones Anthropic wants.
+        let headers = match cfg.get("headers").and_then(Value::as_object) {
+            Some(m) => m
+                .iter()
+                .filter_map(|(k, v)| Some((k.to_ascii_lowercase(), v.as_str()?.to_string())))
+                .collect(),
+            None => BTreeMap::from([(
+                "anthropic-version".to_string(),
+                DEFAULT_API_VERSION.to_string(),
+            )]),
+        };
+        Ok(AnthropicCompatible {
+            base: base.trim_end_matches('/').to_string(),
+            path: cfg["path"].as_str().unwrap_or(DEFAULT_PATH).to_string(),
+            model: model.to_string(),
+            max_tokens: cfg["max_tokens"].as_u64().unwrap_or(DEFAULT_MAX_TOKENS),
+            headers,
+        })
+    }
+
+    fn endpoint(&self) -> String {
+        format!("{}{}", self.base, self.path)
     }
 
     fn map_messages(&self, messages: &[Msg]) -> Vec<Value> {
@@ -90,7 +136,11 @@ impl Anthropic {
     }
 }
 
-impl Backend for Anthropic {
+impl Backend for AnthropicCompatible {
+    /// The tag stored beside a transcript's verbatim `raw` payload, so a
+    /// later turn knows it may replay that content as-is. It names the **wire
+    /// format**, not this backend's config key — renaming the backend must
+    /// not invalidate transcripts recorded by it.
     fn name(&self) -> &'static str {
         "anthropic"
     }
@@ -125,17 +175,20 @@ impl Backend for Anthropic {
             );
         }
 
-        let stream = gw.http_stream(
-            EgressRequest::post(format!("{}/v1/messages", self.base), body.to_string())
-                .header("content-type", "application/json")
-                .header("anthropic-version", &self.version)
-                .header("accept", "text/event-stream"),
-        )?;
+        let mut req = EgressRequest::post(self.endpoint(), body.to_string())
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream");
+        // Configured headers go on last, so an endpoint that wants something
+        // different from the protocol defaults gets it.
+        for (k, v) in &self.headers {
+            req = req.header(k, v);
+        }
+        let stream = gw.http_stream(req)?;
 
         if stream.status != 200 {
             let body = drain_body(&stream);
             return Err(ModelError::Provider(format!(
-                "anthropic api status {}: {body}",
+                "model endpoint status {}: {body}",
                 stream.status
             )));
         }
@@ -359,6 +412,82 @@ mod tests {
         fn text_delta(&mut self, s: &str) {
             self.0.push_str(s);
         }
+    }
+
+    /// Captures the request instead of making it, so the tests below can ask
+    /// what this backend would actually have sent.
+    #[derive(Default)]
+    struct CapturingGateway(std::cell::RefCell<Option<EgressRequest>>);
+
+    impl Gateway for CapturingGateway {
+        fn http_stream(&self, req: EgressRequest) -> Result<EgressStream, ModelError> {
+            *self.0.borrow_mut() = Some(req);
+            Err(ModelError::Gateway("captured".into()))
+        }
+    }
+
+    fn sent(cfg: serde_json::Value) -> EgressRequest {
+        let backend = AnthropicCompatible::from_config(&cfg).expect("config");
+        let gw = CapturingGateway::default();
+        let _ = backend.complete(
+            &gw,
+            &TurnRequest {
+                system: "",
+                messages: &[Msg::User("hi".into())],
+                tools: &[],
+            },
+            &mut NullSink(String::new()),
+        );
+        gw.0.into_inner().expect("a request was built")
+    }
+
+    /// The whole point of this backend being a protocol rather than a vendor:
+    /// nothing it sends is decided here.
+    #[test]
+    fn every_part_of_the_endpoint_comes_from_config() {
+        let req = sent(json!({
+            "base_url": "https://gateway.internal:8443/llm/",
+            "path": "/anthropic/v1/messages",
+            "model": "some-other-model",
+            "max_tokens": 4096,
+            "headers": {"x-tenant": "acme"},
+        }));
+        assert_eq!(
+            req.url,
+            "https://gateway.internal:8443/llm/anthropic/v1/messages"
+        );
+        assert_eq!(
+            req.headers.get("x-tenant").map(String::as_str),
+            Some("acme")
+        );
+        assert_eq!(
+            req.headers.get("anthropic-version"),
+            None,
+            "an explicit header set replaces the defaults rather than adding to them"
+        );
+        let body: Value = serde_json::from_str(req.body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["model"], "some-other-model");
+        assert_eq!(body["max_tokens"], 4096);
+    }
+
+    #[test]
+    fn the_protocol_header_is_a_default_not_a_constant() {
+        let req = sent(json!({"base_url": "https://x.test", "model": "m"}));
+        assert_eq!(req.url, "https://x.test/v1/messages");
+        assert_eq!(
+            req.headers.get("anthropic-version").map(String::as_str),
+            Some(DEFAULT_API_VERSION)
+        );
+        // An endpoint that rejects it needs a way to say so.
+        let bare = sent(json!({"base_url": "https://x.test", "model": "m", "headers": {}}));
+        assert_eq!(bare.headers.get("anthropic-version"), None);
+    }
+
+    /// Guessing which provider was meant is worse than refusing to start.
+    #[test]
+    fn identity_has_no_default() {
+        assert!(AnthropicCompatible::from_config(&json!({"model": "m"})).is_err());
+        assert!(AnthropicCompatible::from_config(&json!({"base_url": "https://x.test"})).is_err());
     }
 
     /// Feed a full Anthropic SSE exchange split at hostile byte boundaries;

@@ -141,8 +141,19 @@ fn run(base: &PathBuf, sink: &Sink, client: &KernelClient, a: RunArgs) -> CallRe
         }
         std::thread::sleep(Duration::from_millis(POLL_MS));
     };
-    // Only now: a backgrounded grandchild can hold a pipe open long after its
-    // parent exits, so joining before the group is dealt with would hang.
+
+    // The leader has been reaped, which says nothing about its group. A
+    // backgrounded grandchild outlives it, is no longer anything we can wait
+    // on, and holds the output pipe open — so joining first would hang, and
+    // returning first would leak. The kernel sweeps a plugin's group
+    // unconditionally for exactly this reason; the escalation above is not a
+    // substitute for it, because escalation stops as soon as the *leader*
+    // goes.
+    //
+    // The consequence, which callers should know: `shell::run` leaves nothing
+    // running. `some-daemon &` does not survive the call. Something meant to
+    // keep running is a plugin, not a background job.
+    signal_group(pgid, Signal::SIGKILL);
     let stdout = out.join().unwrap_or_default();
     let stderr = err.join().unwrap_or_default();
 

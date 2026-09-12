@@ -500,9 +500,15 @@ fn introspected_tools_and_artifact_read() {
 fn unknown_session_and_lifecycle() {
     let (_k, host, root) = setup("life");
     let modeld_dir = root.join("modeld");
+    // No turn is ever run here, but the backend still has to be constructible:
+    // identity has no default, so a config without it would not start.
     write_json(
         &modeld_dir.join("config.json"),
-        &json!({"backend": "anthropic"}),
+        &json!({
+            "backend": "anthropic-compatible",
+            "base_url": "http://127.0.0.1:1",
+            "model": "test-model",
+        }),
     );
     let modeld = host
         .spawn(

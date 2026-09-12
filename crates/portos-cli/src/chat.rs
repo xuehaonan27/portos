@@ -23,9 +23,10 @@
 //! subscribed to the event plane; list one under `plugins` and set
 //! `"render": "none"` to replace the builtin stdout rendering — or leave
 //! both on and they compose. The model provider is whatever the modeld
-//! backend's `base_url` points at; its host must be on the broker allowlist
-//! (checked at startup) with the vendor's auth header in the broker's inject
-//! rule — the key never leaves the broker.
+//! backend's `base_url` points at — any endpoint speaking the configured
+//! wire protocol, not a fixed vendor. Its host must be on the broker
+//! allowlist (checked at startup), with whatever auth header that endpoint
+//! wants in the broker's inject rule — the key never leaves the broker.
 
 use nix::sys::signal::{SigSet, Signal};
 use portos_egress_api as egress;
@@ -331,15 +332,21 @@ fn spawn_signal_handler(
 }
 
 /// The provider is vendor-neutral: modeld's backend `base_url` decides where
-/// LLM traffic goes, and the broker allowlist must cover that host (with the
-/// vendor's auth header in its inject rule). Catch the mismatch at startup
-/// instead of at the first opaque egress denial.
+/// LLM traffic goes, and the broker allowlist must cover that host (with
+/// whatever auth header that endpoint wants, in the broker's inject rule).
+/// Catch the mismatch at startup instead of at the first opaque egress
+/// denial.
+///
+/// No fallback host: modeld refuses to start without a `base_url`, and this
+/// check guessing one would only make the eventual error less clear.
 fn warn_if_provider_host_unlisted(root: &Path) {
-    let base_url = std::fs::read_to_string(root.join("modeld/config.json"))
+    let Some(base_url) = std::fs::read_to_string(root.join("modeld/config.json"))
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .and_then(|c| c["base_url"].as_str().map(String::from))
-        .unwrap_or_else(|| "https://api.anthropic.com".to_string());
+    else {
+        return;
+    };
     let host = base_url
         .split_once("://")
         .map(|(_, rest)| rest)
@@ -410,7 +417,10 @@ fn write_templates(root: &Path) -> std::io::Result<()> {
         std::fs::write(
             &mcfg,
             serde_json::to_string_pretty(&json!({
-                "backend": "anthropic",
+                // A protocol, not a vendor: point base_url at any endpoint
+                // that speaks the Anthropic Messages API. Whichever one it
+                // is, its host and auth header belong in broker/config.json.
+                "backend": "anthropic-compatible",
                 "base_url": "https://api.anthropic.com",
                 "model": "claude-opus-5",
                 "max_tokens": 64000,
@@ -419,7 +429,11 @@ fn write_templates(root: &Path) -> std::io::Result<()> {
             }))
             .unwrap(),
         )?;
-        println!("[chat] wrote {}", mcfg.display());
+        println!(
+            "[chat] wrote {} — base_url and model are required; change them and \
+             broker/config.json together to use another endpoint",
+            mcfg.display()
+        );
     }
     Ok(())
 }

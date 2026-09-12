@@ -26,7 +26,13 @@ cargo test 2>&1 | tail -40
 
 命令以自己为组长启动（`process_group(0)`），超时后逐级升级 **组 SIGTERM → 组 SIGKILL**。
 
-这同时解决了第二个问题：一个后台孙进程会一直**攥着 stdout 管道**，只杀组长的话这个调用会挂在读管道上永远不返回。测试 `a_timeout_collects_the_whole_process_group` 把两件事一起钉住了。
+**而且升级本身不够。** 升级在组长一死就停下，可组长死了不代表组空了。所以调用返回前还有一次**无条件的组 SIGKILL**，超时与否都一样——内核清退插件时的最后一步正是这个。
+
+这同时解决了第二个问题：一个后台孙进程会一直**攥着 stdout 管道**，只杀组长的话这个调用会挂在读管道上永远不返回。**挂死的是整个驱动，不只是漏一个进程。**
+
+**由此而来的语义**：`shell::run` **不留下任何东西**。`some-daemon &` 活不过这次调用。要长期运行的东西是插件，不是后台作业。
+
+两条各有一个测试：`a_timeout_collects_the_whole_process_group` 和 `a_background_child_does_not_survive_a_command_that_exits_normally`。
 
 ## 已知形状，写明
 

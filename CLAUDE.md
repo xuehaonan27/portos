@@ -164,7 +164,10 @@ theoretical elegance is not. Current state and build order live in
   Several may compose. `drivers/render-tty` is the reference.
 - **Credentials stop at the broker.** Plugins get no direct network. Anything
   reaching the outside world invokes `egress::*`; the broker checks the
-  allowlist and injects the key, which exists in no other process.
+  allowlist and injects the key, which exists in no other process. That is
+  also why the *auth header name* is broker config rather than backend code:
+  `x-api-key` and `Authorization: Bearer` are the same mechanism pointed at
+  different endpoints, and a backend has no business knowing which.
 
 Deliberately absent, and not to be reintroduced without a concrete pain that
 is sharp enough to write a spec from: effect-plan language and interpreter,
@@ -176,7 +179,7 @@ MCP later is the opposite direction and is fine).
 
 ```sh
 cargo build --workspace
-cargo test --workspace          # 74 tests; all must pass, zero warnings
+cargo test --workspace          # 79 tests; all must pass, zero warnings
 cargo fmt --all
 ```
 
@@ -244,7 +247,10 @@ walking skeleton test is what proves the wiring.
       result convention, the Rust twin of `drivers/browser/src/sink.js`.
       The kernel depends on none of them; it must not know these exist.
     - Implementations: `model` (Rust — neutral agentic loop in `core.rs`,
-      providers under `backends/`), `browser` (JS/Playwright), `render-tty`
+      wire protocols under `backends/`; a backend names a *protocol*, so
+      `anthropic-compatible` speaks the Messages API to whatever `base_url`,
+      `path`, `headers` and `model` the config names, and `base_url`/`model`
+      have no defaults because guessing a vendor is worse than an error), `browser` (JS/Playwright), `render-tty`
       (renderer reference), `bridge-http` (the event plane and the invoke
       path over HTTP/SSE, so a presenter can live off-box; transport and
       presentation are separate files on purpose), `remote` (the other end

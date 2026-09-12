@@ -171,6 +171,45 @@ fn a_timeout_collects_the_whole_process_group() {
     fx.close();
 }
 
+/// The same collection on the ordinary path, where it is easy to forget:
+/// the command *succeeded*, so no escalation ran, and a backgrounded child
+/// would both leak and hold the output pipe open — which is a hang, not just
+/// a leak.
+#[test]
+fn a_background_child_does_not_survive_a_command_that_exits_normally() {
+    let fx = Fixture::open("background");
+    let pidfile = fx.cwd.join("bg.pid");
+
+    let began = Instant::now();
+    let out = fx.run(json!({
+        "cmd": format!("sleep 300 & echo $! > {}; echo done", pidfile.display()),
+        "timeout_ms": 5000,
+    }));
+    assert_eq!(out["status"], 0, "the command itself succeeded: {out}");
+    assert_eq!(out["timed_out"], false);
+    assert_eq!(out["stdout"]["text"], "done\n");
+    assert!(
+        began.elapsed() < Duration::from_secs(5),
+        "returned rather than waiting on a pipe the background child still holds"
+    );
+
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while alive(pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        !alive(pid),
+        "shell::run leaves nothing running; something meant to keep running is a plugin"
+    );
+
+    fx.close();
+}
+
 /// `kill -0`: does a process still exist?
 fn alive(pid: i32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
