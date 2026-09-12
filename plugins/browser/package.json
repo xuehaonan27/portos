@@ -1,12 +1,10 @@
 {
-  "name": "portos-driver-browser",
+  "name": "portos-browser",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "PortOS browser driver (Stage A) — a watchable, credential-safe browser limb.",
+  "description": "PortOS browser driver: the first implementation of drivers/browser, on Playwright.",
   "scripts": {
-    "demo": "node src/cli-demo.js",
-    "smoke": "node test/smoke.mjs",
     "test": "node test/smoke.mjs"
   },
   "dependencies": {

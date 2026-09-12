@@ -1,11 +1,7 @@
-//! The peer node's HTTP surface, as seen from this side.
-//!
-//! `portos-bridge-http` did not invent a protocol. `/invoke` answers with the
-//! same `{"ok":…}` / `{"err":…}` frame the ABI uses, and `/grants` with the
-//! same `GrantsReply`. So this file parses the peer with `portos_abi::wire`
-//! types rather than a private copy of them: the contract is written once,
-//! and if either end ever changes shape it is a compile error rather than a
-//! runtime surprise.
+//! The peer node's HTTP surface, as seen from this side: a client of the
+//! `link` interface (`drivers/link`), which `portos-bridge-http` serves.
+//! The shapes come from there, so if either end changes one it is a compile
+//! error here rather than a runtime surprise.
 //!
 //! Why this dials a socket directly instead of going through `egress::*`:
 //! the broker is the chokepoint for calls a driver makes to the **outside
@@ -16,9 +12,10 @@
 //! missing either: a forwarded verb is audited twice — here as an ordinary
 //! invoke on this node, and on the far node as an invoke by its bridge.
 
-use portos_abi::ids::{Topic, Verb};
+use portos_abi::ids::Verb;
 use portos_abi::wire::{Grant, GrantsReply, Payload, Reply};
-use serde::{Deserialize, Serialize};
+pub use portos_link_api::Event as PeerEvent;
+use portos_link_api::{EVENTS, GRANTS, INVOKE, InvokeRequest};
 use std::io::{BufRead, BufReader};
 use std::time::Duration;
 
@@ -52,13 +49,6 @@ impl From<ureq::Error> for LinkError {
     }
 }
 
-/// One event as the peer's bridge publishes it.
-#[derive(Deserialize)]
-pub struct PeerEvent {
-    pub topic: Topic,
-    pub data: Payload,
-}
-
 pub struct Link {
     base: String,
     calls: ureq::Agent,
@@ -87,7 +77,7 @@ impl Link {
     pub fn grants(&self) -> Result<Vec<Grant>, LinkError> {
         let body = self
             .calls
-            .get(&format!("{}/grants", self.base))
+            .get(&format!("{}{GRANTS}", self.base))
             .call()?
             .into_string()?;
         Ok(serde_json::from_str::<GrantsReply>(&body)?.grants)
@@ -98,10 +88,17 @@ impl Link {
     /// peer's kernel decides whether the call is allowed, and its refusal
     /// arrives as `err`.
     pub fn invoke(&self, verb: &Verb, args: &Payload) -> Result<Payload, LinkError> {
-        let body = serde_json::to_string(&InvokeBody { verb, args })?;
+        // Unnamed on the far side: the far node's instances are one
+        // instance here, and a caller here cannot reach past it. When one
+        // needs to, `at` is where the name goes.
+        let body = serde_json::to_string(&InvokeRequest {
+            verb: verb.clone(),
+            args: args.clone(),
+            at: None,
+        })?;
         let text = self
             .calls
-            .post(&format!("{}/invoke", self.base))
+            .post(&format!("{}{INVOKE}", self.base))
             .set("content-type", "application/json")
             .send_string(&body)?
             .into_string()?;
@@ -117,7 +114,7 @@ impl Link {
     pub fn events(&self, mut on_event: impl FnMut(PeerEvent)) -> Result<(), LinkError> {
         let body = self
             .stream
-            .get(&format!("{}/events?replay=0", self.base))
+            .get(&format!("{}{EVENTS}?replay=0", self.base))
             .call()?
             .into_reader();
         // Server-sent events in the one shape the bridge emits: `data: <json>`
@@ -137,10 +134,4 @@ impl Link {
         }
         Ok(())
     }
-}
-
-#[derive(Serialize)]
-struct InvokeBody<'a> {
-    verb: &'a Verb,
-    args: &'a Payload,
 }

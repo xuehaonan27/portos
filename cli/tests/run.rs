@@ -182,39 +182,72 @@ fn standard_plugins(root: &Path, modeld_grants: Vec<Value>) -> Vec<Value> {
     ]
 }
 
-/// The adapter alone: browser::* verbs over the plugin ABI, the sink's
-/// kernel mode, screenshot-as-artifact, and origin taint labels.
+/// The browser plugin alone: `browser::*` over the plugin ABI, what it
+/// advertises being what `drivers/browser` says, a screenshot as an
+/// artifact, and an element table too big for the context arriving as a
+/// handle with a preview.
 #[test]
-fn browser_adapter_serves_verbs_and_data_plane() {
+fn browser_plugin_implements_the_interface() {
     let Some((plugin, fixture)) = browser_ready() else {
         return;
     };
-    let (kernel, host, root) = setup("adapter");
+    let echo = Path::new(CLI_BIN).with_file_name("portos-echo");
+    if !echo.exists() {
+        eprintln!("skipping: portos-echo not built (use `cargo test --workspace`)");
+        return;
+    }
+    let (kernel, host, root) = setup("browser");
     let profile = root.join("profile");
-
-    // Phase A: generous inline cap — the fixture snapshot stays inline, and
-    // a screenshot becomes a CAS artifact instead of a loose file.
-    let name = host
-        .spawn(
+    let config = json!({"headless": true, "profile_dir": profile}).to_string();
+    let spawn = || {
+        host.spawn(
             Path::new("node"),
             &[plugin.to_str().unwrap()],
-            &[
-                ("WORKSHOP_HEADLESS", "1"),
-                ("WORKSHOP_PROFILE_DIR", profile.to_str().unwrap()),
-                ("WORKSHOP_SINK_INLINE_MAX", "200000"),
-            ],
+            &[("PORTOS_PLUGIN_CONFIG", config.as_str())],
         )
-        .unwrap();
+        .unwrap()
+    };
+
+    let name = spawn();
     assert_eq!(name.as_str(), "portos-browser");
 
+    // Conformance: what the JS advertised, seen through grants introspection
+    // by a plugin granted all of it, is the Rust interface word for word.
+    let probe = host
+        .spawn(Path::new(&echo), &[], &[("PORTOS_ECHO_DRIVER", "probe")])
+        .unwrap();
+    let interface = portos_browser_api::tools();
+    kernel
+        .caps
+        .mint(
+            &probe.subject(),
+            "driver:browser",
+            interface.keys().map(|v| v.short().to_string()).collect(),
+            Default::default(),
+            None,
+        )
+        .unwrap();
+    let advertised = call(&host, &probe, "probe::grants", json!([])).unwrap();
+    let advertised = advertised.as_array().unwrap();
+    for (verb, meta) in &interface {
+        let g = advertised
+            .iter()
+            .find(|g| g["verb"] == verb.as_str())
+            .unwrap_or_else(|| panic!("{verb} is advertised"));
+        assert_eq!(g["description"], meta.description, "{verb}");
+        let schema: Value = meta.schema.as_ref().unwrap().parse().unwrap();
+        assert_eq!(g["schema"], schema, "{verb}");
+    }
+    assert_eq!(advertised.len(), interface.len(), "and nothing beyond it");
+
+    // The fixture's table fits in context; a screenshot never does.
     let url = format!("file://{}", fixture.display());
     let snap = call(&host, &name, "browser::open", json!({"url": url})).unwrap();
     assert!(snap["title"].as_str().unwrap().contains("Workshop Fixture"));
     assert!(
         snap["elements"].as_array().unwrap().len() >= 3,
-        "inline snapshot keeps the element table"
+        "inline table: {snap}"
     );
-
     let shot = call(&host, &name, "browser::screenshot", json!({})).unwrap();
     let handle = shot["handle"].as_str().unwrap().to_string();
     let meta = kernel.cas.meta(&handle).unwrap();
@@ -222,22 +255,23 @@ fn browser_adapter_serves_verbs_and_data_plane() {
     assert_eq!(Some(meta.size), shot["size"].as_u64());
     host.shutdown(&name);
 
-    // Phase B: tiny inline cap + a real http origin — the snapshot goes to
-    // the CAS with a web:<origin> taint label; the model gets handle+preview.
-    let html = std::fs::read_to_string(&fixture).unwrap();
-    let port = serve_html(2, html);
+    // A page whose table does not fit: the model gets a handle and a
+    // preview, the artifact says which origin it came from. The line is a
+    // constant, so the test makes a bigger page rather than turning a knob.
+    let inputs: String = (0..150)
+        .map(|i| {
+            format!(
+                r#"<input name="f{i}" aria-label="{} {i}">"#,
+                "x".repeat(120)
+            )
+        })
+        .collect();
+    let port = serve_html(
+        2,
+        format!("<!doctype html><title>Big</title><form>{inputs}</form>"),
+    );
     let origin = format!("http://127.0.0.1:{port}");
-    let name = host
-        .spawn(
-            Path::new("node"),
-            &[plugin.to_str().unwrap()],
-            &[
-                ("WORKSHOP_HEADLESS", "1"),
-                ("WORKSHOP_PROFILE_DIR", profile.to_str().unwrap()),
-                ("WORKSHOP_SINK_INLINE_MAX", "64"),
-            ],
-        )
-        .unwrap();
+    let name = spawn();
     let out = call(
         &host,
         &name,
@@ -247,13 +281,13 @@ fn browser_adapter_serves_verbs_and_data_plane() {
     .unwrap();
     let handle = out["handle"]
         .as_str()
-        .expect("oversized snapshot becomes a handle");
+        .unwrap_or_else(|| panic!("an oversized table becomes a handle: {out}"));
     assert!(!out["preview"].as_str().unwrap().is_empty());
     let meta = kernel.cas.meta(&handle.to_string()).unwrap();
     assert_eq!(meta.r#type, "web/page-snapshot");
     assert!(
         meta.labels.integ.contains(&format!("web:{origin}")),
-        "page-derived artifact carries its origin taint: {:?}",
+        "a page-derived artifact says where it came from: {:?}",
         meta.labels
     );
 
@@ -552,8 +586,7 @@ fn portos_run_end_to_end() {
     plugins.push(json!({
         "bin": "node",
         "args": [plugin.to_str().unwrap()],
-        "env": {"WORKSHOP_HEADLESS": "1",
-                 "WORKSHOP_PROFILE_DIR": root.join("profile").to_str().unwrap()},
+        "config": {"headless": true, "profile_dir": root.join("profile")},
     }));
     write_json(&root.join("portos.json"), &json!({"plugins": plugins}));
 

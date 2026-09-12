@@ -24,22 +24,22 @@
 //! cancelled mid-command is only noticed once it returns, because
 //! cancellation is checked between tool calls.
 //!
+//! The interface is `drivers/shell`; this is its first implementation.
+//!
 //! Config (from the launch spec): `{"cwd": "/path"}`, the default working
 //! directory — the process's own if unset.
 
 use portos_abi::Label;
 use portos_abi::wire::Payload;
-use portos_sdk::bulk::{Bulk, Sink};
+use portos_sdk::bulk::Sink;
 use portos_sdk::scope::Scope;
 use portos_sdk::{CallError, CallResult, KernelClient, Plugin};
-use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::collections::BTreeMap;
+use portos_shell_api::{self as shell, DEFAULT_TIMEOUT_MS, RunArgs, RunReply};
+use serde::Deserialize;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 /// Provenance labels carry the command; a whole script would not be a label.
 const LABEL_CMD_CHARS: usize = 80;
 
@@ -60,74 +60,15 @@ fn main() -> std::io::Result<()> {
     eprintln!("[shell] cwd {}", cwd.display());
     let sink = Sink::default();
 
+    let tools = shell::tools();
     portos_sdk::serve(
-        Plugin::new("portos-shell").tool(
-            "shell::run",
-            "Run a shell command and return its exit status and output. The \
-             command is passed to `sh -c`, so pipes and redirection work — use \
-             them: `… 2>&1 | tail -40` keeps a long log out of the conversation. \
-             Output over ~16KB comes back as {handle, size, preview} — and you can \
-             feed such a handle straight back in through `artifacts` instead of \
-             reading it, which is almost always the cheaper move. The call blocks \
-             until the command ends or times out.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "cmd": {"type": "string", "description": "passed to sh -c"},
-                    "artifacts": {
-                        "type": "object",
-                        "description": "handles to expose to the command as environment \
-                                        variables holding file paths, e.g. {\"LOG\": \"blake3:…\"} \
-                                        then `grep error \"$LOG\"`",
-                        "additionalProperties": {"type": "string"},
-                    },
-                    "cwd": {"type": "string", "description": "relative to the driver's working directory"},
-                    "timeout_ms": {"type": "integer", "description": "default 120000"},
-                },
-                "required": ["cmd"],
-            }),
+        Plugin::new("portos-shell").implement(
+            &shell::RUN,
+            &tools[&shell::RUN],
             move |args, client| run(&cwd, &sink, client, args.parse()?),
         ),
         |_topic, _data| {},
     )
-}
-
-#[derive(Deserialize)]
-struct RunArgs {
-    cmd: String,
-    /// Relative to the driver's default working directory.
-    #[serde(default)]
-    cwd: Option<String>,
-    #[serde(default)]
-    timeout_ms: Option<u64>,
-    /// Artifacts to make visible to the command, as `NAME → handle`. Each
-    /// becomes an environment variable holding the path of a read-only file.
-    ///
-    /// This is how a stored result stops being a dead end. Without it the
-    /// only way to use a 700KB log was to read it back into the
-    /// conversation, which is exactly what putting it in the store was meant
-    /// to avoid: `grep -c error "$LOG"` costs one line of context instead.
-    /// The path never reaches the model — it asks by handle, the driver
-    /// resolves it here.
-    #[serde(default)]
-    artifacts: BTreeMap<String, String>,
-}
-
-#[derive(Serialize)]
-struct RunReply {
-    /// Exit code, or `null` when a signal ended it (including our own).
-    status: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    signal: Option<i32>,
-    stdout: Bulk,
-    stderr: Bulk,
-    timed_out: bool,
-    /// Output was still arriving when we stopped waiting for it. Only
-    /// reachable if something in the group survived a SIGKILL, but a caller
-    /// that is told "this is all of it" deserves to know when it is not.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    output_truncated: bool,
-    duration_ms: u64,
 }
 
 fn run(base: &PathBuf, sink: &Sink, client: &KernelClient, a: RunArgs) -> CallResult {

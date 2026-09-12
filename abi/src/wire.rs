@@ -150,6 +150,15 @@ pub struct Hello {
     /// difference between "not allowed" and "nobody there".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub needs: Vec<Verb>,
+    /// Serve hello only: topics this plugin listens to.
+    ///
+    /// Registered before the spawn that started it returns, so nothing
+    /// published the moment "everything is up" can slip past a plugin that
+    /// is still connecting — the window a subscription made from `on_ready`
+    /// leaves open. A plugin may still subscribe later, for what it learns
+    /// it wants at runtime.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subscribes: Vec<Topic>,
 }
 
 impl Hello {

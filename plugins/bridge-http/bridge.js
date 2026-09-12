@@ -7,7 +7,7 @@
 // shapes PortOS has:
 //
 //   topics  → GET  /events        (Server-Sent Events; ?replay=0 for new only)
-//   verbs   → POST /invoke        {verb, args} → {ok} | {err}
+//   verbs   → POST /invoke        {verb, args, at?} → {ok} | {err}
 //
 // plus the two things a presenter needs to be useful:
 //
@@ -15,6 +15,8 @@
 //   GET /artifact/<id>            dereference a handle (the data plane —
 //                                 bytes stream here, never through /events)
 //   GET /                         a presenter, served as plain static bytes
+//
+// The shapes are `drivers/link`; this file follows it.
 //
 // The presentation language lives entirely on the other end of the socket.
 // `web/console.html` is one presenter; a TUI, a native app or another PortOS
@@ -137,7 +139,7 @@ async function handle(req, res, client) {
     try {
       // The kernel is the one that decides whether this is allowed; a denial
       // comes back as a thrown error and is reported as-is.
-      const ok = await client.invoke(body.verb, body.args ?? null);
+      const ok = await client.invoke(body.verb, body.args ?? null, body.at);
       return sendJson(res, 200, { ok });
     } catch (e) {
       return sendJson(res, 200, { err: String(e?.message ?? e) });
@@ -178,9 +180,8 @@ await servePlugin({
   // Zero verbs: this plugin serves nobody inside PortOS. It is a consumer of
   // the event plane and a caller of the invoke path, like any renderer.
   verbs: [],
+  subscribes: TOPICS,
   onReady: async (client) => {
-    for (const topic of TOPICS) await client.subscribe(topic);
-
     server = http.createServer((req, res) => {
       handle(req, res, client).catch((e) => {
         if (!res.headersSent) sendJson(res, 500, { err: String(e?.message ?? e) });

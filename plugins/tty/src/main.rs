@@ -23,6 +23,7 @@ use nix::sys::signal::{self, SigHandler, SigSet, Signal};
 use nix::unistd::{getpgid, getpgrp, getppid, isatty, tcsetpgrp};
 use portos_abi::ids::Verb;
 use portos_abi::wire::Payload;
+use portos_kernel_api as kernel;
 use portos_model_api as model;
 use portos_sdk::{KernelClient, Plugin, PluginError};
 use serde::Deserialize;
@@ -49,7 +50,13 @@ enum Msg {
     /// The turn is over, one way or another.
     TurnOver,
     Interrupt,
+    /// The launcher says everything it listed is running.
+    Up,
 }
+
+/// How long to wait for the launcher before opening a session anyway — a
+/// front end started some other way has no launcher to wait for.
+const UP_WAIT: Duration = Duration::from_secs(10);
 
 fn main() -> std::io::Result<()> {
     let cfg: Config = portos_sdk::config::config().map_err(std::io::Error::other)?;
@@ -66,6 +73,10 @@ fn main() -> std::io::Result<()> {
         Plugin::new("portos-tty")
             // Said here because this plugin is the only thing that knows it.
             .needs(&model::START)
+            // Declared rather than subscribed from `on_ready`: the launcher
+            // publishes it the moment its list is up, which can be before a
+            // subscription made after this hello would land.
+            .subscribes(&kernel::UP)
             .on_ready(move |_registrar, client| {
                 let client = client.clone();
                 std::thread::spawn(move || {
@@ -76,7 +87,13 @@ fn main() -> std::io::Result<()> {
                 });
                 Ok(())
             }),
-        move |_topic, data| render(data, &events_tx),
+        move |topic, data| {
+            if topic == &*kernel::UP {
+                let _ = events_tx.send(Msg::Up);
+            } else {
+                render(data, &events_tx);
+            }
+        },
     )
 }
 
@@ -112,6 +129,20 @@ fn front_end(
         let _ = tx.send(Msg::Eof);
     });
 
+    // The whole set first — the tools, the other renderers — because a turn
+    // started before them would run without them. `needs` cannot say this:
+    // it names a driver, and only the launcher knows the list.
+    let mut pending: VecDeque<Msg> = VecDeque::new();
+    let deadline = Instant::now() + UP_WAIT;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(Msg::Up) => break,
+            Ok(other) => pending.push_back(other),
+            Err(_) => break,
+        }
+    }
+
     let sid = open_session(client, cfg)?;
     client.subscribe(&sid.topic())?;
     println!("[tty] session {sid} — type a message; /cancel stops a turn, /exit quits\n");
@@ -121,7 +152,6 @@ fn front_end(
     // call still in flight. Only `/cancel` and an interrupt act at once.
     let mut busy = false;
     let mut interrupted = false;
-    let mut pending: VecDeque<Msg> = VecDeque::new();
     loop {
         let deferred = if busy { None } else { pending.pop_front() };
         let msg = match deferred {
@@ -143,6 +173,8 @@ fn front_end(
                 busy = false;
                 interrupted = false;
             }
+            // A reload finished; nothing to do mid-session.
+            Msg::Up => {}
             // A turn in flight is cancelled, not abandoned: an interrupt
             // almost always means "stop this", not "lose the session".
             // Interrupting again, or when idle, quits.

@@ -137,10 +137,13 @@ export class KernelClient {
     return run;
   }
 
-  /** Call another plugin's verb through the kernel (capability-checked there). */
-  invoke(verb, args = null) {
+  /** Call another plugin's verb through the kernel (capability-checked
+   *  there). `at` names the instance when more than one answers the verb. */
+  invoke(verb, args = null, at) {
     return this._serial(async () => {
-      this.chan.writeFrame({ op: "invoke", verb, args });
+      const req = { op: "invoke", verb, args };
+      if (at) req.at = at;
+      this.chan.writeFrame(req);
       return unwrapOk(await this.chan.readFrame());
     });
   }
@@ -217,8 +220,13 @@ export class KernelClient {
  *   advertised to the kernel and joined into grants introspection.
  * onReady (optional): async hook run with the client once connected, before
  *   serving — where a passive plugin (e.g. a renderer) subscribes.
+ * needs (optional): verbs this plugin cannot work without; until somebody
+ *   answers them it runs but is not routed.
+ * subscribes (optional): topics to listen to, registered by the kernel before
+ *   the spawn returns — so nothing published "once everything is up" is
+ *   missed. Subscribe from onReady only for what is learned at runtime.
  */
-export async function servePlugin({ name, verbs, tools, onCall, onEvent, onReady }) {
+export async function servePlugin({ name, verbs, tools, needs, subscribes, onCall, onEvent, onReady }) {
   const sock = process.env.PORTOS_PLUGIN_SOCK;
   if (!sock) throw new Error("PORTOS_PLUGIN_SOCK unset");
   const token = process.env.PORTOS_PLUGIN_TOKEN ?? "";
@@ -228,6 +236,8 @@ export async function servePlugin({ name, verbs, tools, onCall, onEvent, onReady
   // events channel (which sync-threaded plugins need) is unnecessary here.
   const serveHello = { name, abi: ABI_VERSION, role: "serve", token, verbs, channels: ["client"] };
   if (tools) serveHello.tools = tools;
+  if (needs?.length) serveHello.needs = needs;
+  if (subscribes?.length) serveHello.subscribes = subscribes;
   const serveChan = await connectChannel(sock, { hello: serveHello });
   const clientChan = await connectChannel(sock, {
     hello: { name, abi: ABI_VERSION, role: "client", token },

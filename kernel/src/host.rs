@@ -51,9 +51,9 @@ use portos_abi::wire::{
 };
 use portos_abi::{ABI_VERSION, chunk, frame};
 use portos_router::{Miss, Router as _};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
@@ -62,103 +62,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 
-/// How to start a plugin, and what it may do once it is up.
-///
-/// The same shape whether it comes from `portos.json` at boot or from a
-/// `kernel::spawn` call mid-session: starting a plugin is one operation with
-/// one description, not two code paths that drift.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub struct LaunchSpec {
-    /// An executable in the CAS.
-    ///
-    /// A plugin named this way is a **thing** rather than a location: the
-    /// same bytes get the same id on every machine, the spec carries the
-    /// name and never the bytes, and what ran is checkable afterwards. It
-    /// is also what lets a spec cross a boundary at all — a path means
-    /// nothing inside a container, on another node, or to the next run of
-    /// this one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub artifact: Option<String>,
-    /// A path on this host: the escape hatch, for things already installed
-    /// (`node`, a system tool) and for the bootstrap.
-    ///
-    /// **Not reproducible and not portable.** The file can change under a
-    /// spec that names it, and nothing that names one can be shipped
-    /// anywhere. Kept because pretending otherwise would be worse, and
-    /// labelled so it does not read as equivalent to the line above.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bin: Option<String>,
-    /// A tar archive in the CAS: everything the plugin needs beyond one
-    /// executable.
-    ///
-    /// A second axis from `artifact`/`bin`, not an alternative to them. Those
-    /// say **what runs**; this says **what files it has**. A JS plugin needs
-    /// both and they come from different places — the script and its
-    /// dependencies from here, the interpreter from the host — which is why
-    /// folding them into one field would not have worked.
-    ///
-    /// It is unpacked once and becomes the process's working directory, so
-    /// relative paths inside it mean what they meant when it was built.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bundle: Option<String>,
-    #[serde(default)]
-    pub args: Vec<String>,
-    /// What this plugin should be, in its own vocabulary. Opaque here — the
-    /// kernel hands it over and cannot read it, like any other payload.
-    ///
-    /// It lives in the spec rather than in a file the plugin finds for
-    /// itself, so that changing it changes the spec: a reload then re-plugs
-    /// that one driver without anyone having to declare which files matter.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub config: Option<Payload>,
-    #[serde(default)]
-    pub env: BTreeMap<String, String>,
-    /// The identifier this instance runs under.
-    ///
-    /// Two instances of one driver — two browsers — need two, and the
-    /// launcher is the one who knows there are two, so it names them; what a
-    /// plugin calls itself is only the name it gets when nobody says
-    /// otherwise. A plugin that was named and answers to something else is
-    /// refused: a launcher that cannot trust the name it gave cannot address
-    /// what it started.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    /// Minted once the plugin is up and has declared its name.
-    #[serde(default)]
-    pub grants: Vec<GrantSpec>,
-    /// How it runs. What a plugin *is* and how it runs are two axes; this is
-    /// the second one, and the kernel knows only the two it can do without
-    /// learning a domain — a child process, optionally inside a cgroup.
-    /// Containers and VMs belong to drivers.
-    #[serde(default)]
-    pub form: Form,
-}
-
-/// The runtime forms the kernel implements itself.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Form {
-    /// A child process leading its own process group. Always available, and
-    /// the bootstrap that must never depend on anything else being present.
-    Bare,
-    /// The same child, inside a cgroup of its own — a boundary it cannot
-    /// leave with `setsid`, and one that leaves a findable directory if this
-    /// runtime dies without teardown. Falls back to [`Form::Bare`] where
-    /// cgroup v2 is not available or not writable.
-    #[default]
-    Cgroup,
-}
-
-/// A capability to mint. `subject` defaults to the plugin being started,
-/// which is the common case: a driver being granted what it needs.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct GrantSpec {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subject: Option<String>,
-    pub resource: String,
-    #[serde(default)]
-    pub verbs: BTreeSet<String>,
-}
+pub use portos_kernel_api::{Form, GrantSpec, LaunchSpec};
+use portos_kernel_api::{PluginInfo, PluginsReply, SpawnReply, StopArgs, StopReply};
 
 /// Where a plugin's executable comes from. Two fields rather than one enum
 /// so that a spec reads as `{"artifact": …}` or `{"bin": …}` and a typo gets
@@ -169,43 +74,17 @@ enum Source<'a> {
     Path(&'a str),
 }
 
-impl LaunchSpec {
-    pub fn from_path(bin: impl Into<String>) -> LaunchSpec {
-        LaunchSpec {
-            bin: Some(bin.into()),
-            ..Default::default()
-        }
-    }
-
-    pub fn from_artifact(id: impl Into<String>) -> LaunchSpec {
-        LaunchSpec {
-            artifact: Some(id.into()),
-            ..Default::default()
-        }
-    }
-
-    /// A bundled plugin: its files from `bundle`, run by `bin` — which is
-    /// either a name to find on PATH (`node`) or, if it contains a
-    /// separator, a file inside the bundle.
-    pub fn from_bundle(bundle: impl Into<String>, bin: impl Into<String>) -> LaunchSpec {
-        LaunchSpec {
-            bundle: Some(bundle.into()),
-            bin: Some(bin.into()),
-            ..Default::default()
-        }
-    }
-
-    fn source(&self) -> Result<Source<'_>, KernelError> {
-        match (&self.artifact, &self.bin) {
-            (Some(id), None) => Ok(Source::Artifact(id)),
-            (None, Some(path)) => Ok(Source::Path(path)),
-            (Some(_), Some(_)) => Err(KernelError::Denied(
-                "launch spec names both `artifact` and `bin`; it must name exactly one".into(),
-            )),
-            (None, None) => Err(KernelError::Denied(
-                "launch spec names neither `artifact` nor `bin`".into(),
-            )),
-        }
+/// Exactly one of `artifact` and `bin`, checked here, once.
+fn source(spec: &LaunchSpec) -> Result<Source<'_>, KernelError> {
+    match (&spec.artifact, &spec.bin) {
+        (Some(id), None) => Ok(Source::Artifact(id)),
+        (None, Some(path)) => Ok(Source::Path(path)),
+        (Some(_), Some(_)) => Err(KernelError::Denied(
+            "launch spec names both `artifact` and `bin`; it must name exactly one".into(),
+        )),
+        (None, None) => Err(KernelError::Denied(
+            "launch spec names neither `artifact` nor `bin`".into(),
+        )),
     }
 }
 
@@ -578,7 +457,7 @@ fn spawn_process(
         Some(id) => Some(unpack(kernel, id)?),
         None => None,
     };
-    let bin = match spec.source()? {
+    let bin = match source(spec)? {
         Source::Artifact(id) => materialise(kernel, id)?,
         // A program name with no separator is for PATH to find — `node` is
         // not something a bundle carries. One with a separator names a file,
@@ -745,6 +624,20 @@ fn spawn_process(
             }
         }
 
+        // What it listens to, in place before this spawn returns: whoever
+        // started it may publish the moment it has, and a subscription made
+        // after the fact would miss that.
+        {
+            let mut subs = inner.subs.lock().unwrap();
+            for pattern in &hello.subscribes {
+                let id = SubId::new(inner.next_sub.fetch_add(1, Ordering::SeqCst));
+                subs.push(Sub {
+                    id,
+                    pattern: pattern.clone(),
+                    target: SubTarget::Plugin(name.clone()),
+                });
+            }
+        }
         let (events_tx, events_rx) = sync_channel::<ServeMsg>(EVENT_QUEUE);
         let handle = Arc::new(PluginHandle {
             declared: Mutex::new(Declared {
@@ -1428,50 +1321,6 @@ fn handle_client_op(
     }
 }
 
-#[derive(Deserialize)]
-struct StopArgs {
-    name: PluginName,
-}
-
-#[derive(Serialize)]
-struct PluginInfo {
-    name: PluginName,
-    verbs: Vec<Verb>,
-    /// What it is still waiting for. Empty means it is answering.
-    ///
-    /// The diagnosis lives here rather than in the route table because the
-    /// table has one job — does this name resolve — and a third state in it
-    /// would be a special case for every reader of it.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    unmet: Vec<Verb>,
-}
-
-#[derive(Serialize)]
-struct SpawnReply {
-    name: PluginName,
-    verbs: Vec<Verb>,
-    /// Present when it started but is waiting on something. An agent that
-    /// spawned a plugin and got this back knows to start what it needs
-    /// rather than wondering why the new verbs are not there.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    unmet: Vec<Verb>,
-}
-
-#[derive(Serialize)]
-struct StopReply {
-    stopped: bool,
-}
-
-#[derive(Serialize)]
-struct PluginsReply {
-    plugins: Vec<PluginInfo>,
-}
-
-/// What the kernel advertises about its own verbs. A driver describes its
-/// verbs in its hello; the kernel has no hello, so it says so here — and
-/// `grants` then hands these to a caller exactly like any driver's, which is
-/// how a model comes to see `kernel__spawn` as an ordinary tool.
-
 /// The verbs the kernel answers itself. Reaching here means the capability
 /// gate already passed, exactly as for a routed verb — the kernel is not a
 /// special caller, it is a special *callee*.
@@ -1531,80 +1380,11 @@ fn reply_of(encoded: Option<Vec<u8>>) -> Result<Payload, KernelError> {
 /// The kernel's own verbs, as rows answered by the instance named `kernel`.
 /// Nothing is reserved: a plugin may answer `kernel::spawn` as well — a
 /// launcher for a form the kernel does not know — and callers then name
-/// which of the two they mean. The descriptions live here rather than in a
-/// second table, because a second table keyed by verb is the mistake this
-/// whole change is about.
+/// which of the two they mean. What each verb says about itself comes from
+/// the interface, so a second implementation says the same thing.
 fn builtin_routes() -> RouteTable {
-    let tool = |verb: &str, description: &str, schema: serde_json::Value| {
-        (
-            Verb::parse(verb).expect("constant verb"),
-            ToolMeta {
-                description: description.to_string(),
-                schema: Payload::of(&schema).ok(),
-            },
-        )
-    };
-    let described: BTreeMap<Verb, ToolMeta> = BTreeMap::from([
-        tool(
-            "kernel::spawn",
-            "Start a new plugin and grant it what it needs. Name it with \
-             either `artifact` (an executable in the CAS) or `bin` (a path \
-             on this host) — exactly one. The plugin's verbs \
-             become available to anyone granted them — including, if the grants \
-             say so, you — from your next turn onward. Use this to add a \
-             capability the system does not currently have.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "artifact": {"type": "string", "description":
-                        "id of an executable stored in the CAS — the portable \
-                         way to name a plugin"},
-                    "bin": {"type": "string", "description":
-                        "path to an executable on this host; use it for things \
-                         already installed, such as `node`"},
-                    "args": {"type": "array", "items": {"type": "string"}},
-                    "env": {"type": "object"},
-                    "grants": {
-                        "type": "array",
-                        "description": "capabilities to mint once it is up; \
-                                        `subject` defaults to the new plugin",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "subject": {"type": "string"},
-                                "resource": {"type": "string"},
-                                "verbs": {"type": "array", "items": {"type": "string"}},
-                            },
-                            "required": ["resource", "verbs"],
-                        },
-                    },
-                },
-                // Exactly one of `artifact` and `bin`, which a JSON
-                // schema cannot say and the kernel checks instead.
-                "required": [],
-            }),
-        ),
-        tool(
-            "kernel::stop",
-            "Stop a running plugin. Its verbs stop being routed and everything \
-             it was granted is revoked; anything it started is collected too.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {"name": {"type": "string"}},
-                "required": ["name"],
-            }),
-        ),
-        tool(
-            "kernel::plugins",
-            "List the plugins currently running and the verbs each answers.",
-            serde_json::json!({"type": "object", "properties": {}}),
-        ),
-    ]);
-
     let mut table = RouteTable::default();
-    for verb in ["kernel::spawn", "kernel::stop", "kernel::plugins"] {
-        let verb = Verb::parse(verb).expect("constant verb");
-        let meta = described.get(&verb).cloned().unwrap_or_default();
+    for (verb, meta) in portos_kernel_api::tools() {
         table
             .add(verb, Answerer::Kernel, meta)
             .expect("each kernel verb is registered once");

@@ -1,0 +1,132 @@
+{
+  "browser::open": {
+    "description": "Open the browser (it has a profile of its own) and, if `url` is given, go there. Returns the page's element table: every interactive element, each with a short-lived `ref` to act on.",
+    "schema": {
+      "type": "object",
+      "properties": {
+        "url": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "browser::navigate": {
+    "description": "Go to `url`. Returns the new element table.",
+    "schema": {
+      "type": "object",
+      "required": [
+        "url"
+      ],
+      "properties": {
+        "url": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "browser::snapshot": {
+    "description": "Re-read the current page's element table with fresh refs. `with_bbox` adds each element's position.",
+    "schema": {
+      "type": "object",
+      "properties": {
+        "with_bbox": {
+          "type": "boolean"
+        }
+      }
+    }
+  },
+  "browser::click": {
+    "description": "Click the element `ref` points at. Pass `expect_name` to be told if the element under that ref is no longer the one you saw.",
+    "schema": {
+      "type": "object",
+      "required": [
+        "ref"
+      ],
+      "properties": {
+        "ref": {
+          "type": "string"
+        },
+        "expect_name": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "browser::type": {
+    "description": "Type `text` into the element `ref` points at; `submit` presses Enter afterwards. `expect_name` as for click.",
+    "schema": {
+      "type": "object",
+      "required": [
+        "ref",
+        "text"
+      ],
+      "properties": {
+        "ref": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "expect_name": {
+          "type": "string"
+        },
+        "submit": {
+          "type": "boolean"
+        }
+      }
+    }
+  },
+  "browser::wait_for": {
+    "description": "Wait for a selector to appear, for the network to go idle, or for a number of milliseconds.",
+    "schema": {
+      "type": "object",
+      "properties": {
+        "selector": {
+          "type": "string"
+        },
+        "ms": {
+          "type": "number"
+        },
+        "network_idle": {
+          "type": "boolean"
+        }
+      }
+    }
+  },
+  "browser::screenshot": {
+    "description": "Take a screenshot. Returns a handle to the stored image and its path — never the image itself.",
+    "schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "browser::login_passthrough": {
+    "description": "Hand the window to the person, to log in or pass a check. Passwords and passkeys never reach the agent; call `resume` when they are done.",
+    "schema": {
+      "type": "object",
+      "properties": {
+        "url": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "browser::resume": {
+    "description": "Take the browser back after a passthrough.",
+    "schema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  "browser::close": {
+    "description": "Close the browser.",
+    "schema": {
+      "type": "object",
+      "properties": {}
+    }
+  }
+}

@@ -29,8 +29,10 @@
 
 use nix::sys::signal::{SigSet, Signal};
 use portos_abi::ids::{PluginName, Topic};
+use portos_abi::wire::Payload;
 use portos_kernel::Kernel;
-use portos_kernel::host::{Form, GrantSpec, Host, LaunchSpec};
+use portos_kernel::host::Host;
+use portos_kernel_api::{Form, GrantSpec, LaunchSpec};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -122,6 +124,9 @@ pub fn run(root: &str) -> Result<(), Box<dyn std::error::Error>> {
         host.shutdown_all();
         return Err(first.clone().into());
     }
+    // The list is up. A front end that waited for the whole of it — not
+    // just the model driver its own `needs` name — opens its session now.
+    host.emit(&portos_kernel_api::UP, Payload::null());
     println!("[run] up — SIGHUP reloads {CONFIG}, Ctrl-C stops");
 
     spawn_signal_handler(
@@ -201,6 +206,7 @@ impl Reloadable {
         for f in converge(&self.host, &self.root, &self.exe, &mut state) {
             eprintln!("[run] reload: {f}");
         }
+        self.host.emit(&portos_kernel_api::UP, Payload::null());
     }
 }
 

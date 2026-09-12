@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 portos-abi = { path = "../../abi" }
+portos-link-api = { path = "../../drivers/link" }
 portos-sdk = { path = "../../sdk/rust" }
 serde = { workspace = true }
 serde_json = { workspace = true }

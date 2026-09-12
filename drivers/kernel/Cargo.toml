@@ -1,0 +1,9 @@
+[package]
+name = "portos-kernel-api"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+portos-abi = { path = "../../abi" }
+serde = { workspace = true }
+serde_json = { workspace = true }

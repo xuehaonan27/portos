@@ -490,14 +490,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "portos-browser-api"
+version = "0.1.0"
+dependencies = [
+ "portos-abi",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "portos-cli"
 version = "0.1.0"
 dependencies = [
  "blake3",
  "nix",
  "portos-abi",
+ "portos-browser-api",
  "portos-egress-api",
  "portos-kernel",
+ "portos-kernel-api",
  "portos-model-api",
  "serde",
  "serde_json",
@@ -533,9 +544,19 @@ dependencies = [
  "globset",
  "ignore",
  "portos-abi",
+ "portos-fs-api",
  "portos-kernel",
  "portos-sdk",
  "regex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "portos-fs-api"
+version = "0.1.0"
+dependencies = [
+ "portos-abi",
  "serde",
  "serde_json",
 ]
@@ -548,6 +569,7 @@ dependencies = [
  "hex",
  "nix",
  "portos-abi",
+ "portos-kernel-api",
  "portos-router",
  "rand",
  "regex",
@@ -556,6 +578,23 @@ dependencies = [
  "serde_json",
  "tar",
  "thiserror",
+]
+
+[[package]]
+name = "portos-kernel-api"
+version = "0.1.0"
+dependencies = [
+ "portos-abi",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "portos-link-api"
+version = "0.1.0"
+dependencies = [
+ "portos-abi",
+ "serde",
 ]
 
 [[package]]
@@ -596,6 +635,7 @@ name = "portos-remote"
 version = "0.1.0"
 dependencies = [
  "portos-abi",
+ "portos-link-api",
  "portos-sdk",
  "serde",
  "serde_json",
@@ -631,6 +671,16 @@ dependencies = [
  "portos-abi",
  "portos-kernel",
  "portos-sdk",
+ "portos-shell-api",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "portos-shell-api"
+version = "0.1.0"
+dependencies = [
+ "portos-abi",
  "serde",
  "serde_json",
 ]
@@ -641,6 +691,7 @@ version = "0.1.0"
 dependencies = [
  "nix",
  "portos-abi",
+ "portos-kernel-api",
  "portos-model-api",
  "portos-sdk",
  "serde",

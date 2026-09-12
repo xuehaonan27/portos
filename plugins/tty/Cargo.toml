@@ -13,3 +13,4 @@ serde = { workspace = true }
 portos-abi = { path = "../../abi" }
 portos-sdk = { path = "../../sdk/rust" }
 portos-model-api = { path = "../../drivers/model" }
+portos-kernel-api = { path = "../../drivers/kernel" }

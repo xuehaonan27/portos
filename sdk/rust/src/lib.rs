@@ -256,6 +256,7 @@ pub struct Plugin<'a> {
     /// peer appears. That is why handlers must be `Send`.
     inner: Arc<Mutex<Served<'a>>>,
     needs: Vec<Verb>,
+    subscribes: Vec<Topic>,
     on_ready: Option<ReadyHook<'a>>,
 }
 
@@ -400,6 +401,7 @@ impl<'a> Plugin<'a> {
             name: name.into(),
             inner: Arc::new(Mutex::new(Served::default())),
             needs: Vec::new(),
+            subscribes: Vec::new(),
             on_ready: None,
         }
     }
@@ -425,6 +427,20 @@ impl<'a> Plugin<'a> {
             },
             handler,
         )
+    }
+
+    /// A verb of a driver interface, described by that interface.
+    ///
+    /// The description and schema come from the driver crate — `fs::tools()`
+    /// — so what this plugin advertises *is* what the interface says, not a
+    /// second copy of it that can drift.
+    pub fn implement(
+        self,
+        verb: &Verb,
+        meta: &ToolMeta,
+        handler: impl FnMut(&Payload, &Arc<KernelClient>) -> CallResult + Send + 'a,
+    ) -> Plugin<'a> {
+        self.declare(verb.as_str(), meta.clone(), handler)
     }
 
     /// A verb with nothing to say for itself: reachable, but not something a
@@ -476,8 +492,18 @@ impl<'a> Plugin<'a> {
         self
     }
 
+    /// A topic this plugin listens to, subscribed by the kernel before the
+    /// spawn that starts it returns. Declare here what you must not miss —
+    /// `kernel::up`, a session's events — and subscribe from `on_ready` only
+    /// for what you learn you want at runtime.
+    pub fn subscribes(mut self, topic: &Topic) -> Plugin<'a> {
+        self.subscribes.push(topic.clone());
+        self
+    }
+
     /// Work to start once the channels are up and before the first call is
-    /// served: subscribing, listening, pumping a link. A plugin whose job
+    /// served: listening, pumping a link, subscribing to what was only
+    /// learned at runtime. A plugin whose job
     /// begins on its own has no call to hang it off, and deferring it to the
     /// first call means a plugin nobody calls never starts.
     pub fn on_ready(
@@ -519,6 +545,11 @@ impl<'a> Plugin<'a> {
                 },
                 needs: if serving {
                     self.needs.clone()
+                } else {
+                    Vec::new()
+                },
+                subscribes: if serving {
+                    self.subscribes.clone()
                 } else {
                     Vec::new()
                 },

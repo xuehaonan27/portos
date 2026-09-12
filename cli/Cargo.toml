@@ -15,5 +15,9 @@ serde_json = { workspace = true }
 nix = { workspace = true }
 portos-egress-api = { path = "../drivers/egress" }
 portos-kernel = { path = "../kernel" }
+portos-kernel-api = { path = "../drivers/kernel" }
 portos-model-api = { path = "../drivers/model" }
 portos-abi = { path = "../abi" }
+
+[dev-dependencies]
+portos-browser-api = { path = "../drivers/browser" }

@@ -231,7 +231,9 @@ theoretical elegance is not. Current state and build order live in
   state. `plugins/echo/tests/hotplug.rs` asserts the list.
 - **A result the model might not read does not enter its context.** Every
   bulky verb answers `{text}` when small and `{handle, size, preview}` when
-  not — one shape, defined once in `portos_sdk::bulk`, because `modeld`
+  not — one shape, `portos_abi::bulk::Bulk`, at the boundary because callers
+  and driver interfaces parse it too, with the mechanism that decides and
+  stores in `portos_sdk::bulk::Sink`; one shape because `modeld`
   already promised the model that shape in the `artifact::read` tool
   description. Where the line falls is a constant, not a knob. Pipes count
   as context discipline too: `shell::run` takes a whole `sh -c` string
@@ -256,7 +258,16 @@ theoretical elegance is not. Current state and build order live in
   set — broker, model driver, terminal front end — is spelled out, into the
   file. The REPL that used to live in the CLI was a front end masquerading
   as the launcher, with a renderer that was not a plugin and a launcher that
-  knew `model::start`; both are gone.
+  knew `model::start`; both are gone. When the list is up the launcher
+  publishes `kernel::up`, at startup and after each reload: a plugin's
+  `needs` name a driver, not the operator's whole list, so a front end that
+  wants the tools and the other renderers in place before its first turn
+  waits for that rather than racing the launcher that started it — and
+  declares the subscription in its `hello` (`Plugin::subscribes`,
+  `Hello.subscribes`), which the kernel registers before the spawn
+  returns, because a subscription made from `on_ready` lands after the
+  launcher may already have spoken. A renderer declares
+  `model::session::*` the same way, for the same reason.
 - **Reload is re-plug.** `SIGHUP` to `portos run` re-reads `portos.json`
   and brings the running set back in line — whatever changed is stopped and
   started again, whatever did not is left alone. There is no second
@@ -320,6 +331,12 @@ theoretical elegance is not. Current state and build order live in
   learns at startup rather than mid-turn. `kernel::plugins` and the spawn
   reply report what a plugin is still waiting for; the route table does not,
   because a third state in it would be a special case for every reader.
+  A JS plugin declares `needs` the same way. Most plugins have none, and
+  that is the truth rather than an omission: `fs`, `shell`, `browser` and
+  `remote` call nothing local. Not expressible yet: a *renderer's*
+  dependency, which is on somebody publishing `model::session::*` — a need
+  on a topic, not a verb. The trigger for adding it is a renderer that
+  misbehaves for lack of a publisher; none does.
 - **A plugin may learn a verb after it is running.** `hello` is the ordinary
   way to declare verbs, not the only one: a driver that mirrors somebody
   else cannot know what it answers until it has asked them, and asking
@@ -359,7 +376,7 @@ cargo test --workspace          # their own, and a package with no tests
 cargo fmt --all                 # (remote) is not rebuilt by `cargo test`
 ```
 
-98 tests; all must pass, zero warnings.
+99 tests; all must pass, zero warnings.
 
 The end-to-end tests are the ones that matter and they are hermetic:
 
@@ -372,7 +389,9 @@ The end-to-end tests are the ones that matter and they are hermetic:
   "skipping:" in the output before believing a green run. Also the
   substitution: a different model driver listed in `portos.json` and
   nothing else changed, which is the guarantee a plugin author relies on,
-  tested rather than promised.
+  tested rather than promised. And the browser plugin's conformance: what
+  its hello advertises, seen through grants introspection, equals
+  `portos_browser_api::tools()` word for word.
 - `plugins/echo/tests/abi_v2.rs` — plugin ABI conformance.
 - `plugins/broker/tests/egress.rs` — allowlist, injection, sanitizing.
 - `plugins/modeld/tests/modeld.rs` — the agentic loop, cancellation, and a
@@ -422,7 +441,8 @@ walking skeleton test is what proves the wiring.
   and `Payload` is unparsed JSON the kernel forwards without being able to
   read it. `ids` holds `Verb`/`Topic`/`PluginName`/`SubId`, which parse once
   so their accessors are total. Also the frame codec, chunk streaming,
-  `Capability`, `Label`, artifact metadata, and `boundary`: a cgroup, a
+  `Capability`, `Label`, artifact metadata, `bulk` (the large-result
+  shape), and `boundary`: a cgroup, a
   boundary whatever is inside cannot leave — here because both sides need
   it; the kernel puts a plugin in one, a plugin puts its own children in one.
 - `kernel` (`portos-kernel`): `caps` (authorization, and the join that
@@ -444,8 +464,20 @@ walking skeleton test is what proves the wiring.
   a library; daemonization is deferred to W4.
 - `drivers`: interfaces that regulate a class of behaviour, depended on by
   implementations and callers alike so a shape is never written twice.
-  `egress`, `model`, `router`. **These never run.** A new plugin that needs a
-  new interface adds a driver here and becomes its first implementation.
+  `kernel`, `egress`, `model`, `fs`, `shell`, `browser`, `link`, `router`.
+  **These never run.** A new plugin that needs a new interface adds a driver
+  here and becomes its first implementation, and an existing plugin without
+  one is a plugin whose contract can only be copied by eye — which is how
+  `fs`, `shell` and `browser` stood until they got theirs. A driver states
+  the verbs, the argument and reply types, and what each verb says about
+  itself (`tools()`), so an implementation advertises the interface's
+  wording and not its own. Where the first implementation is JavaScript
+  (`browser`), the descriptions live in a `tools.json` both sides read, and
+  a conformance test holds the JS hello to the Rust view. `kernel` is the
+  kernel's own verbs — `LaunchSpec`, spawn/stop/plugins — stated outside it
+  so the CLI's launcher and a future launcher plugin get the types from the
+  interface and not from the kernel. `link` is not a verb family: it is the
+  HTTP shape a bridge serves and a remote consumes.
 
   The kernel must not know that a *domain* driver exists — `egress`, `model`
   and whatever comes next are none of its business, and that is where
@@ -477,7 +509,10 @@ walking skeleton test is what proves the wiring.
       to stdout, `resume` in its config. It takes the terminal's foreground
       so Ctrl-C cancels a turn, and asks the launcher to stop with `SIGTERM`
       when it quits, since a front end has no verb for that and should not.
-    - `browser` (JS/Playwright), `fs`, `shell`, `remote` (another node's
+    - `browser` (JS/Playwright: `plugin.js` is the ABI and the two
+      data-plane rules, `driver/` is the browser; its tool descriptions are
+      `drivers/browser/tools.json`, which it reads), `fs`, `shell`, `remote`
+      (another node's
       verbs, mirrored here), `bridge-http` (the event plane and the invoke
       path over HTTP/SSE; transport and presentation are separate files on
       purpose), `render-tty` (the renderer reference).

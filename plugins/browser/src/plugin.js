@@ -1,76 +1,39 @@
 #!/usr/bin/env node
-// plugin.js — the PortOS adapter (thin). Exposes the transport-agnostic tool
-// surface (tools.js) as `browser::*` verbs on the PortOS plugin ABI; the seam
-// that used to hold the MCP adapter now holds this. Only this file knows the
-// kernel protocol.
+// portos-browser: a watchable browser as `browser::*` verbs.
 //
-// Seam ③ cashes in here: the sink runs in "kernel" mode, so oversized
-// payloads land in the kernel CAS (taint-labeled by page origin) and the
-// model receives handle + preview instead of the full text. Screenshots stop
-// being loose files: the bytes are ingested as an image artifact and the
-// verb returns its handle (the temp path rides along for a headful human).
+// The interface is `drivers/browser`. Its `tools.json` is read here, so what
+// this plugin advertises and what the Rust side says are one document; a
+// conformance test in `cli/tests/run.rs` holds the two together. The
+// implementation is Playwright (`driver/`). What this file adds is the ABI:
+// config in, verbs out, and the two data-plane rules every driver follows —
+// a result the model might not read goes to the CAS with a preview (the JS
+// twin of `portos_abi::bulk`), and a screenshot is an artifact, never bytes
+// in a conversation.
+//
+// Config (from the launch spec), all optional:
+//   {"headless": bool, "profile_dir": "…", "channel": "chrome", "no_sandbox": bool}
 
 import { readFile } from "node:fs/promises";
-import { createWorkshop } from "./tools.js";
-import { makeSink } from "./sink.js";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
+import { PlaywrightDriver } from "./driver/playwright-driver.js";
 import { servePlugin } from "../../../sdk/js/client.js";
 
-const typeFor = (kind) =>
-  kind === "snapshot" ? "web/page-snapshot" : kind === "text" ? "text/plain" : "application/json";
-
-const labelsFor = (origin) => (origin ? { integ: [`web:${origin}`] } : null);
-
-// The kernel client only exists once servePlugin connects; the sink binds to
-// it lazily (puts can only happen inside a call, by which time it is set).
-const clientRef = { current: null };
-
-const sink = makeSink({
-  mode: "kernel",
-  inlineMax: Number(process.env.WORKSHOP_SINK_INLINE_MAX ?? 16 * 1024),
-  previewChars: 2048,
-  put: (kind, text, origin) =>
-    clientRef.current.put(Buffer.from(text, "utf8"), typeFor(kind), labelsFor(origin)),
-});
-
-const { tools, driver } = createWorkshop({
-  sink,
-  log: (s) => console.error(`[browser] ${s}`),
-});
-const byVerb = new Map(tools.map((t) => [`browser::${t.name.replace(/^browser_/, "")}`, t]));
-
-// The driver owns its tool metadata: advertised to the kernel, joined into
-// grants introspection, so a granted model driver needs no tool config.
-const toolsMeta = Object.fromEntries(
-  [...byVerb.entries()].map(([verb, t]) => [
-    verb,
-    { description: t.description, schema: t.inputSchema },
-  ]),
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const TOOLS = JSON.parse(
+  await readFile(path.join(HERE, "../../../drivers/browser/tools.json"), "utf8"),
 );
+const config = JSON.parse(process.env.PORTOS_PLUGIN_CONFIG ?? "{}");
 
-await servePlugin({
-  name: "portos-browser",
-  verbs: [...byVerb.keys()],
-  tools: toolsMeta,
-  onCall: async (verb, args, client) => {
-    clientRef.current = client;
-    const tool = byVerb.get(verb);
-    if (!tool) throw new Error(`unknown verb: ${verb}`);
-    const out = await tool.handler(args ?? {});
-    if (verb === "browser::screenshot" && out?.path) {
-      const origin = originOf(driver.currentUrl());
-      const meta = await client.put(await readFile(out.path), "image/png", labelsFor(origin));
-      return { handle: meta.id, size: meta.size, type: meta.type, path: out.path };
-    }
-    return out;
-  },
-});
+// Where the line between context and data is drawn: the constants of
+// `portos_abi::bulk`, because the model was told one shape.
+const INLINE_MAX = 16 * 1024;
+const PREVIEW_CHARS = 2048;
+/** The element table is the model's working lens; it is capped, not cut. */
+const MAX_ELEMENTS = 120;
 
-// Kernel said shutdown: close the browser so Chromium never outlives us,
-// then exit explicitly (open sockets would otherwise keep node alive).
-try {
-  await driver.close();
-} catch {}
-process.exit(0);
+const driver = new PlaywrightDriver(config);
+let client = null;
 
 function originOf(url) {
   try {
@@ -80,3 +43,76 @@ function originOf(url) {
     return null;
   }
 }
+
+/** Provenance: an artifact should still say where it came from once it has
+ *  outlived the call that made it. */
+function labelsFor(url) {
+  const origin = originOf(url);
+  return origin ? { integ: [`web:${origin}`] } : null;
+}
+
+/** The element table the model works from: compact, capped, refs intact. */
+function shape(snap, { with_bbox = false } = {}) {
+  const elements = snap.elements
+    .slice(0, MAX_ELEMENTS)
+    .map((e) => (with_bbox ? e : { ref: e.ref, role: e.role, name: e.name, editable: e.editable }));
+  return {
+    snapshot_id: snap.snapshot_id,
+    url: snap.url,
+    title: snap.title,
+    element_count: snap.elements.length,
+    elements,
+    ...(snap.stale_warning ? { stale_warning: snap.stale_warning } : {}),
+  };
+}
+
+/** Inline if small, otherwise stored with a preview — `Bulk`, for a page. */
+async function deliver(page) {
+  const text = JSON.stringify(page);
+  if (Buffer.byteLength(text, "utf8") <= INLINE_MAX) return page;
+  const meta = await client.put(Buffer.from(text, "utf8"), "web/page-snapshot", labelsFor(page.url));
+  return { handle: meta.id, size: meta.size, preview: text.slice(0, PREVIEW_CHARS) };
+}
+
+const verbs = {
+  "browser::open": async ({ url } = {}) => deliver(shape(await driver.open({ url }))),
+  "browser::navigate": async ({ url }) => deliver(shape(await driver.navigate({ url }))),
+  "browser::snapshot": async (a = {}) => deliver(shape(await driver.snapshot(), a)),
+  "browser::click": async (a) => deliver(shape(await driver.click(a))),
+  "browser::type": async (a) => deliver(shape(await driver.type(a))),
+  "browser::wait_for": (a = {}) => driver.waitFor(a),
+  "browser::screenshot": async ({ path: where } = {}) => {
+    const shot = await driver.screenshot({ path: where });
+    const meta = await client.put(await readFile(shot.path), "image/png", labelsFor(driver.currentUrl()));
+    return { handle: meta.id, size: meta.size, type: meta.type, path: shot.path };
+  },
+  "browser::login_passthrough": ({ url } = {}) => driver.passthroughBegin({ url }),
+  "browser::resume": () => driver.passthroughEnd(),
+  "browser::close": () => driver.close(),
+};
+
+// The interface and this implementation must name the same verbs, and a
+// mismatch is a startup failure rather than a verb that quietly misses.
+for (const verb of Object.keys(verbs)) {
+  if (!TOOLS[verb]) throw new Error(`${verb} is not in drivers/browser/tools.json`);
+}
+for (const verb of Object.keys(TOOLS)) {
+  if (!verbs[verb]) throw new Error(`${verb} is in the interface and not implemented here`);
+}
+
+await servePlugin({
+  name: "portos-browser",
+  verbs: Object.keys(verbs),
+  tools: TOOLS,
+  onCall: async (verb, args, c) => {
+    client = c;
+    return verbs[verb](args ?? {});
+  },
+});
+
+// Kernel said shutdown: close the browser so Chromium never outlives us,
+// then exit explicitly (open sockets would otherwise keep node alive).
+try {
+  await driver.close();
+} catch {}
+process.exit(0);

@@ -2,6 +2,7 @@
 
 pub mod artifact;
 pub mod boundary;
+pub mod bulk;
 pub mod cap;
 pub mod chunk;
 pub mod frame;
@@ -15,6 +16,7 @@ pub mod wire;
 pub const ABI_VERSION: &str = "0.2";
 
 pub use artifact::{ArtifactId, ArtifactMeta};
+pub use bulk::Bulk;
 pub use cap::{Capability, Constraints};
 pub use ids::{IdError, PluginName, SubId, Topic, Verb};
 pub use label::Label;

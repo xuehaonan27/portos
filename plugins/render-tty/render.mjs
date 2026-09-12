@@ -21,9 +21,7 @@ const RESET = "\x1b[0m";
 await servePlugin({
   name: "portos-render-tty",
   verbs: [],
-  onReady: async (client) => {
-    await client.subscribe("model::session::*");
-  },
+  subscribes: ["model::session::*"],
   onCall: async () => {
     throw new Error("render-tty serves no verbs");
   },

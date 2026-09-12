@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 portos-abi = { path = "../abi" }
 portos-router = { path = "../drivers/router" }
+portos-kernel-api = { path = "../drivers/kernel" }
 serde = { workspace = true }
 tar = { workspace = true }
 serde_json = { workspace = true }

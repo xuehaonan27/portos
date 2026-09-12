@@ -1,0 +1,8 @@
+[package]
+name = "portos-link-api"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+portos-abi = { path = "../../abi" }
+serde = { workspace = true }
