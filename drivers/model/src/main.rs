@@ -28,6 +28,7 @@ use portos_sdk::{CallError, CallResult, KernelClient, Plugin};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -180,19 +181,27 @@ fn assemble_tools(
     map.into_values().collect()
 }
 
+/// Sessions outlive any single turn, and a turn runs on its own thread, so a
+/// session is shared rather than owned by the serve loop.
+type Sessions = Arc<Mutex<BTreeMap<String, Arc<Mutex<Session>>>>>;
+/// Cancel flags for turns in flight, keyed by session. Empty means idle.
+type Running = Arc<Mutex<BTreeMap<String, Arc<AtomicBool>>>>;
+
 fn main() -> std::io::Result<()> {
     let cfg = load_config();
     let backend = backend::make_backend(&cfg).map_err(std::io::Error::other)?;
-    let config_tools = load_tools(&cfg).map_err(std::io::Error::other)?;
+    let config_tools = Arc::new(load_tools(&cfg).map_err(std::io::Error::other)?);
     let introspect = cfg["introspect_tools"].as_bool().unwrap_or(true);
-    let exclude: Vec<String> = cfg["tool_families_exclude"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_else(|| vec!["egress".to_string()]);
+    let exclude: Arc<Vec<String>> = Arc::new(
+        cfg["tool_families_exclude"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_else(|| vec!["egress".to_string()]),
+    );
     let read_max = cfg["read_max"].as_u64().unwrap_or(32 * 1024);
     let default_system = cfg["system"].as_str().unwrap_or("").to_string();
     let max_turns = cfg["max_turns"].as_u64().unwrap_or(16) as u32;
@@ -200,14 +209,15 @@ fn main() -> std::io::Result<()> {
     let slot: Arc<Mutex<Option<SyncSender<StreamEvent>>>> = Arc::new(Mutex::new(None));
     let slot_for_events = slot.clone();
 
-    let mut sessions: BTreeMap<String, Session> = BTreeMap::new();
+    let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
+    let running: Running = Arc::new(Mutex::new(BTreeMap::new()));
     let mut next_session = 0u64;
     let mut subscribed = false;
 
     portos_sdk::serve(
         Plugin::new(
             "portos-modeld",
-            &["model::start", "model::send", "model::end"],
+            &["model::start", "model::send", "model::cancel", "model::end"],
         ),
         move |verb, args, client| -> CallResult {
             match verb.short() {
@@ -215,63 +225,88 @@ fn main() -> std::io::Result<()> {
                     let a: model::StartArgs = args.parse()?;
                     next_session += 1;
                     let id = model::SessionId::new(next_session);
-                    sessions.insert(
+                    sessions.lock().unwrap().insert(
                         id.as_str().to_string(),
-                        Session {
+                        Arc::new(Mutex::new(Session {
                             system: a.system.unwrap_or_else(|| default_system.clone()),
                             messages: Vec::new(),
-                        },
+                        })),
                     );
                     Ok(Payload::of(&model::StartReply { session: id })?)
                 }
+
+                // Accept the turn and return. Everything it produces arrives
+                // on the session topic, so the caller is free to cancel it,
+                // serve another front end, or simply not be blocked.
                 "send" => {
                     let a: model::SendArgs = args.parse()?;
                     let sid = a.session;
-                    let mut session = sessions
-                        .remove(sid.as_str())
+                    let session = sessions
+                        .lock()
+                        .unwrap()
+                        .get(sid.as_str())
+                        .cloned()
                         .ok_or_else(|| CallError::from(format!("unknown session: {sid}")))?;
+
+                    let flag = Arc::new(AtomicBool::new(false));
+                    {
+                        // One turn at a time, because the egress stream lands
+                        // on a single topic. Per-turn topics are what lifts
+                        // this, and nothing needs them yet.
+                        let mut r = running.lock().unwrap();
+                        if let Some(busy) = r.keys().next() {
+                            return Err(CallError::from(format!(
+                                "a turn is already running on session {busy}"
+                            )));
+                        }
+                        r.insert(sid.as_str().to_string(), flag.clone());
+                    }
                     if !subscribed {
                         client.subscribe(&STREAM_TOPIC)?;
                         subscribed = true;
                     }
-                    let gw = Gw {
+
+                    let turn = Turn {
+                        backend: backend.clone(),
                         client: client.clone(),
                         slot: slot.clone(),
-                    };
-                    // Fresh per send: grants can change between turns.
-                    let tools = assemble_tools(client, introspect, &exclude, &config_tools);
-                    let topic = sid.topic();
-                    let emit = |ev: model::SessionEvent| {
-                        if let Ok(p) = Payload::of(&ev) {
-                            let _ = client.emit(&topic, p);
-                        }
-                    };
-                    let invoke = |verb: &Verb, a: Payload| -> Result<Payload, String> {
-                        if verb == &*ARTIFACT_READ {
-                            return read_artifact(client, a, read_max).map_err(|e| e.to_string());
-                        }
-                        client.invoke(verb, a).map_err(|e| e.to_string())
-                    };
-                    let result = core::run_send(
-                        &*backend,
-                        &gw,
-                        &mut session,
-                        &tools,
-                        a.text,
+                        running: running.clone(),
+                        config_tools: config_tools.clone(),
+                        exclude: exclude.clone(),
+                        introspect,
+                        read_max,
                         max_turns,
-                        &emit,
-                        &invoke,
-                    );
-                    sessions.insert(sid.as_str().to_string(), session);
-                    let text = result.map_err(|e| CallError::from(e.to_string()))?;
-                    Ok(Payload::of(&model::SendReply { text })?)
+                    };
+                    std::thread::spawn(move || turn.run(sid, session, a.text, flag));
+                    Ok(Payload::of(&model::SendReply::default())?)
                 }
+
+                "cancel" => {
+                    let a: model::CancelArgs = args.parse()?;
+                    let cancelled = match running.lock().unwrap().get(a.session.as_str()) {
+                        Some(flag) => {
+                            flag.store(true, Ordering::Relaxed);
+                            true
+                        }
+                        None => false,
+                    };
+                    Ok(Payload::of(&model::CancelReply { cancelled })?)
+                }
+
                 "end" => {
                     let a: model::EndArgs = args.parse()?;
+                    if let Some(flag) = running.lock().unwrap().get(a.session.as_str()) {
+                        flag.store(true, Ordering::Relaxed);
+                    }
                     Ok(Payload::of(&model::EndReply {
-                        ended: sessions.remove(a.session.as_str()).is_some(),
+                        ended: sessions
+                            .lock()
+                            .unwrap()
+                            .remove(a.session.as_str())
+                            .is_some(),
                     })?)
                 }
+
                 other => Err(CallError::from(format!("unknown verb: {other}"))),
             }
         },
@@ -287,6 +322,76 @@ fn main() -> std::io::Result<()> {
             }
         },
     )
+}
+
+/// Everything one turn needs, gathered so it can move to its own thread.
+struct Turn {
+    backend: Arc<dyn core::Backend + Send + Sync>,
+    client: Arc<KernelClient>,
+    slot: Arc<Mutex<Option<SyncSender<StreamEvent>>>>,
+    running: Running,
+    config_tools: Arc<Vec<ToolDef>>,
+    exclude: Arc<Vec<String>>,
+    introspect: bool,
+    read_max: u64,
+    max_turns: u32,
+}
+
+impl Turn {
+    fn run(
+        self,
+        sid: model::SessionId,
+        session: Arc<Mutex<Session>>,
+        text: String,
+        flag: Arc<AtomicBool>,
+    ) {
+        let topic = sid.topic();
+        let client = &self.client;
+        let emit = |ev: model::SessionEvent| {
+            if let Ok(p) = Payload::of(&ev) {
+                let _ = client.emit(&topic, p);
+            }
+        };
+        let invoke = |verb: &Verb, a: Payload| -> Result<Payload, String> {
+            if verb == &*ARTIFACT_READ {
+                return read_artifact(client, a, self.read_max).map_err(|e| e.to_string());
+            }
+            client.invoke(verb, a).map_err(|e| e.to_string())
+        };
+        let gw = Gw {
+            client: client.clone(),
+            slot: self.slot.clone(),
+        };
+        // Fresh per turn: grants can change between them.
+        let tools = assemble_tools(client, self.introspect, &self.exclude, &self.config_tools);
+
+        let result = {
+            let mut s = session.lock().unwrap();
+            core::run_send(
+                &*self.backend,
+                &gw,
+                &mut s,
+                &tools,
+                text,
+                self.max_turns,
+                &emit,
+                &invoke,
+                &|| flag.load(Ordering::Relaxed),
+            )
+        };
+        self.running.lock().unwrap().remove(sid.as_str());
+
+        // Exactly one terminal event per turn. `run_send` emits Done and
+        // Cancelled itself; a failure has no other way to be heard, and a
+        // front end waiting for a terminal event would wait forever.
+        if let Err(e) = result {
+            if !matches!(e, ModelError::Cancelled) {
+                emit(model::SessionEvent::Failed {
+                    error: e.to_string(),
+                });
+            }
+        }
+    }
 }
 
 /// Dereference an artifact for the model, capped at `read_max` bytes so one

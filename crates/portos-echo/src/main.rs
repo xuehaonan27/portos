@@ -30,6 +30,14 @@ struct Received {
 }
 
 fn main() -> std::io::Result<()> {
+    // A grandchild the kernel never sees, deliberately never reaped: it is
+    // how a real driver's cost shows up (the browser driver's chromium), and
+    // it is what teardown has to reach past this process to collect.
+    if let Some(path) = std::env::var_os("PORTOS_ECHO_GRANDCHILD") {
+        let child = std::process::Command::new("sleep").arg("300").spawn()?;
+        std::fs::write(path, child.id().to_string())?;
+    }
+
     let family = std::env::var("PORTOS_ECHO_FAMILY").unwrap_or_else(|_| "echo".into());
     let name = format!("portos-{family}");
     let verbs: Vec<String> = [

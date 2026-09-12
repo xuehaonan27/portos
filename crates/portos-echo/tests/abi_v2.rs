@@ -386,3 +386,53 @@ fn js_plugin_speaks_abi_v2() {
     host.shutdown_all();
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Teardown must not depend on a plugin's goodwill, and must reach past it.
+///
+/// A driver's real cost is usually its grandchildren — chromium under the
+/// browser driver, a pipeline under a shell driver — and `Child::kill` never
+/// sees those. Each plugin therefore leads its own process group and
+/// teardown signals the group, so a plugin that ignores `shutdown`, or that
+/// leaks a process and exits anyway, still leaves nothing behind.
+#[test]
+fn teardown_collects_a_plugin_s_grandchildren() {
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+
+    let (_kernel, host, root) = setup("grandchild");
+    let pid_file = root.join("grandchild.pid");
+    host.spawn(
+        Path::new(ECHO_BIN),
+        &[],
+        &[
+            ("PORTOS_ECHO_FAMILY", "echo"),
+            ("PORTOS_ECHO_GRANDCHILD", pid_file.to_str().unwrap()),
+        ],
+    )
+    .unwrap();
+
+    let grandchild: i32 = std::fs::read_to_string(&pid_file)
+        .expect("the plugin recorded its grandchild")
+        .trim()
+        .parse()
+        .unwrap();
+    let alive = || kill(Pid::from_raw(grandchild), None).is_ok();
+    assert!(alive(), "grandchild should be running before teardown");
+
+    host.shutdown_all();
+
+    // The group signal is delivered synchronously; give the scheduler a beat
+    // to reap before asking.
+    for _ in 0..50 {
+        if !alive() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        !alive(),
+        "grandchild {grandchild} survived teardown — the process group was not collected"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}

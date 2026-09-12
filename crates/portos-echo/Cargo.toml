@@ -14,4 +14,5 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+nix = { workspace = true }
 portos-kernel = { path = "../portos-kernel" }

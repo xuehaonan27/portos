@@ -97,6 +97,7 @@
     cursor: pointer;
   }
   button[disabled] { opacity: 0.5; cursor: default; }
+  #stop { background: var(--bad); }
   .err { color: var(--bad); font-size: 12px; }
 </style>
 
@@ -109,12 +110,14 @@
 <footer>
   <textarea id="input" placeholder="Message… (Enter to send, Shift+Enter for a newline)" disabled></textarea>
   <button id="send" disabled>Send</button>
+  <button id="stop" hidden>Stop</button>
 </footer>
 
 <script type="module">
   const log = document.getElementById("log");
   const input = document.getElementById("input");
   const sendBtn = document.getElementById("send");
+  const stopBtn = document.getElementById("stop");
   const status = document.getElementById("status");
   const toolsEl = document.getElementById("tools");
 
@@ -168,8 +171,19 @@
       case "tool_result":
         note(`⏺ ${data.verb} ${data.ok ? "done" : "failed"}`, !data.ok);
         break;
+      // The three terminal events: the input comes back on any of them.
       case "done":
         current = null;
+        setBusy(false);
+        break;
+      case "cancelled":
+        current = null;
+        note("⏹ cancelled");
+        setBusy(false);
+        break;
+      case "failed":
+        current = null;
+        note(`✗ ${data.error ?? "turn failed"}`, true);
         setBusy(false);
         break;
     }
@@ -178,6 +192,8 @@
   function setBusy(busy) {
     input.disabled = busy || !session;
     sendBtn.disabled = busy || !session;
+    sendBtn.hidden = busy;
+    stopBtn.hidden = !busy;
     status.textContent = !session ? "no session" : busy ? "working…" : `session ${session}`;
     if (!busy && session) input.focus();
   }
@@ -190,6 +206,7 @@
     scroll();
     setBusy(true);
     try {
+      // Returns as soon as the turn is accepted; a terminal event ends it.
       await invoke("model::send", { session, text });
     } catch (e) {
       note(String(e.message ?? e), true);
@@ -198,6 +215,18 @@
   }
 
   sendBtn.addEventListener("click", send);
+  // A turn runs on the driver's own thread, so asking it to stop is an
+  // ordinary verb call rather than anything special about this page.
+  stopBtn.addEventListener("click", async () => {
+    stopBtn.disabled = true;
+    try {
+      await invoke("model::cancel", { session });
+    } catch (e) {
+      note(String(e.message ?? e), true);
+    } finally {
+      stopBtn.disabled = false;
+    }
+  });
   input.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();

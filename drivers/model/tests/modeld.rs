@@ -128,6 +128,30 @@ fn mock_provider(bodies: Vec<String>) -> (u16, Arc<Mutex<Vec<String>>>) {
     (port, captured)
 }
 
+/// `send` returns as soon as a turn is accepted, so a test waits for the
+/// turn the way a front end does: for its terminal event. Returns the kinds
+/// seen and the concatenated deltas.
+fn drain_turn(
+    rx: &std::sync::mpsc::Receiver<portos_proto::wire::LocalEvent>,
+) -> (Vec<String>, String, Value) {
+    let mut kinds = Vec::new();
+    let mut deltas = String::new();
+    loop {
+        let ev = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("session event");
+        let d = js(&ev.data);
+        let kind = d["kind"].as_str().unwrap_or("?").to_string();
+        if kind == "delta" {
+            deltas.push_str(d["text"].as_str().unwrap_or(""));
+        }
+        kinds.push(kind.clone());
+        if matches!(kind.as_str(), "done" | "cancelled" | "failed") {
+            return (kinds, deltas, d);
+        }
+    }
+}
+
 fn write_json(path: &Path, v: &Value) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, serde_json::to_string_pretty(v).unwrap()).unwrap();
@@ -282,28 +306,13 @@ fn agentic_loop_end_to_end_with_tool_call() {
         json!({"session": sid, "text": "please make a ref"}),
     )
     .unwrap();
-    assert_eq!(out["text"].as_str(), Some("Ref created."));
+    // The reply carries nothing: a turn is accepted here, not finished. The
+    // whole story arrives on the session topic.
+    assert_eq!(out, json!({}), "send acknowledges, it does not answer");
 
-    // The event stream told the story live: deltas, the tool call, its
-    // result, and the final text.
-    let mut deltas = String::new();
-    let mut kinds = Vec::new();
-    loop {
-        let ev = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("session event");
-        let d = js(&ev.data);
-        let d = &d;
-        let kind = d["kind"].as_str().unwrap_or("?").to_string();
-        if kind == "delta" {
-            deltas.push_str(d["text"].as_str().unwrap_or(""));
-        }
-        kinds.push(kind.clone());
-        if kind == "done" {
-            assert_eq!(d["text"].as_str(), Some("Ref created."));
-            break;
-        }
-    }
+    let (kinds, deltas, terminal) = drain_turn(&rx);
+    assert_eq!(terminal["kind"].as_str(), Some("done"));
+    assert_eq!(terminal["text"].as_str(), Some("Ref created."));
     assert_eq!(deltas, "Let me make a ref.Ref created.");
     assert!(kinds.contains(&"tool_call".to_string()));
     assert!(kinds.contains(&"tool_result".to_string()));
@@ -451,14 +460,16 @@ fn introspected_tools_and_artifact_read() {
 
     let started = call(&host, &modeld, "model::start", json!({})).unwrap();
     let sid = started["session"].as_str().unwrap().to_string();
-    let out = call(
+    let (_sub, rx) = host.subscribe_local(&tp(&format!("model::session::{sid}")));
+    call(
         &host,
         &modeld,
         "model::send",
         json!({"session": sid, "text": "read the artifact"}),
     )
     .unwrap();
-    assert_eq!(out["text"].as_str(), Some("Read it."));
+    let (_kinds, _deltas, terminal) = drain_turn(&rx);
+    assert_eq!(terminal["text"].as_str(), Some("Read it."));
 
     let reqs = captured.lock().unwrap();
     assert_eq!(reqs.len(), 2);
@@ -515,6 +526,132 @@ fn unknown_session_and_lifecycle() {
     assert_eq!(ended["ended"].as_bool(), Some(true));
     let again = call(&host, &modeld, "model::end", json!({"session": "s1"})).unwrap();
     assert_eq!(again["ended"].as_bool(), Some(false));
+
+    host.shutdown_all();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A provider that answers, then goes quiet. Nearly all of a real turn's
+/// time is spent exactly here — waiting on the network — so this is where a
+/// cancel has to land if it is to mean anything.
+fn stalling_provider() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        while let Ok((mut conn, _)) = listener.accept() {
+            let _ = read_request(&mut conn);
+            let head =
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+            let _ = conn.write_all(head.as_bytes());
+            let _ = conn.write_all(
+                sse(&[(
+                    "content_block_start",
+                    json!({"index": 0, "content_block": {"type": "text", "text": ""}}),
+                )])
+                .as_bytes(),
+            );
+            let _ = conn.flush();
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        }
+    });
+    port
+}
+
+/// A turn is accepted, not awaited — and having been accepted it can be
+/// stopped. Without both halves a runaway turn can only be escaped by
+/// killing the process, and no second front end can do anything at all
+/// while one is running.
+#[test]
+fn a_turn_is_accepted_immediately_and_can_be_cancelled_mid_flight() {
+    let Some(modeld_bin) = sibling("portos-modeld") else {
+        return;
+    };
+    let Some(broker_bin) = sibling("portos-broker") else {
+        return;
+    };
+    let (_kernel, host, root) = setup("cancel");
+    let port = stalling_provider();
+
+    write_json(
+        &root.join("broker/config.json"),
+        &json!({"allow": [{"host": "127.0.0.1", "insecure_http": true,
+                           "inject": {"x-api-key": "k1"}}]}),
+    );
+    write_json(&root.join("broker/secrets.json"), &json!({"k1": "fake"}));
+    write_json(
+        &root.join("modeld/config.json"),
+        &json!({
+            "backend": "anthropic",
+            "base_url": format!("http://127.0.0.1:{port}"),
+            "model": "test-model",
+            "introspect_tools": false,
+        }),
+    );
+
+    host.spawn(
+        &broker_bin,
+        &[],
+        &[("PORTOS_BROKER_DIR", root.join("broker").to_str().unwrap())],
+    )
+    .unwrap();
+    let modeld = host
+        .spawn(
+            &modeld_bin,
+            &[],
+            &[("PORTOS_MODELD_DIR", root.join("modeld").to_str().unwrap())],
+        )
+        .unwrap();
+    _kernel
+        .caps
+        .mint(
+            &modeld.subject(),
+            "driver:egress",
+            ["http", "http_stream"]
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<BTreeSet<_>>(),
+            Constraints::default(),
+            None,
+        )
+        .unwrap();
+
+    let started = call(&host, &modeld, "model::start", json!({})).unwrap();
+    let sid = started["session"].as_str().unwrap().to_string();
+    let (_sub, rx) = host.subscribe_local(&tp(&format!("model::session::{sid}")));
+
+    // Accepted, not awaited: the provider will not say another word for 30
+    // seconds, and this still returns.
+    let began = std::time::Instant::now();
+    call(
+        &host,
+        &modeld,
+        "model::send",
+        json!({"session": sid, "text": "hello"}),
+    )
+    .unwrap();
+    assert!(
+        began.elapsed() < std::time::Duration::from_secs(5),
+        "send waited for the turn instead of accepting it: {:?}",
+        began.elapsed()
+    );
+
+    let cancelled = call(&host, &modeld, "model::cancel", json!({"session": sid})).unwrap();
+    assert_eq!(cancelled["cancelled"].as_bool(), Some(true));
+
+    let (_kinds, _deltas, terminal) = drain_turn(&rx);
+    assert_eq!(
+        terminal["kind"].as_str(),
+        Some("cancelled"),
+        "the stalled turn ended as cancelled, not as done or failed"
+    );
+
+    // The turn is off the books, so the next one is free to start.
+    let again = call(&host, &modeld, "model::cancel", json!({"session": sid})).unwrap();
+    assert_eq!(
+        again["cancelled"].as_bool(),
+        Some(false),
+        "nothing left running once a turn has ended"
+    );
 
     host.shutdown_all();
     let _ = std::fs::remove_dir_all(&root);

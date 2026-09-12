@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+nix = { workspace = true }
 portos-egress-api = { path = "../../drivers/egress-api" }
 portos-kernel = { path = "../portos-kernel" }
 portos-model-api = { path = "../../drivers/model-api" }

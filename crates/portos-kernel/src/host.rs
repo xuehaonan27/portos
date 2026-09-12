@@ -39,6 +39,8 @@
 //! (cli → model driver → {broker, browser}) are acyclic by construction.
 
 use crate::{Kernel, KernelError};
+use nix::sys::signal::Signal;
+use nix::unistd::Pid;
 use portos_proto::ids::{PluginName, SubId, Topic, Verb};
 use portos_proto::wire::{
     Call, ChannelRole, ClientOp, EmitReply, Event, GrantsReply, Hello, HelloFrame, LocalEvent,
@@ -50,6 +52,7 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
@@ -61,6 +64,9 @@ use std::sync::{Arc, Mutex};
 pub const EVENT_QUEUE: usize = 256;
 
 const SPAWN_DEADLINE_MS: u64 = 10_000;
+
+/// How long each teardown step waits before escalating.
+const GRACE_MS: u64 = 1_000;
 
 struct PluginHandle {
     child: Mutex<std::process::Child>,
@@ -146,7 +152,12 @@ impl Host {
         let mut cmd = std::process::Command::new(bin);
         cmd.args(args)
             .env("PORTOS_PLUGIN_SOCK", &sock_path)
-            .env("PORTOS_PLUGIN_TOKEN", &token);
+            .env("PORTOS_PLUGIN_TOKEN", &token)
+            // Each plugin leads its own process group, so teardown can reach
+            // whatever it started. A driver's real cost is usually its
+            // grandchildren — the browser driver's chromium, a shell driver's
+            // pipeline — and `Child::kill` never sees those.
+            .process_group(0);
         for (k, v) in envs {
             cmd.env(k, v);
         }
@@ -357,26 +368,34 @@ impl Host {
         (m.context_bytes, m.data_bytes)
     }
 
-    /// Graceful-ish shutdown: send the shutdown op, give the plugin a moment,
-    /// then make sure it is gone.
+    /// Shut a plugin down, escalating until it is actually gone.
+    ///
+    /// Asking politely is the first step, not the mechanism: a plugin that
+    /// ignores `shutdown`, or that leaves a listening socket holding its
+    /// runtime alive, still goes — and so does everything it started, because
+    /// the signals go to its process group rather than to it alone.
     pub fn shutdown(&self, plugin: &PluginName) {
         let handle = { self.inner.plugins.lock().unwrap().remove(plugin) };
-        if let Some(h) = handle {
-            cleanup_plugin(&self.inner, plugin);
-            if let Ok(mut s) = h.serve.lock() {
-                let _ = frame::write_frame(&mut *s, &ServeMsg::Shutdown);
-            }
-            let mut child = h.child.lock().unwrap();
-            for _ in 0..20 {
-                if matches!(child.try_wait(), Ok(Some(_))) {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = std::fs::remove_file(&h.sock_path);
+        let Some(h) = handle else { return };
+        cleanup_plugin(&self.inner, plugin);
+        if let Ok(mut s) = h.serve.lock() {
+            let _ = frame::write_frame(&mut *s, &ServeMsg::Shutdown);
         }
+        let mut child = h.child.lock().unwrap();
+        let pgid = child.id();
+        if !wait_for_exit(&mut child, GRACE_MS) {
+            signal_group(pgid, Signal::SIGTERM);
+            if !wait_for_exit(&mut child, GRACE_MS) {
+                signal_group(pgid, Signal::SIGKILL);
+                let _ = wait_for_exit(&mut child, GRACE_MS);
+            }
+        }
+        // The leader is reaped; anything left in its group is not a child of
+        // ours and cannot be waited on, so the final KILL is unconditional.
+        let _ = child.kill();
+        let _ = child.wait();
+        signal_group(pgid, Signal::SIGKILL);
+        let _ = std::fs::remove_file(&h.sock_path);
     }
 
     pub fn shutdown_all(&self) {
@@ -752,6 +771,27 @@ fn accept_with_deadline(
             }
             Err(e) => return Err(e.into()),
         }
+    }
+}
+
+/// Signal a plugin's whole process group. The group id equals the plugin's
+/// own pid because it was spawned as a group leader; an error here means the
+/// group is already gone, which is the outcome we wanted.
+fn signal_group(pgid: u32, sig: Signal) {
+    let _ = nix::sys::signal::killpg(Pid::from_raw(pgid as i32), sig);
+}
+
+/// Poll for exit up to `ms`. Returns whether the child is gone.
+fn wait_for_exit(child: &mut std::process::Child, ms: u64) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+    loop {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 

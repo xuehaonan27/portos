@@ -27,17 +27,20 @@
 //! (checked at startup) with the vendor's auth header in the broker's inject
 //! rule — the key never leaves the broker.
 
+use nix::sys::signal::{SigSet, Signal};
 use portos_egress_api as egress;
 use portos_kernel::Kernel;
 use portos_kernel::host::Host;
 use portos_model_api as model;
+use portos_proto::ids::PluginName;
 use portos_proto::wire::Payload;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// `<root>/chat.json`: which extra drivers to start and what they may do.
 #[derive(Debug, Default, Deserialize)]
@@ -78,9 +81,15 @@ enum RenderMode {
 }
 
 pub fn run(root: &str, repl: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // Block the interrupt signals before anything else starts a thread, so
+    // every thread inherits the mask and only the handler thread below ever
+    // sees them. Without this, Ctrl-C tears the process down without running
+    // teardown, and every plugin — and everything it started — is orphaned.
+    let signals = block_interrupts()?;
+
     let root = PathBuf::from(root);
     let kernel = Arc::new(Kernel::open(&root)?);
-    let host = Host::new(kernel.clone(), &root.join("sock"))?;
+    let host = Arc::new(Host::new(kernel.clone(), &root.join("sock"))?);
     host.audit_topic(&egress::LOG);
 
     write_templates(&root)?;
@@ -158,6 +167,18 @@ pub fn run(root: &str, repl: bool) -> Result<(), Box<dyn std::error::Error>> {
         println!("[chat] grant: {subject} → {}", g.resource);
     }
 
+    // Whether a turn is in flight, and which session it belongs to, so an
+    // interrupt knows whether to cancel the turn or bring the runtime down.
+    let busy = Arc::new(AtomicBool::new(false));
+    let current: Arc<Mutex<Option<model::SessionId>>> = Arc::new(Mutex::new(None));
+    spawn_signal_handler(
+        signals,
+        host.clone(),
+        modeld.clone(),
+        busy.clone(),
+        current.clone(),
+    );
+
     if !repl {
         // No REPL: the runtime is up and a front end owns its own sessions
         // (a bridge plugin's presenter calls `model::start` itself). Parking
@@ -179,6 +200,7 @@ pub fn run(root: &str, repl: bool) -> Result<(), Box<dyn std::error::Error>> {
         Payload::of(&model::StartArgs::default())?,
     )?;
     let sid = started.parse::<model::StartReply>()?.session;
+    *current.lock().unwrap() = Some(sid.clone());
     let (_sub, rx) = host.subscribe_local(&sid.topic());
     let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || {
@@ -202,9 +224,23 @@ pub fn run(root: &str, repl: bool) -> Result<(), Box<dyn std::error::Error>> {
                     println!("[tool{}] {verb}", if ok { "✓" } else { "✗" });
                     let _ = std::io::stdout().flush();
                 }
+                // The three terminal events. Exactly one arrives per turn,
+                // and the prompt comes back on any of them.
                 model::SessionEvent::Done { .. } => {
                     if render_builtin {
                         println!();
+                    }
+                    let _ = done_tx.send(());
+                }
+                model::SessionEvent::Cancelled => {
+                    if render_builtin {
+                        println!("\n[chat] cancelled");
+                    }
+                    let _ = done_tx.send(());
+                }
+                model::SessionEvent::Failed { error } => {
+                    if render_builtin {
+                        println!("\n[chat] failed: {error}");
                     }
                     let _ = done_tx.send(());
                 }
@@ -228,10 +264,13 @@ pub fn run(root: &str, repl: bool) -> Result<(), Box<dyn std::error::Error>> {
             session: sid.clone(),
             text: text.to_string(),
         })?;
+        // `send` returns as soon as the turn is accepted; the turn itself is
+        // over when a terminal event arrives, however long that takes.
         match host.call(&modeld, &model::SEND, args) {
             Ok(_) => {
-                // Let the render thread finish printing this turn's events.
-                let _ = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+                busy.store(true, Ordering::SeqCst);
+                let _ = done_rx.recv();
+                busy.store(false, Ordering::SeqCst);
             }
             Err(e) => println!("[chat] error: {e}"),
         }
@@ -243,6 +282,52 @@ pub fn run(root: &str, repl: bool) -> Result<(), Box<dyn std::error::Error>> {
     }
     host.shutdown_all();
     Ok(())
+}
+
+/// Take the interrupt signals away from the default disposition, which is to
+/// kill the process without running any teardown. Called before any thread
+/// exists so the mask is inherited everywhere.
+fn block_interrupts() -> Result<SigSet, Box<dyn std::error::Error>> {
+    let mut set = SigSet::empty();
+    set.add(Signal::SIGINT);
+    set.add(Signal::SIGTERM);
+    set.thread_block()?;
+    Ok(set)
+}
+
+/// One thread that does nothing but wait for an interrupt. Waiting rather
+/// than handling means it may do real work — call a verb, tear plugins down —
+/// none of which is safe inside an actual signal handler.
+fn spawn_signal_handler(
+    signals: SigSet,
+    host: Arc<Host>,
+    modeld: PluginName,
+    busy: Arc<AtomicBool>,
+    current: Arc<Mutex<Option<model::SessionId>>>,
+) {
+    std::thread::spawn(move || {
+        loop {
+            if signals.wait().is_err() {
+                return;
+            }
+            // A turn in flight is cancelled, not killed: an interrupt almost
+            // always means "stop this", not "lose the session". Interrupting
+            // again, or when idle, brings the runtime down.
+            let session = current.lock().unwrap().clone();
+            if busy.swap(false, Ordering::SeqCst) {
+                if let Some(session) = session {
+                    eprintln!("\n[chat] cancelling — interrupt again to quit");
+                    if let Ok(p) = Payload::of(&model::CancelArgs { session }) {
+                        let _ = host.call(&modeld, &model::CANCEL, p);
+                    }
+                    continue;
+                }
+            }
+            eprintln!("\n[chat] shutting down");
+            host.shutdown_all();
+            std::process::exit(130);
+        }
+    });
 }
 
 /// The provider is vendor-neutral: modeld's backend `base_url` decides where

@@ -112,6 +112,19 @@ theoretical elegance is not. Current state and build order live in
   driver builds its tool list from `grants` introspection. Capabilities are a
   routing and accounting mechanism here, not a security ceremony — `chat.json`
   declares grants and that is the whole approval story.
+- **Teardown is enforced, not requested.** Each plugin is spawned as its own
+  process-group leader, and shutdown escalates — `shutdown` frame, then
+  SIGTERM to the group, then SIGKILL — so a plugin that ignores the polite
+  request goes anyway, and so does everything it started. A driver's real
+  cost is usually its grandchildren (chromium under the browser driver), and
+  `Child::kill` never sees those. The CLI blocks SIGINT/SIGTERM and waits for
+  them on a dedicated thread rather than dying in a default handler, because
+  a signal that skips teardown orphans the whole tree.
+- **A long operation is accepted, not awaited.** `model::send` returns once
+  the turn is admitted; the turn runs on its own thread and reports through
+  the event plane, and `model::cancel` stops it. The consequence to respect:
+  every such verb owes its subscribers exactly one terminal event — done,
+  cancelled, or failed — or a front end waits forever.
 - **Rendering is event subscription.** A renderer is an ordinary plugin with
   zero verbs and zero capabilities that subscribes to `model::session::*`.
   Several may compose. `drivers/render-tty` is the reference.
@@ -129,7 +142,7 @@ MCP later is the opposite direction and is fine).
 
 ```sh
 cargo build --workspace
-cargo test --workspace          # 51 tests; all must pass, zero warnings
+cargo test --workspace          # 54 tests; all must pass, zero warnings
 cargo fmt --all
 ```
 

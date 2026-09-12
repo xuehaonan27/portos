@@ -43,7 +43,7 @@ PortOS 只有两种交互形状，这里就只暴露两个端点，加上呈现�
   ],
   "grants": [
     { "subject": "plugin:portos-bridge-http",
-      "resource": "driver:model", "verbs": ["start", "send", "end"] }
+      "resource": "driver:model", "verbs": ["start", "send", "cancel", "end"] }
   ]
 }
 ```
@@ -76,6 +76,6 @@ open http://127.0.0.1:7777
 
 ## 已知限制
 
-- **一次只能有一个 turn 在飞。** `model::send` 是同步阻塞的内核调用，JS 客户端又把同一条 client 通道上的请求串行化，所以第二个标签页发消息会排队。根因在 ABI 不在本插件（见 `.dev/plans/extension-cases-v1.md` §1.3），修在 W0-3。
+- **一次只能有一个 turn 在飞。** `model::send` 现在接受即返回（2026-09-11 的 W0-3），所以 bridge 的 client 通道不再被整个 turn 占住——`grants`、`cancel`、另一个标签页的读操作都能穿过去。剩下的限制在 modeld：egress 流落在单一 topic 上，所以第二个 `send` 会被明确拒绝（`a turn is already running on session …`）而不是排队。解开它需要 per-turn 的 egress topic，等真有并发需求再做。
 - **进程遗留：本插件已自理，别的没有。** `servePlugin` 返回后，一个还在监听的 socket 会把 node 的 event loop 永远吊住，于是父进程被信号杀掉时留下一个占着端口的孤儿。本插件现在自己关门退出。但由驱动拉起的**孙进程**（例如 browser driver 的 chromium）仍然会被遗弃——那个要靠进程组回收（W1），不是每个插件各修一遍。
 - **截图还进不了 console。** `GET /artifact/<id>` 是通的，但 `tool_result` 事件目前只带 `{verb, ok}`，不带产物句柄，所以呈现端拿不到 id。要通需要让 model 族的事件携带产物句柄——一个 `model-api` 的改动，待定。

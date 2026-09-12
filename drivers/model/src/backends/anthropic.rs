@@ -142,11 +142,31 @@ impl Backend for Anthropic {
 
         let mut sse = SseParser::default();
         let mut acc = MsgAcc::default();
+        let started = std::time::Instant::now();
         loop {
-            let ev = stream
+            // Short waits rather than one long one: a cancel arriving while
+            // the provider is quiet must still be noticed promptly.
+            let ev = match stream
                 .rx
-                .recv_timeout(std::time::Duration::from_secs(360))
-                .map_err(|_| ModelError::Gateway("egress stream stalled".into()))?;
+                .recv_timeout(std::time::Duration::from_millis(200))
+            {
+                Ok(ev) => ev,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if sink.cancelled() {
+                        return Err(ModelError::Cancelled);
+                    }
+                    if started.elapsed() > std::time::Duration::from_secs(360) {
+                        return Err(ModelError::Gateway("egress stream stalled".into()));
+                    }
+                    continue;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(ModelError::Gateway("egress stream closed".into()));
+                }
+            };
+            if sink.cancelled() {
+                return Err(ModelError::Cancelled);
+            }
             match ev {
                 StreamEvent::Chunk { chunk } => {
                     for (event, data) in sse.feed(&chunk) {
@@ -361,6 +381,7 @@ mod tests {
         // Split every 7 bytes — guaranteed to cut mid-line and mid-JSON.
         let mut sse = SseParser::default();
         let mut acc = MsgAcc::default();
+        let started = std::time::Instant::now();
         let mut sink = NullSink(String::new());
         let bytes = wire.as_bytes();
         let mut i = 0;

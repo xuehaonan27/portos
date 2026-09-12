@@ -46,6 +46,11 @@ impl std::fmt::Display for SessionId {
 }
 
 /// Every session topic, for a renderer that wants all of them.
+/// Stop the turn running on a session. The session itself survives; it is
+/// rewound to exactly where it was before the abandoned message.
+pub static CANCEL: LazyLock<Verb> =
+    LazyLock::new(|| Verb::parse("model::cancel").expect("constant verb"));
+
 pub static ALL_SESSIONS: LazyLock<Topic> =
     LazyLock::new(|| Topic::parse("model::session::*").expect("constant topic"));
 
@@ -67,9 +72,23 @@ pub struct SendArgs {
     pub text: String,
 }
 
+/// `send` returns as soon as the turn is accepted, not when it finishes: a
+/// turn can run for minutes, and a caller blocked for that long can neither
+/// cancel it nor do anything else. Everything the turn produces — text,
+/// tool activity, its ending — arrives on the session topic as
+/// [`SessionEvent`]s.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SendReply {}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SendReply {
-    pub text: String,
+pub struct CancelArgs {
+    pub session: SessionId,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CancelReply {
+    /// Whether a turn was actually running to cancel.
+    pub cancelled: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -99,6 +118,13 @@ pub enum SessionEvent {
     ToolResult { verb: Verb, ok: bool },
     /// The turn is over; `text` is everything the assistant said.
     Done { text: String },
+    /// The turn was cancelled. The session is left exactly as it was before
+    /// the cancelled message, so the next turn starts from clean ground.
+    Cancelled,
+    /// The turn ended badly. Since `send` returns before a turn runs, this is
+    /// the only way a caller learns it failed — without it a front end waits
+    /// forever for a `done` that is never coming.
+    Failed { error: String },
     /// A kind this consumer does not know. Renderers ignore it rather than
     /// failing, so a driver can add events without breaking them.
     #[serde(other)]
@@ -121,6 +147,30 @@ mod tests {
         let future: SessionEvent =
             serde_json::from_str(r#"{"kind":"thinking","text":"…"}"#).unwrap();
         assert_eq!(future, SessionEvent::Unknown);
+    }
+
+    #[test]
+    fn a_turn_always_ends_with_exactly_one_terminal_event() {
+        // A front end re-enables its input on these three and nothing else,
+        // so their wire shapes are part of the contract.
+        for (ev, text) in [
+            (
+                SessionEvent::Done {
+                    text: "hi".to_string(),
+                },
+                r#"{"kind":"done","text":"hi"}"#,
+            ),
+            (SessionEvent::Cancelled, r#"{"kind":"cancelled"}"#),
+            (
+                SessionEvent::Failed {
+                    error: "boom".to_string(),
+                },
+                r#"{"kind":"failed","error":"boom"}"#,
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&ev).unwrap(), text);
+            assert_eq!(serde_json::from_str::<SessionEvent>(text).unwrap(), ev);
+        }
     }
 
     #[test]

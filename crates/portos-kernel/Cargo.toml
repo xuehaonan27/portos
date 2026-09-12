@@ -13,3 +13,4 @@ rand = { workspace = true }
 regex = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }
+nix = { workspace = true }

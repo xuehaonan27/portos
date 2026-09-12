@@ -27,6 +27,8 @@ pub enum ModelError {
     Payload(#[from] serde_json::Error),
     #[error("max turns exceeded ({0})")]
     MaxTurns(u32),
+    #[error("cancelled")]
+    Cancelled,
 }
 
 impl From<portos_proto::ids::IdError> for ModelError {
@@ -103,9 +105,17 @@ pub struct TurnRequest<'a> {
     pub tools: &'a [ToolDef],
 }
 
-/// Streaming output of a turn as it is generated.
+/// A turn's liveness channel, in both directions: output as it is generated,
+/// and whether anyone still wants it. A backend must poll [`cancelled`] while
+/// it waits on the network — that wait is where nearly all of a turn's time
+/// goes, so a cancel that is only checked between turns is not a cancel.
+///
+/// [`cancelled`]: TurnSink::cancelled
 pub trait TurnSink {
     fn text_delta(&mut self, s: &str);
+    fn cancelled(&self) -> bool {
+        false
+    }
 }
 
 /// A live egress response stream: the status the gateway reported plus the
@@ -142,6 +152,7 @@ pub struct Session {
 
 struct EmitSink<'a> {
     emit: &'a dyn Fn(SessionEvent),
+    cancelled: &'a dyn Fn() -> bool,
 }
 
 impl TurnSink for EmitSink<'_> {
@@ -149,6 +160,9 @@ impl TurnSink for EmitSink<'_> {
         (self.emit)(SessionEvent::Delta {
             text: s.to_string(),
         });
+    }
+    fn cancelled(&self) -> bool {
+        (self.cancelled)()
     }
 }
 
@@ -166,16 +180,29 @@ pub fn run_send(
     max_turns: u32,
     emit: &dyn Fn(SessionEvent),
     invoke: &dyn Fn(&Verb, Payload) -> Result<Payload, String>,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<String, ModelError> {
+    // Where to rewind to if this turn is abandoned. A cancelled turn leaves
+    // no trace: a half-streamed assistant message, or a tool call with no
+    // result, would make the *next* turn malformed.
+    let mark = session.messages.len();
     session.messages.push(Msg::User(user_text));
+
     for _ in 0..max_turns {
+        if cancelled() {
+            return abandon(session, mark, emit);
+        }
         let req = TurnRequest {
             system: &session.system,
             messages: &session.messages,
             tools,
         };
-        let mut sink = EmitSink { emit };
-        let turn = backend.complete(gw, &req, &mut sink)?;
+        let mut sink = EmitSink { emit, cancelled };
+        let turn = match backend.complete(gw, &req, &mut sink) {
+            Ok(t) => t,
+            Err(ModelError::Cancelled) => return abandon(session, mark, emit),
+            Err(e) => return Err(e),
+        };
         let calls: Vec<ToolCall> = turn
             .parts
             .iter()
@@ -204,6 +231,12 @@ pub fn run_send(
 
         let mut results = Vec::with_capacity(calls.len());
         for call in calls {
+            // Between a model asking for a tool and the tool running is the
+            // other place a cancel has to land: the effect has not happened
+            // yet, so not doing it is still free.
+            if cancelled() {
+                return abandon(session, mark, emit);
+            }
             emit(SessionEvent::ToolCall {
                 verb: call.verb.clone(),
             });
@@ -224,4 +257,16 @@ pub fn run_send(
         session.messages.push(Msg::ToolResults(results));
     }
     Err(ModelError::MaxTurns(max_turns))
+}
+
+/// Rewind the transcript and tell the session's subscribers. Whatever the
+/// turn had already produced is dropped on purpose.
+fn abandon(
+    session: &mut Session,
+    mark: usize,
+    emit: &dyn Fn(SessionEvent),
+) -> Result<String, ModelError> {
+    session.messages.truncate(mark);
+    emit(SessionEvent::Cancelled);
+    Err(ModelError::Cancelled)
 }
