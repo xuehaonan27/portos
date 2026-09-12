@@ -231,6 +231,19 @@ impl CapStore {
             .collect())
     }
 
+    /// Revoke everything `subject` holds. Used when a plugin stops: a
+    /// capability is held by a *running* plugin, not by a name, so authority
+    /// does not survive the process that was granted it. Capabilities other
+    /// subjects hold *about* that plugin's family are untouched — those go
+    /// inert with the route and come back if it does.
+    pub fn revoke_subject(&self, subject: &str, now: u64) -> Result<u64, KernelError> {
+        let mut n = 0;
+        for cap in self.list_live(subject, now)? {
+            n += self.revoke(&cap.cap_id)?;
+        }
+        Ok(n)
+    }
+
     /// Revoke a capability and everything attenuated from it.
     pub fn revoke(&self, cap_id: &str) -> Result<u64, KernelError> {
         let mut frontier = vec![cap_id.to_string()];

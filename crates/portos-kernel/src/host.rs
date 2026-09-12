@@ -47,9 +47,9 @@ use portos_proto::wire::{
     Payload, PutReply, ReadReply, Reply, ServeMsg, SubscribeReply, ToolMeta, UnsubscribeReply,
 };
 use portos_proto::{ABI_VERSION, chunk, frame};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
@@ -57,6 +57,37 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
+
+/// How to start a plugin, and what it may do once it is up.
+///
+/// The same shape whether it comes from `chat.json` at boot or from a
+/// `kernel::spawn` call mid-session: starting a plugin is one operation with
+/// one description, not two code paths that drift.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct LaunchSpec {
+    pub bin: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Minted once the plugin is up and has declared its name.
+    #[serde(default)]
+    pub grants: Vec<GrantSpec>,
+}
+
+/// A capability to mint. `subject` defaults to the plugin being started,
+/// which is the common case: a driver being granted what it needs.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct GrantSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    pub resource: String,
+    #[serde(default)]
+    pub verbs: BTreeSet<String>,
+}
+
+/// The family the kernel answers itself. Reserved: a plugin may not claim it.
+pub const KERNEL_FAMILY: &str = "kernel";
 
 /// Bounded event queue per subscriber. A subscriber that falls this far
 /// behind is cut off, because a slow consumer must never stall the kernel:
@@ -139,161 +170,230 @@ impl Host {
         args: &[&str],
         envs: &[(&str, &str)],
     ) -> Result<PluginName, KernelError> {
-        let idx = self.inner.next_spawn.fetch_add(1, Ordering::SeqCst);
-        let sock_path = self
-            .inner
-            .sock_dir
-            .join(format!("plugin-{}-{idx}.sock", std::process::id()));
-        let _ = std::fs::remove_file(&sock_path);
-        let listener = UnixListener::bind(&sock_path)?;
-        listener.set_nonblocking(true)?;
-        let token = rand_token();
+        self.spawn_spec(&LaunchSpec {
+            bin: bin.to_string_lossy().into_owned(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            env: envs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            grants: Vec::new(),
+        })
+    }
 
-        let mut cmd = std::process::Command::new(bin);
-        cmd.args(args)
-            .env("PORTOS_PLUGIN_SOCK", &sock_path)
-            .env("PORTOS_PLUGIN_TOKEN", &token)
-            // Each plugin leads its own process group, so teardown can reach
-            // whatever it started. A driver's real cost is usually its
-            // grandchildren — the browser driver's chromium, a shell driver's
-            // pipeline — and `Child::kill` never sees those.
-            .process_group(0);
-        for (k, v) in envs {
-            cmd.env(k, v);
-        }
-        let mut child = cmd.spawn()?;
+    /// Start a plugin and mint what its spec says it may do.
+    pub fn spawn_spec(&self, spec: &LaunchSpec) -> Result<PluginName, KernelError> {
+        spawn_spec_on(&self.kernel, &self.inner, spec)
+    }
 
-        // The serve connection comes first and declares which extra channels
-        // follow ("client" always; "events" optionally). A frame that is not
-        // a well-formed hello, or a bad token, is fatal for the spawn.
-        let accept_hello =
-            |child: &mut std::process::Child| -> Result<(UnixStream, Hello), KernelError> {
-                let mut stream = accept_with_deadline(&listener, child, SPAWN_DEADLINE_MS)?;
-                let frame: HelloFrame = frame::read_frame(&mut stream)
-                    .map_err(|e| KernelError::Corrupt(format!("hello: {e}")))?;
-                if frame.hello.token != token {
-                    let _ = frame::write_frame(&mut stream, &Reply::<()>::Err("bad token".into()));
-                    return Err(KernelError::Denied("plugin hello: bad token".into()));
-                }
-                frame::write_frame(&mut stream, &Reply::Ok(Payload::null()))
-                    .map_err(|e| KernelError::Corrupt(format!("hello ack: {e}")))?;
-                Ok((stream, frame.hello))
-            };
+    /// Which plugins are up, and what each answers.
+    pub fn plugins(&self) -> Vec<(PluginName, Vec<Verb>)> {
+        list_plugins(&self.inner)
+    }
+}
 
-        let (serve_stream, hello) = match accept_hello(&mut child) {
-            Ok((stream, h)) if h.role == ChannelRole::Serve => (stream, h),
-            Ok(_) => {
-                let _ = child.kill();
-                return Err(KernelError::Corrupt(
-                    "plugin hello: first connection must be role serve".into(),
-                ));
+fn list_plugins(inner: &Arc<HostInner>) -> Vec<(PluginName, Vec<Verb>)> {
+    let routes = inner.routes.lock().unwrap();
+    inner
+        .plugins
+        .lock()
+        .unwrap()
+        .keys()
+        .map(|name| {
+            let verbs = routes
+                .iter()
+                .filter(|(_, e)| &e.plugin == name)
+                .map(|(v, _)| v.clone())
+                .collect();
+            (name.clone(), verbs)
+        })
+        .collect()
+}
+
+fn spawn_spec_on(
+    kernel: &Arc<Kernel>,
+    inner: &Arc<HostInner>,
+    spec: &LaunchSpec,
+) -> Result<PluginName, KernelError> {
+    let name = spawn_process(kernel, inner, spec)?;
+    for g in &spec.grants {
+        let subject = g.subject.clone().unwrap_or_else(|| name.subject());
+        kernel.caps.mint(
+            &subject,
+            &g.resource,
+            g.verbs.clone(),
+            Default::default(),
+            None,
+        )?;
+    }
+    Ok(name)
+}
+
+/// Start the process, complete every declared handshake, register its verbs.
+/// Free-standing because both the embedder (`Host::spawn_spec`) and the
+/// `kernel::spawn` verb reach it, and a second way to start a plugin is a
+/// second set of bugs.
+fn spawn_process(
+    kernel: &Arc<Kernel>,
+    inner: &Arc<HostInner>,
+    spec: &LaunchSpec,
+) -> Result<PluginName, KernelError> {
+    let idx = inner.next_spawn.fetch_add(1, Ordering::SeqCst);
+    let sock_path = inner
+        .sock_dir
+        .join(format!("plugin-{}-{idx}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&sock_path);
+    let listener = UnixListener::bind(&sock_path)?;
+    listener.set_nonblocking(true)?;
+    let token = rand_token();
+
+    let mut cmd = std::process::Command::new(&spec.bin);
+    cmd.args(&spec.args)
+        .env("PORTOS_PLUGIN_SOCK", &sock_path)
+        .env("PORTOS_PLUGIN_TOKEN", &token)
+        // Each plugin leads its own process group, so teardown can reach
+        // whatever it started. A driver's real cost is usually its
+        // grandchildren — the browser driver's chromium, a shell driver's
+        // pipeline — and `Child::kill` never sees those.
+        .process_group(0);
+    for (k, v) in &spec.env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn()?;
+
+    // The serve connection comes first and declares which extra channels
+    // follow ("client" always; "events" optionally). A frame that is not
+    // a well-formed hello, or a bad token, is fatal for the spawn.
+    let accept_hello =
+        |child: &mut std::process::Child| -> Result<(UnixStream, Hello), KernelError> {
+            let mut stream = accept_with_deadline(&listener, child, SPAWN_DEADLINE_MS)?;
+            let frame: HelloFrame = frame::read_frame(&mut stream)
+                .map_err(|e| KernelError::Corrupt(format!("hello: {e}")))?;
+            if frame.hello.token != token {
+                let _ = frame::write_frame(&mut stream, &Reply::<()>::Err("bad token".into()));
+                return Err(KernelError::Denied("plugin hello: bad token".into()));
             }
+            frame::write_frame(&mut stream, &Reply::Ok(Payload::null()))
+                .map_err(|e| KernelError::Corrupt(format!("hello ack: {e}")))?;
+            Ok((stream, frame.hello))
+        };
+
+    let (serve_stream, hello) = match accept_hello(&mut child) {
+        Ok((stream, h)) if h.role == ChannelRole::Serve => (stream, h),
+        Ok(_) => {
+            let _ = child.kill();
+            return Err(KernelError::Corrupt(
+                "plugin hello: first connection must be role serve".into(),
+            ));
+        }
+        Err(e) => {
+            let _ = child.kill();
+            return Err(e);
+        }
+    };
+    if hello.abi != ABI_VERSION {
+        let _ = child.kill();
+        return Err(KernelError::Denied(format!(
+            "plugin abi {} != kernel abi {ABI_VERSION}",
+            hello.abi
+        )));
+    }
+    let name = hello.name.clone();
+    let verbs = hello.verbs.clone();
+    let mut tools_meta = hello.tools.clone().unwrap_or_default();
+    let mut expected = hello.declared_channels();
+
+    if !expected.contains(&ChannelRole::Client) {
+        let _ = child.kill();
+        return Err(KernelError::Corrupt(
+            "plugin hello: a client channel is required".into(),
+        ));
+    }
+    let mut client: Option<UnixStream> = None;
+    let mut events: Option<UnixStream> = None;
+    while !expected.is_empty() {
+        let (stream, h) = match accept_hello(&mut child) {
+            Ok(x) => x,
             Err(e) => {
                 let _ = child.kill();
                 return Err(e);
             }
         };
-        if hello.abi != ABI_VERSION {
-            let _ = child.kill();
-            return Err(KernelError::Denied(format!(
-                "plugin abi {} != kernel abi {ABI_VERSION}",
-                hello.abi
-            )));
-        }
-        let name = hello.name.clone();
-        let verbs = hello.verbs.clone();
-        let mut tools_meta = hello.tools.clone().unwrap_or_default();
-        let mut expected = hello.declared_channels();
-
-        if !expected.contains(&ChannelRole::Client) {
-            let _ = child.kill();
-            return Err(KernelError::Corrupt(
-                "plugin hello: a client channel is required".into(),
-            ));
-        }
-        let mut client: Option<UnixStream> = None;
-        let mut events: Option<UnixStream> = None;
-        while !expected.is_empty() {
-            let (stream, h) = match accept_hello(&mut child) {
-                Ok(x) => x,
-                Err(e) => {
-                    let _ = child.kill();
-                    return Err(e);
-                }
-            };
-            match expected.iter().position(|c| *c == h.role) {
-                Some(i) => {
-                    expected.remove(i);
-                    match h.role {
-                        ChannelRole::Client => client = Some(stream),
-                        ChannelRole::Events => events = Some(stream),
-                        ChannelRole::Serve => {
-                            let _ = child.kill();
-                            return Err(KernelError::Corrupt(
-                                "plugin hello: duplicate serve channel".into(),
-                            ));
-                        }
+        match expected.iter().position(|c| *c == h.role) {
+            Some(i) => {
+                expected.remove(i);
+                match h.role {
+                    ChannelRole::Client => client = Some(stream),
+                    ChannelRole::Events => events = Some(stream),
+                    ChannelRole::Serve => {
+                        let _ = child.kill();
+                        return Err(KernelError::Corrupt(
+                            "plugin hello: duplicate serve channel".into(),
+                        ));
                     }
                 }
-                None => {
-                    let _ = child.kill();
-                    return Err(KernelError::Corrupt(format!(
-                        "plugin hello: undeclared or duplicate role {:?}",
-                        h.role
-                    )));
-                }
+            }
+            None => {
+                let _ = child.kill();
+                return Err(KernelError::Corrupt(format!(
+                    "plugin hello: undeclared or duplicate role {:?}",
+                    h.role
+                )));
             }
         }
-        let client_stream = client.expect("client channel present");
+    }
+    let client_stream = client.expect("client channel present");
 
-        // Register verbs; a route conflict aborts the spawn.
-        {
-            let mut plugins = self.inner.plugins.lock().unwrap();
-            let mut routes = self.inner.routes.lock().unwrap();
-            if plugins.contains_key(&name) {
-                let _ = child.kill();
-                return Err(KernelError::Denied(format!("plugin name taken: {name}")));
-            }
-            if let Some(v) = verbs.iter().find(|v| routes.contains_key(*v)) {
-                let _ = child.kill();
-                return Err(KernelError::Denied(format!("verb already routed: {v}")));
-            }
-            let (events_tx, events_rx) = sync_channel::<ServeMsg>(EVENT_QUEUE);
-            let handle = Arc::new(PluginHandle {
-                child: Mutex::new(child),
-                serve: Mutex::new(serve_stream),
-                events: events.map(Mutex::new),
-                events_tx,
-                sock_path: sock_path.clone(),
-            });
-            for v in &verbs {
-                let meta = tools_meta.remove(v).unwrap_or_default();
-                routes.insert(
-                    v.clone(),
-                    RouteEntry {
-                        plugin: name.clone(),
-                        meta,
-                    },
-                );
-            }
-            plugins.insert(name.clone(), handle.clone());
-            spawn_event_pump(handle.clone(), events_rx);
-            spawn_client_loop(
-                self.kernel.clone(),
-                self.inner.clone(),
-                name.clone(),
-                client_stream,
+    // Register verbs; a route conflict aborts the spawn.
+    {
+        let mut plugins = inner.plugins.lock().unwrap();
+        let mut routes = inner.routes.lock().unwrap();
+        if plugins.contains_key(&name) {
+            let _ = child.kill();
+            return Err(KernelError::Denied(format!("plugin name taken: {name}")));
+        }
+        if let Some(v) = verbs.iter().find(|v| v.family() == KERNEL_FAMILY) {
+            let _ = child.kill();
+            return Err(KernelError::Denied(format!(
+                "the `{KERNEL_FAMILY}` family is the kernel's own: {v}"
+            )));
+        }
+        if let Some(v) = verbs.iter().find(|v| routes.contains_key(*v)) {
+            let _ = child.kill();
+            return Err(KernelError::Denied(format!("verb already routed: {v}")));
+        }
+        let (events_tx, events_rx) = sync_channel::<ServeMsg>(EVENT_QUEUE);
+        let handle = Arc::new(PluginHandle {
+            child: Mutex::new(child),
+            serve: Mutex::new(serve_stream),
+            events: events.map(Mutex::new),
+            events_tx,
+            sock_path: sock_path.clone(),
+        });
+        for v in &verbs {
+            let meta = tools_meta.remove(v).unwrap_or_default();
+            routes.insert(
+                v.clone(),
+                RouteEntry {
+                    plugin: name.clone(),
+                    meta,
+                },
             );
         }
-
-        self.audit(json!({
-            "event": "plugin.spawned",
-            "plugin": name.as_str(),
-            "verbs": verbs.iter().map(Verb::as_str).collect::<Vec<_>>(),
-        }));
-        Ok(name)
+        plugins.insert(name.clone(), handle.clone());
+        spawn_event_pump(handle.clone(), events_rx);
+        spawn_client_loop(kernel.clone(), inner.clone(), name.clone(), client_stream);
     }
 
+    let _ = kernel.audit.lock().unwrap().append(json!({
+        "event": "plugin.spawned",
+        "plugin": name.as_str(),
+        "verbs": verbs.iter().map(Verb::as_str).collect::<Vec<_>>(),
+    }));
+    Ok(name)
+}
+
+impl Host {
     /// Kernel-initiated verb call on a named plugin. No capability check:
     /// kernel-side callers act with root authority.
     pub fn call(
@@ -375,39 +475,57 @@ impl Host {
     /// runtime alive, still goes — and so does everything it started, because
     /// the signals go to its process group rather than to it alone.
     pub fn shutdown(&self, plugin: &PluginName) {
-        let handle = { self.inner.plugins.lock().unwrap().remove(plugin) };
-        let Some(h) = handle else { return };
-        cleanup_plugin(&self.inner, plugin);
-        if let Ok(mut s) = h.serve.lock() {
-            let _ = frame::write_frame(&mut *s, &ServeMsg::Shutdown);
-        }
-        let mut child = h.child.lock().unwrap();
-        let pgid = child.id();
-        if !wait_for_exit(&mut child, GRACE_MS) {
-            signal_group(pgid, Signal::SIGTERM);
-            if !wait_for_exit(&mut child, GRACE_MS) {
-                signal_group(pgid, Signal::SIGKILL);
-                let _ = wait_for_exit(&mut child, GRACE_MS);
-            }
-        }
-        // The leader is reaped; anything left in its group is not a child of
-        // ours and cannot be waited on, so the final KILL is unconditional.
-        let _ = child.kill();
-        let _ = child.wait();
-        signal_group(pgid, Signal::SIGKILL);
-        let _ = std::fs::remove_file(&h.sock_path);
+        shutdown_on(&self.kernel, &self.inner, plugin);
     }
 
     pub fn shutdown_all(&self) {
         let names: Vec<PluginName> = self.inner.plugins.lock().unwrap().keys().cloned().collect();
         for n in &names {
-            self.shutdown(n);
+            shutdown_on(&self.kernel, &self.inner, n);
         }
     }
+}
 
-    fn audit(&self, body: serde_json::Value) {
-        let _ = self.kernel.audit.lock().unwrap().append(body);
+/// Stop a plugin and collect what the kernel was holding for it.
+///
+/// The residue is a short, enumerable list, which is the whole reason
+/// hot-unplug needs no theory here: the plugin is a process, so its own
+/// state goes with it, and what the kernel keeps is routes, subscriptions,
+/// a socket file, a process group, and capabilities. The first four were
+/// always collected; the fifth is collected here, because **a capability is
+/// held by a running plugin, not by a name**. What survives on purpose is
+/// only the immutable record: artifacts already in the CAS, and the audit
+/// log.
+fn shutdown_on(kernel: &Arc<Kernel>, inner: &Arc<HostInner>, plugin: &PluginName) -> bool {
+    let handle = { inner.plugins.lock().unwrap().remove(plugin) };
+    let Some(h) = handle else { return false };
+    cleanup_plugin(inner, plugin);
+    let revoked = kernel
+        .caps
+        .revoke_subject(&plugin.subject(), crate::db::now_unix())
+        .unwrap_or(0);
+    let _ = kernel.audit.lock().unwrap().append(json!({
+        "event": "plugin.stopped", "plugin": plugin.as_str(), "caps_revoked": revoked,
+    }));
+    if let Ok(mut s) = h.serve.lock() {
+        let _ = frame::write_frame(&mut *s, &ServeMsg::Shutdown);
     }
+    let mut child = h.child.lock().unwrap();
+    let pgid = child.id();
+    if !wait_for_exit(&mut child, GRACE_MS) {
+        signal_group(pgid, Signal::SIGTERM);
+        if !wait_for_exit(&mut child, GRACE_MS) {
+            signal_group(pgid, Signal::SIGKILL);
+            let _ = wait_for_exit(&mut child, GRACE_MS);
+        }
+    }
+    // The leader is reaped; anything left in its group is not a child of
+    // ours and cannot be waited on, so the final KILL is unconditional.
+    let _ = child.kill();
+    let _ = child.wait();
+    signal_group(pgid, Signal::SIGKILL);
+    let _ = std::fs::remove_file(&h.sock_path);
+    true
 }
 
 impl Drop for Host {
@@ -637,6 +755,9 @@ fn handle_client_op(
                 "event": "invoke.allowed", "from": name.as_str(),
                 "verb": verb.as_str(), "cap": cap,
             }));
+            if verb.family() == KERNEL_FAMILY {
+                return kernel_verb(kernel, inner, &verb, req.args);
+            }
             let handle = {
                 let routes = inner.routes.lock().unwrap();
                 let target = routes
@@ -661,12 +782,14 @@ fn handle_client_op(
         // and schemas, the user owns grants, the kernel owns neither.
         ClientOp::Grants => {
             let grants = kernel.caps.grants_for(&subject, now, |verb| {
-                inner
-                    .routes
-                    .lock()
-                    .unwrap()
-                    .get(verb)
-                    .map(|e| e.meta.clone())
+                BUILTIN_TOOLS.get(verb).cloned().or_else(|| {
+                    inner
+                        .routes
+                        .lock()
+                        .unwrap()
+                        .get(verb)
+                        .map(|e| e.meta.clone())
+                })
             })?;
             ok(&GrantsReply { grants })
         }
@@ -743,6 +866,139 @@ fn handle_client_op(
             inner.meter.lock().unwrap().count_data(moved);
             Ok(None) // response already sent
         }
+    }
+}
+
+#[derive(Deserialize)]
+struct StopArgs {
+    name: PluginName,
+}
+
+#[derive(Serialize)]
+struct PluginInfo {
+    name: PluginName,
+    verbs: Vec<Verb>,
+}
+
+#[derive(Serialize)]
+struct SpawnReply {
+    name: PluginName,
+    verbs: Vec<Verb>,
+}
+
+#[derive(Serialize)]
+struct StopReply {
+    stopped: bool,
+}
+
+#[derive(Serialize)]
+struct PluginsReply {
+    plugins: Vec<PluginInfo>,
+}
+
+/// What the kernel advertises about its own verbs. A driver describes its
+/// verbs in its hello; the kernel has no hello, so it says so here — and
+/// `grants` then hands these to a caller exactly like any driver's, which is
+/// how a model comes to see `kernel__spawn` as an ordinary tool.
+static BUILTIN_TOOLS: std::sync::LazyLock<BTreeMap<Verb, ToolMeta>> =
+    std::sync::LazyLock::new(|| {
+        let tool = |verb: &str, description: &str, schema: serde_json::Value| {
+            (
+                Verb::parse(verb).expect("constant verb"),
+                ToolMeta {
+                    description: description.to_string(),
+                    schema: Payload::of(&schema).ok(),
+                },
+            )
+        };
+        BTreeMap::from([
+            tool(
+                "kernel::spawn",
+                "Start a new plugin and grant it what it needs. The plugin's verbs \
+                 become available to anyone granted them — including, if the grants \
+                 say so, you — from your next turn onward. Use this to add a \
+                 capability the system does not currently have.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "bin": {"type": "string", "description": "executable to run"},
+                        "args": {"type": "array", "items": {"type": "string"}},
+                        "env": {"type": "object"},
+                        "grants": {
+                            "type": "array",
+                            "description": "capabilities to mint once it is up; \
+                                            `subject` defaults to the new plugin",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "subject": {"type": "string"},
+                                    "resource": {"type": "string"},
+                                    "verbs": {"type": "array", "items": {"type": "string"}},
+                                },
+                                "required": ["resource", "verbs"],
+                            },
+                        },
+                    },
+                    "required": ["bin"],
+                }),
+            ),
+            tool(
+                "kernel::stop",
+                "Stop a running plugin. Its verbs stop being routed and everything \
+                 it was granted is revoked; anything it started is collected too.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}},
+                    "required": ["name"],
+                }),
+            ),
+            tool(
+                "kernel::plugins",
+                "List the plugins currently running and the verbs each answers.",
+                serde_json::json!({"type": "object", "properties": {}}),
+            ),
+        ])
+    });
+
+/// The verbs the kernel answers itself. Reaching here means the capability
+/// gate already passed, exactly as for a routed verb — the kernel is not a
+/// special caller, it is a special *callee*.
+fn kernel_verb(
+    kernel: &Arc<Kernel>,
+    inner: &Arc<HostInner>,
+    verb: &Verb,
+    args: Payload,
+) -> Result<Option<Vec<u8>>, KernelError> {
+    match verb.short() {
+        "spawn" => {
+            let spec: LaunchSpec = args
+                .parse()
+                .map_err(|e| KernelError::Corrupt(format!("kernel::spawn args: {e}")))?;
+            let name = spawn_spec_on(kernel, inner, &spec)?;
+            let verbs = list_plugins(inner)
+                .into_iter()
+                .find(|(n, _)| n == &name)
+                .map(|(_, v)| v)
+                .unwrap_or_default();
+            ok(&SpawnReply { name, verbs })
+        }
+        "stop" => {
+            let a: StopArgs = args
+                .parse()
+                .map_err(|e| KernelError::Corrupt(format!("kernel::stop args: {e}")))?;
+            ok(&StopReply {
+                stopped: shutdown_on(kernel, inner, &a.name),
+            })
+        }
+        "plugins" => ok(&PluginsReply {
+            plugins: list_plugins(inner)
+                .into_iter()
+                .map(|(name, verbs)| PluginInfo { name, verbs })
+                .collect(),
+        }),
+        other => Err(KernelError::NotFound(format!(
+            "no such kernel verb: {other}"
+        ))),
     }
 }
 

@@ -175,7 +175,11 @@ pub fn run_send(
     backend: &dyn Backend,
     gw: &dyn Gateway,
     session: &mut Session,
-    tools: &[ToolDef],
+    // Recomputed every turn, not once: a tool call can change what the
+    // caller may do — starting a plugin is exactly that — and a surface
+    // fixed at the first turn would hide the thing just added until the
+    // next message.
+    tools: &dyn Fn() -> Vec<ToolDef>,
     user_text: String,
     max_turns: u32,
     emit: &dyn Fn(SessionEvent),
@@ -192,10 +196,11 @@ pub fn run_send(
         if cancelled() {
             return abandon(session, mark, emit);
         }
+        let available = tools();
         let req = TurnRequest {
             system: &session.system,
             messages: &session.messages,
-            tools,
+            tools: &available,
         };
         let mut sink = EmitSink { emit, cancelled };
         let turn = match backend.complete(gw, &req, &mut sink) {

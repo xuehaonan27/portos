@@ -125,6 +125,22 @@ theoretical elegance is not. Current state and build order live in
   the event plane, and `model::cancel` stops it. The consequence to respect:
   every such verb owes its subscribers exactly one terminal event — done,
   cancelled, or failed — or a front end waits forever.
+- **`kernel::` is the kernel's own verb family, and it is reserved.** A
+  plugin declaring it is rejected. `spawn`/`stop`/`plugins` are dispatched
+  internally *after* the same capability check a routed verb gets, and they
+  carry built-in tool metadata, so a caller granted `driver:kernel` sees
+  `kernel__spawn` as an ordinary tool. This is what lets a running system
+  gain a capability it did not have: the agent starts a driver mid-session
+  and the tool surface, recomputed every turn, shows it on the next one.
+- **Hot-unplug needs no theory here, because the unit of plugging is a
+  process.** The plugin's own state dies with it; what the kernel keeps is a
+  list short enough to write down — routes, subscriptions, socket file,
+  process group, capabilities — and `kernel::stop` collects all five. One
+  rule makes it work: a capability is held by a *running plugin*, not by a
+  name, so stopping revokes what it held, while what others were granted
+  about its family goes inert with the route and returns if it does.
+  Artifacts and the audit log survive on purpose: immutable records are not
+  state. `crates/portos-echo/tests/hotplug.rs` asserts the list.
 - **Rendering is event subscription.** A renderer is an ordinary plugin with
   zero verbs and zero capabilities that subscribes to `model::session::*`.
   Several may compose. `drivers/render-tty` is the reference.
@@ -142,7 +158,7 @@ MCP later is the opposite direction and is fine).
 
 ```sh
 cargo build --workspace
-cargo test --workspace          # 54 tests; all must pass, zero warnings
+cargo test --workspace          # 59 tests; all must pass, zero warnings
 cargo fmt --all
 ```
 
@@ -156,6 +172,8 @@ The end-to-end tests are the ones that matter and they are hermetic:
   before believing a green run.
 - `crates/portos-echo/tests/abi_v2.rs` — plugin ABI conformance.
 - `crates/portos-broker/tests/egress.rs` — allowlist, injection, sanitizing.
+- `crates/portos-echo/tests/hotplug.rs` — a running system gaining and losing
+  a capability, and the residue list after it loses one.
 - `crates/portos-echo/tests/bridge.rs` — the extensibility claim itself: a
   plugin carrying the event plane and the invoke path over HTTP, written
   against the published ABI with no kernel change. If a change here starts

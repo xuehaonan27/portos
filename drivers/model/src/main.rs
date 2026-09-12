@@ -362,8 +362,9 @@ impl Turn {
             client: client.clone(),
             slot: self.slot.clone(),
         };
-        // Fresh per turn: grants can change between them.
-        let tools = assemble_tools(client, self.introspect, &self.exclude, &self.config_tools);
+        // Recomputed per turn inside the loop: a turn that starts a plugin
+        // sees its verbs on the very next turn, not the next message.
+        let tools = || assemble_tools(client, self.introspect, &self.exclude, &self.config_tools);
 
         let result = {
             let mut s = session.lock().unwrap();
