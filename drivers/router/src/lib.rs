@@ -11,40 +11,41 @@
 //! What it regulates is **laws, not storage**. An implementation keeps its
 //! table however it likes; what it may not do is disagree about these:
 //!
-//! 1. **A name has exactly one answerer.** Registering a name that is taken
-//!    is a [`Conflict`], not a silent overwrite and not a first-match-wins.
-//!    This is also what makes a reserved name ordinary: whoever registers
-//!    first has it, and the second registration is refused with a reason.
-//! 1b. **A *family* has one answerer.** Not a separate rule so much as the
-//!    consequence of what a family is: the capability resource is
-//!    `driver:<family>`, so a family answered by two targets makes one grant
-//!    statement mean two different things to whoever wrote it.
+//! 1. **A verb names a driver's verb, not an answerer.** `browser::open` is
+//!    what the browser interface calls opening; any number of instances may
+//!    answer it — two browsers here, one on another node. What is unique is
+//!    the pair: one target may not register one verb twice, and that is the
+//!    only [`Conflict`].
 //!
-//!    Whether two targets *are* the same answerer is the implementation's
-//!    to decide — only it knows what its targets name. The kernel's
-//!    `kernel::spawn` and `kernel::stop` are different targets and one
-//!    answerer.
-//!
-//!    This law was discovered by deleting a special case. The kernel used to
-//!    refuse a plugin that claimed *any* `kernel::*` verb, which looked like
-//!    a privilege of the kernel's; it was not. Nothing stopped two ordinary
-//!    plugins from splitting `browser::*` between them and quietly doing the
-//!    same damage to `driver:browser`. The special case was a general law
-//!    wearing a disguise.
-//! 2. **Resolution yields the name the *target* knows.** Usually the same
+//!    This replaced a law that said a name, and a whole family, has exactly
+//!    one answerer. That law made the name do two jobs — say which interface
+//!    and say which instance — and the second job leaked out as encoded
+//!    names (`mac_browser::open`) that nothing could parse back. Which
+//!    instance is a routing decision, so it lives here and not in the name.
+//! 2. **Resolution yields exactly one answerer, or an error.** With one
+//!    answerer the verb alone resolves; with several the caller names the
+//!    one it wants (`at`), and without a name that is [`Miss::Ambiguous`] —
+//!    an error, not a choice made on the caller's behalf. The selector is
+//!    optional because a choice with one option is not a choice.
+//! 3. **Resolution yields the name the *target* knows.** Usually the same
 //!    name; not always, because a route may cross a boundary where the far
 //!    side calls it something else. Callers must use what resolution gave
 //!    them, never the name they looked up.
-//! 3. **A miss is an error, never a default.** There is no fallback answerer.
+//! 4. **A miss is an error, never a default.** There is no fallback answerer.
+//!
+//! An implementation whose callers have no way to name a target — the SDK's
+//! handlers are found by an id no caller holds — must keep one target per
+//! verb, or every call would be ambiguous. That is not a fifth law; it is
+//! law 2 applied to a table nobody can select from.
 //!
 //! ## What a target is, is the implementation's business
 //!
 //! [`Router::Target`] is an associated type on purpose. The kernel's targets
-//! are a plugin process or one of its own built-in verbs; the SDK's are its
-//! own handlers. They have nothing in common and should not be forced into a
-//! shared enum — an earlier draft of this did exactly that, and the strain of
-//! making one type mean both was the clue that it was an implementation
-//! pretending to be an interface.
+//! are a plugin process or the kernel itself; the SDK's are its own handlers.
+//! They have nothing in common and should not be forced into a shared enum —
+//! an earlier draft of this did exactly that, and the strain of making one
+//! type mean both was the clue that it was an implementation pretending to be
+//! an interface.
 //!
 //! A target is a **name for an answerer, not the answerer itself.** Reaching
 //! it is a separate step, and separating them is the whole point: it is what
@@ -63,14 +64,19 @@
 use portos_abi::ids::Verb;
 use portos_abi::wire::ToolMeta;
 
+/// The one thing registration refuses: the same target, the same verb, twice.
 #[derive(Debug, thiserror::Error)]
-pub enum Conflict {
-    #[error("verb already routed: {0}")]
-    Verb(Verb),
-    /// The family is answered by something else. Refused because the
-    /// capability resource is the family, not the verb.
-    #[error("the `{family}` family is answered by something else already: {verb}")]
-    Family { verb: Verb, family: String },
+#[error("already registered for this answerer: {0}")]
+pub struct Conflict(pub Verb);
+
+/// Why a verb did not resolve. Both are the caller's to report.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum Miss {
+    #[error("no route")]
+    NoRoute,
+    /// Several answer it and none was named.
+    #[error("several answerers and none named")]
+    Ambiguous,
 }
 
 /// What resolution produces: who answers, and what *they* call it.
@@ -85,15 +91,22 @@ pub struct Resolved<'a, T> {
 pub trait Router {
     /// A name for an answerer. Not the answerer: reaching it is a separate
     /// step, and one this interface says nothing about.
-    type Target;
+    type Target: PartialEq;
 
-    /// Who answers `verb`, and what they call it. `None` is a miss, and a
-    /// miss is an error for the caller to report — not a place to put a
-    /// default.
-    fn resolve(&self, verb: &Verb) -> Option<Resolved<'_, Self::Target>>;
+    /// Who answers `verb`, and what they call it. `at` names the answerer
+    /// when the caller already knows which one it wants; without it, the
+    /// verb must have exactly one.
+    fn resolve(
+        &self,
+        verb: &Verb,
+        at: Option<&Self::Target>,
+    ) -> Result<Resolved<'_, Self::Target>, Miss>;
 
-    /// Claim a name. Refuses one that is taken, which is how a name stays
-    /// reserved without anybody writing a check for it.
+    /// Everyone who answers `verb`, with what each says about it. Empty is a
+    /// verb nobody answers.
+    fn answerers(&self, verb: &Verb) -> Vec<(&Self::Target, &ToolMeta)>;
+
+    /// Register an answerer for a verb.
     ///
     /// `meta` rides along because in PortOS the route table is also where a
     /// name says what it is: a granted verb joined with what its answerer
@@ -102,10 +115,7 @@ pub trait Router {
     /// would make it.
     fn add(&mut self, verb: Verb, target: Self::Target, meta: ToolMeta) -> Result<(), Conflict>;
 
-    /// What this name says about itself, for whoever is entitled to call it.
-    fn meta(&self, verb: &Verb) -> Option<&ToolMeta>;
-
-    /// Give up every name held by `f`. Returns how many.
+    /// Give up every registration `f` selects. Returns how many.
     fn remove_where(&mut self, f: &dyn Fn(&Verb, &Self::Target) -> bool) -> usize;
 
     fn verbs(&self) -> Vec<Verb>;

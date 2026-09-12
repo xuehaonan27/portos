@@ -1,7 +1,7 @@
 //! The shape a verb answers with when its result might be large.
 //!
 //! Part of the SDK rather than a crate of its own, because it is not a
-//! family: it has no verbs and no domain, it is simply how *any* verb
+//! driver: it has no verbs and no domain, it is simply how *any* verb
 //! replies when the answer might not belong in a conversation. A plugin
 //! author should not have to find a second library to learn that.
 //!

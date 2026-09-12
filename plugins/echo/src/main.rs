@@ -3,17 +3,18 @@
 //! capability-gated invoke, the event bus, and the two-layer naming rule
 //! (ephemeral refs live here, NOT in the kernel handle table).
 //!
-//! The verb family is `PORTOS_ECHO_FAMILY` (default "echo"), so one binary
-//! can be spawned as several distinct plugins — which is exactly what the
-//! invoke tests need (a plugin cannot invoke itself: single-threaded serve
-//! loop, and invoke cycles deadlock by design).
+//! It plays whichever driver `PORTOS_ECHO_DRIVER` names (default "echo"),
+//! so one binary can stand in for several drivers — which is exactly what
+//! the invoke tests need (a plugin cannot invoke itself: single-threaded
+//! serve loop, and invoke cycles deadlock by design) — and, launched under
+//! two names, for two instances of one driver.
 //!
 //! Its verbs take positional arguments, so each one parses the opaque
 //! payload into a tuple of exactly the types it wants. That is the shape
 //! every driver takes: the kernel moved bytes it could not read, and the
 //! plugin that owns the meaning is the one that names the types.
 
-use portos_abi::ids::{Topic, Verb};
+use portos_abi::ids::{PluginName, Topic, Verb};
 use portos_abi::wire::Payload;
 use portos_sdk::{CallError, CallResult, Plugin};
 use serde::Serialize;
@@ -48,8 +49,8 @@ fn main() -> std::io::Result<()> {
         std::fs::write(path, child.id().to_string())?;
     }
 
-    let family = std::env::var("PORTOS_ECHO_FAMILY").unwrap_or_else(|_| "echo".into());
-    let name = format!("portos-{family}");
+    let driver = std::env::var("PORTOS_ECHO_DRIVER").unwrap_or_else(|_| "echo".into());
+    let name = format!("portos-{driver}");
 
     // Shared because the verbs are separate closures now. That is not a
     // cost of the new shape so much as the old shape hiding the fact: two
@@ -61,7 +62,7 @@ fn main() -> std::io::Result<()> {
     let seen = received.clone();
 
     let (make, used) = (refs.clone(), refs);
-    let v = |short: &str| format!("{family}::{short}");
+    let v = |short: &str| format!("{driver}::{short}");
 
     // A fixture for dependency readiness: whatever is listed here is
     // something this echo cannot work without, the way modeld cannot work
@@ -113,6 +114,12 @@ fn main() -> std::io::Result<()> {
             .verb(&v("relay"), |args, client| {
                 let (target, inner): (String, Payload) = args.parse()?;
                 Ok(client.invoke(&Verb::parse(&target)?, inner)?)
+            })
+            // The same, naming the instance: what a caller does when more
+            // than one answers the verb.
+            .verb(&v("relay_at"), |args, client| {
+                let (at, target, inner): (String, String, Payload) = args.parse()?;
+                Ok(client.invoke_at(&PluginName::parse(&at)?, &Verb::parse(&target)?, inner)?)
             })
             .verb(&v("publish"), |args, client| {
                 let (topic, data): (String, Payload) = args.parse()?;

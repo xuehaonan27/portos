@@ -8,10 +8,12 @@
 //! same `portos-bridge-http` that was written for a browser; the near node
 //! dials it with `portos-remote`, which is a plugin like any other.
 //!
-//! What the three tests pin down is the division of authority, because that
-//! is the part a multi-node design usually gets wrong: **the far node
-//! decides what is exposed, the near node decides who may use it**, and
-//! neither can overrule the other.
+//! What the tests pin down: the division of authority, because that is the
+//! part a multi-node design usually gets wrong — **the far node decides what
+//! is exposed, the near node decides who may use it**, and neither can
+//! overrule the other — and that the far node's driver and this node's are
+//! two *instances* of one driver, told apart by name and not by a renamed
+//! verb.
 //!
 //! Hermetic: loopback only, no model provider. Skips when node or the remote
 //! driver binary is absent.
@@ -85,9 +87,9 @@ impl Node {
             .unwrap();
     }
 
-    fn echo(&self, family: &str) -> PluginName {
+    fn echo(&self, driver: &str) -> PluginName {
         self.host
-            .spawn(Path::new(ECHO_BIN), &[], &[("PORTOS_ECHO_FAMILY", family)])
+            .spawn(Path::new(ECHO_BIN), &[], &[("PORTOS_ECHO_DRIVER", driver)])
             .unwrap()
     }
 
@@ -107,8 +109,18 @@ fn tp(s: &str) -> Topic {
 
 /// A kernel-side call: root authority, so it tests routing alone.
 fn call_verb(node: &Node, verb: &str, args: Value) -> Result<Value, String> {
+    call_verb_at(node, verb, None, args)
+}
+
+/// The same, naming the instance when there is more than one.
+fn call_verb_at(node: &Node, verb: &str, at: Option<&str>, args: Value) -> Result<Value, String> {
+    let at = at.map(|a| PluginName::parse(a).expect("test name"));
     node.host
-        .call_verb(&vb(verb), Payload::of(&args).expect("test payload"))
+        .call_verb(
+            &vb(verb),
+            at.as_ref(),
+            Payload::of(&args).expect("test payload"),
+        )
         .map(|p| p.parse().expect("json"))
         .map_err(|e| e.to_string())
 }
@@ -126,8 +138,8 @@ fn call(node: &Node, plugin: &PluginName, verb: &str, args: Value) -> Result<Val
 /// capability gate — by having an echo driver relay it. Never to a verb of
 /// the relaying plugin itself: one serve loop, so that deadlocks by design.
 fn relay(node: &Node, from: &PluginName, verb: &str, args: Value) -> Result<Value, String> {
-    let family = from.as_str().trim_start_matches("portos-").to_string();
-    call(node, from, &format!("{family}::relay"), json!([verb, args]))
+    let driver = from.as_str().trim_start_matches("portos-").to_string();
+    call(node, from, &format!("{driver}::relay"), json!([verb, args]))
 }
 
 fn await_port(path: &Path) -> u16 {
@@ -175,13 +187,18 @@ fn far_node(tag: &str, bridge_js: &Path, exposed: &[&str], topics: &str) -> (Nod
 /// pretending otherwise.
 fn await_verb(node: &Node, verb: &str) {
     let deadline = Instant::now() + Duration::from_secs(20);
+    let mut last = String::new();
     while Instant::now() < deadline {
-        if call_verb(node, verb, json!([])).is_ok() {
-            return;
+        match call_verb(node, verb, json!([])) {
+            Ok(_) => return,
+            Err(e) => last = e,
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    panic!("{verb} was never answered");
+    panic!(
+        "{verb} was never answered; last error: {last}; running: {:?}",
+        node.host.plugins()
+    );
 }
 
 /// The near node, with a remote driver pointed at the far one.
@@ -215,30 +232,34 @@ fn another_nodes_verbs_arrive_as_ordinary_local_verbs() {
     let (far, port) = far_node("far-verbs", &bridge_js, &["make_ref", "emit"], "echo::*");
     let near = near_node("near-verbs", &remote_bin, port);
 
-    // Routed, under a family that says whose it is.
-    await_verb(&near, "b_echo::make_ref");
-    let made = call_verb(&near, "b_echo::make_ref", json!([])).expect("the far node answered");
+    // Routed under the driver's own verb: the far node's `echo::make_ref`
+    // is `echo::make_ref` here. What says whose it is is the instance that
+    // answers, and with one instance nothing needs naming.
+    await_verb(&near, "echo::make_ref");
+    let made = call_verb(&near, "echo::make_ref", json!([])).expect("the far node answered");
     assert!(made["ref"].is_string(), "a real reply crossed: {made}");
-
-    // And the far node's own name for it is gone from this side: two nodes
-    // with a browser each would collide in a flat route table.
     assert!(
-        call_verb(&near, "echo::make_ref", json!([])).is_err(),
-        "the far node's verbs are not installed under their own family"
+        call_verb_at(&near, "echo::make_ref", Some("portos-remote-b"), json!([])).is_ok(),
+        "and it can be named, the way a caller with two would have to"
     );
 
     // The tool surface: what a plugin here sees when it asks what it may do.
     let near_echo = near.echo("echoa");
-    near.grant(&near_echo, "driver:b_echo", &["emit"]);
+    near.grant(&near_echo, "driver:echo", &["emit"]);
     let grants = call(&near, &near_echo, "echoa::grants", json!([])).expect("grants");
 
     let emit = grants
         .as_array()
         .unwrap()
         .iter()
-        .find(|g| g["verb"] == "b_echo::emit")
+        .find(|g| g["verb"] == "echo::emit")
         .expect("the remote verb is a grantable capability like any other")
         .clone();
+    assert_eq!(
+        emit["instances"],
+        json!(["portos-remote-b"]),
+        "and the grant says which instance answers it: {emit}"
+    );
     let description = emit["description"].as_str().unwrap_or_default();
     assert!(
         description.contains("echo driver's stdout"),
@@ -258,7 +279,8 @@ fn another_nodes_verbs_arrive_as_ordinary_local_verbs() {
 }
 
 /// The other half of the two-layer naming rule, and the half that needs no
-/// transport at all.
+/// transport at all — and, with a browser on each node, the whole point of
+/// instances.
 ///
 /// An ephemeral ref belongs to the driver session that minted it and means
 /// nothing outside it — which is exactly why it crosses a node boundary for
@@ -273,11 +295,11 @@ fn a_drivers_own_refs_cross_without_being_translated() {
     let (far, port) = far_node("far-refs", &bridge_js, &["make_ref", "use_ref"], "echo::*");
     let near = near_node("near-refs", &remote_bin, port);
 
-    await_verb(&near, "b_echo::make_ref");
-    let made = call_verb(&near, "b_echo::make_ref", json!([])).expect("minted on the far node");
+    await_verb(&near, "echo::make_ref");
+    let made = call_verb(&near, "echo::make_ref", json!([])).expect("minted on the far node");
     let reference = made["ref"].as_str().expect("a ref").to_string();
 
-    let used = call_verb(&near, "b_echo::use_ref", json!([reference.clone()]))
+    let used = call_verb(&near, "echo::use_ref", json!([reference.clone()]))
         .expect("the far driver still knows its own ref");
     assert_eq!(
         used["used"].as_str(),
@@ -285,10 +307,35 @@ fn a_drivers_own_refs_cross_without_being_translated() {
         "the ref went out and came back untouched: {used}"
     );
 
-    // It is meaningful only there: this node never held it, and nothing
-    // here would know what to do with it.
+    // Now this node has an echo of its own: two instances of one driver,
+    // one here and one there. The verb alone no longer says which, so the
+    // call has to.
+    let local = near.echo("echo");
+    let err = call_verb(&near, "echo::use_ref", json!([reference.clone()])).unwrap_err();
     assert!(
-        call_verb(&near, "echo::use_ref", json!([reference])).is_err(),
+        err.contains("ambiguous") && err.contains("portos-remote-b") && err.contains("portos-echo"),
+        "two instances, none named: {err}"
+    );
+    assert!(
+        call_verb_at(
+            &near,
+            "echo::use_ref",
+            Some("portos-remote-b"),
+            json!([reference.clone()])
+        )
+        .is_ok(),
+        "named, the far one still knows its ref"
+    );
+    // The ref is meaningful only there: the local instance never minted
+    // it, and nothing here would know what to do with it.
+    assert!(
+        call_verb_at(
+            &near,
+            "echo::use_ref",
+            Some(local.as_str()),
+            json!([reference])
+        )
+        .is_err(),
         "a ref is not a portable name"
     );
 
@@ -312,16 +359,16 @@ fn both_nodes_get_a_say_in_what_crosses() {
     let near_echo = near.echo("echoa");
     // Granted here for both — the near node cannot tell which of them the
     // far node is willing to serve, and does not need to.
-    near.grant(&near_echo, "driver:b_echo", &["make_ref", "use_ref"]);
+    near.grant(&near_echo, "driver:echo", &["make_ref", "use_ref"]);
 
-    await_verb(&near, "b_echo::make_ref");
-    let allowed = relay(&near, &near_echo, "b_echo::make_ref", json!([]));
+    await_verb(&near, "echo::make_ref");
+    let allowed = relay(&near, &near_echo, "echo::make_ref", json!([]));
     assert!(
         allowed.is_ok(),
         "exposed there and granted here: {allowed:?}"
     );
 
-    let not_exposed = relay(&near, &near_echo, "b_echo::use_ref", json!(["e1"])).unwrap_err();
+    let not_exposed = relay(&near, &near_echo, "echo::use_ref", json!(["e1"])).unwrap_err();
     assert!(
         not_exposed.contains("no route"),
         "what the far node did not expose was never declared here: {not_exposed}"
@@ -329,7 +376,7 @@ fn both_nodes_get_a_say_in_what_crosses() {
 
     // The other direction: revoke locally and the link is irrelevant.
     let near_echo2 = near.echo("echob");
-    let not_granted = relay(&near, &near_echo2, "b_echo::make_ref", json!([])).unwrap_err();
+    let not_granted = relay(&near, &near_echo2, "echo::make_ref", json!([])).unwrap_err();
     assert!(
         not_granted.contains("no capability"),
         "the route exists and the far node would serve it; this node's own \
@@ -342,17 +389,17 @@ fn both_nodes_get_a_say_in_what_crosses() {
 
 /// The other interaction shape. A transport that carried only verbs would be
 /// half a transport: a verb that reports through events — every long
-/// operation PortOS has — would arrive unusable. Topics are renamed by the
-/// same rule the verbs are.
+/// operation PortOS has — would arrive unusable. Topics cross under their
+/// own names, like the verbs do.
 #[test]
-fn events_cross_the_link_renamed_like_the_verbs() {
+fn events_cross_the_link_under_their_own_topics() {
     let Some((bridge_js, remote_bin)) = link_ready() else {
         return;
     };
     let (far, port) = far_node("far-events", &bridge_js, &["publish"], "echo::*");
     let near = near_node("near-events", &remote_bin, port);
 
-    let (_sub, rx) = near.host.subscribe_local(&tp("b_echo::*"));
+    let (_sub, rx) = near.host.subscribe_local(&tp("echo::*"));
 
     // The far node publishes until it lands: nothing here knows when the
     // driver's event stream finished connecting, and inventing a readiness
@@ -368,8 +415,8 @@ fn events_cross_the_link_renamed_like_the_verbs() {
 
     assert_eq!(
         received.topic.as_str(),
-        "b_echo::news",
-        "the leading segment gained the node's name, like a family does"
+        "echo::news",
+        "the topic is the driver's, unrenamed"
     );
     let data: Value = received.data.parse().unwrap();
     assert_eq!(data["n"], 7, "the payload crossed untouched: {data}");

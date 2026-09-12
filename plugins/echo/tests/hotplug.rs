@@ -35,8 +35,8 @@ fn setup(tag: &str) -> (Arc<Kernel>, Host, PathBuf) {
     (kernel, host, root)
 }
 
-fn spawn_echo(host: &Host, family: &str) -> PluginName {
-    host.spawn(Path::new(ECHO_BIN), &[], &[("PORTOS_ECHO_FAMILY", family)])
+fn spawn_echo(host: &Host, driver: &str) -> PluginName {
+    host.spawn(Path::new(ECHO_BIN), &[], &[("PORTOS_ECHO_DRIVER", driver)])
         .unwrap()
 }
 
@@ -53,8 +53,8 @@ fn call(host: &Host, plugin: &PluginName, verb: &str, args: Value) -> Result<Val
 /// Reach a verb the way a plugin does: through the kernel, past the
 /// capability gate. `echo::relay` forwards whatever it is handed.
 fn relay(host: &Host, from: &PluginName, verb: &str, args: Value) -> Result<Value, String> {
-    let family = from.as_str().trim_start_matches("portos-").to_string();
-    call(host, from, &format!("{family}::relay"), json!([verb, args]))
+    let driver = from.as_str().trim_start_matches("portos-").to_string();
+    call(host, from, &format!("{driver}::relay"), json!([verb, args]))
 }
 
 fn grant(kernel: &Kernel, subject: &str, resource: &str, verbs: &[&str]) {
@@ -70,16 +70,16 @@ fn grant(kernel: &Kernel, subject: &str, resource: &str, verbs: &[&str]) {
         .unwrap();
 }
 
-/// A spec that starts another echo under `family`, granting it a capability
+/// A spec that starts another echo playing `driver`, granting it a capability
 /// of its own and granting `caller` the right to use it.
-fn echo_spec(family: &str, caller: &PluginName) -> Value {
+fn echo_spec(driver: &str, caller: &PluginName) -> Value {
     json!({
         "bin": ECHO_BIN,
-        "env": {"PORTOS_ECHO_FAMILY": family},
+        "env": {"PORTOS_ECHO_DRIVER": driver},
         "grants": [
             // subject defaults to the plugin being started
             {"resource": "driver:noop", "verbs": ["nothing"]},
-            {"subject": caller.subject(), "resource": format!("driver:{family}"),
+            {"subject": caller.subject(), "resource": format!("driver:{driver}"),
              "verbs": ["make_ref"]},
         ],
     })
@@ -155,7 +155,7 @@ fn a_plugin_can_start_another_and_the_new_verbs_route_at_once() {
 ///
 /// The one rule worth stating: a capability is held by a *running plugin*,
 /// not by a name. What the stopped plugin held is revoked. What *others*
-/// were granted about its family is left alone: it goes inert with the route
+/// were granted about its driver is left alone: it goes inert with the route
 /// and means something again if the plugin comes back.
 #[test]
 fn stopping_a_plugin_collects_every_item_of_the_residue() {
@@ -260,41 +260,87 @@ fn replugging_lands_where_the_first_plug_did() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// A family has one answerer — which is what "the kernel's family is its
-/// own" turned out to be a special case of.
+/// Two instances of one driver — two browsers — are told apart by name,
+/// and only by name: the verb is the driver's and says nothing about who
+/// answers it.
 ///
-/// The capability resource is `driver:<family>`, so a family split between
-/// two answerers makes one grant statement mean two different things. The
-/// kernel's family is not privileged; it is simply already answered.
+/// This replaced a law that said a family has one answerer. That law made
+/// the name do two jobs, and the second one leaked out as encoded names
+/// (`mac_browser::open`) that nothing could parse back. Which instance
+/// answers is a routing decision, so it lives in the call, not in the name.
 #[test]
-fn a_family_has_one_answerer() {
-    let (_kernel, host, root) = setup("reserved");
-    let err = host
-        .spawn(
-            Path::new(ECHO_BIN),
-            &[],
-            &[("PORTOS_ECHO_FAMILY", "kernel")],
-        )
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("kernel"),
-        "the kernel already answers that family: {err}"
+fn two_instances_of_one_driver_are_told_apart_by_name() {
+    let (kernel, host, root) = setup("instances");
+    let instance = |name: &str| portos_kernel::host::LaunchSpec {
+        name: Some(name.to_string()),
+        env: [("PORTOS_ECHO_DRIVER".to_string(), "shared".to_string())]
+            .into_iter()
+            .collect(),
+        ..portos_kernel::host::LaunchSpec::from_path(ECHO_BIN)
+    };
+    let a = host
+        .spawn_spec(&instance("portos-shared-a"))
+        .expect("first");
+    let b = host
+        .spawn_spec(&instance("portos-shared-b"))
+        .expect("a second instance of the same driver is not a conflict");
+    assert_eq!(
+        (a.as_str(), b.as_str()),
+        ("portos-shared-a", "portos-shared-b"),
+        "the launcher's names, not the plugin's own"
     );
 
-    // And the same refusal for two ordinary plugins, which is the part that
-    // was never checked while this looked like a privilege of the kernel's.
-    let _first = spawn_echo(&host, "shared");
-    let second = host
-        .spawn_spec(&portos_kernel::host::LaunchSpec {
-            env: [("PORTOS_ECHO_FAMILY".to_string(), "shared".to_string())]
-                .into_iter()
-                .collect(),
-            ..portos_kernel::host::LaunchSpec::from_path(ECHO_BIN)
-        })
-        .unwrap_err();
+    // Unnamed, the call is ambiguous: an error, not a choice made for the
+    // caller — and the error says who could have been named.
+    let err = routed(&host, "shared::make_ref").unwrap_err();
     assert!(
-        second.to_string().contains("shared"),
-        "two plugins may not split a family between them: {second}"
+        err.contains("ambiguous")
+            && err.contains("portos-shared-a")
+            && err.contains("portos-shared-b"),
+        "{err}"
+    );
+
+    // Named, each answers for itself: a ref minted by one is unknown to the
+    // other, which is what "two instances" means.
+    let minted = routed_at(&host, "shared::make_ref", &a, json!([])).expect("named");
+    let r = minted["ref"].as_str().expect("a ref").to_string();
+    assert!(routed_at(&host, "shared::use_ref", &a, json!([r.clone()])).is_ok());
+    assert!(
+        routed_at(&host, "shared::use_ref", &b, json!([r.clone()])).is_err(),
+        "b never minted it"
+    );
+
+    // A plugin names an instance the same way — through the kernel, past
+    // the gate — and the grant it holds tells it there is a choice.
+    let caller = spawn_echo(&host, "echoa");
+    grant(&kernel, &caller.subject(), "driver:shared", &["make_ref"]);
+    let via = call(
+        &host,
+        &caller,
+        "echoa::relay_at",
+        json!(["portos-shared-b", "shared::make_ref", []]),
+    )
+    .expect("named through the kernel");
+    assert!(via["ref"].is_string(), "{via}");
+    let grants = call(&host, &caller, "echoa::grants", json!([])).expect("grants");
+    let g = grants
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["verb"] == "shared::make_ref")
+        .expect("granted")
+        .clone();
+    assert_eq!(
+        g["instances"],
+        json!(["portos-shared-a", "portos-shared-b"])
+    );
+
+    // One leaves, and the verb needs no name again: a choice with one
+    // option is not a choice.
+    host.shutdown(&a);
+    assert!(
+        routed(&host, "shared::make_ref").is_ok(),
+        "one answerer left, so nothing to name"
     );
 
     host.shutdown_all();
@@ -318,7 +364,7 @@ fn a_plugin_waits_for_what_it_needs_and_nobody_declares_an_order() {
     let waiting = host
         .spawn_spec(&portos_kernel::host::LaunchSpec {
             env: [
-                ("PORTOS_ECHO_FAMILY".to_string(), "waiter".to_string()),
+                ("PORTOS_ECHO_DRIVER".to_string(), "waiter".to_string()),
                 (
                     "PORTOS_ECHO_NEEDS".to_string(),
                     "provider::make_ref".to_string(),
@@ -378,7 +424,19 @@ fn a_plugin_waits_for_what_it_needs_and_nobody_declares_an_order() {
 fn routed(host: &Host, verb: &str) -> Result<Value, String> {
     host.call_verb(
         &Verb::parse(verb).expect("test verb"),
+        None,
         Payload::of(&serde_json::json!([])).expect("test payload"),
+    )
+    .map(|p| p.parse().expect("json"))
+    .map_err(|e| e.to_string())
+}
+
+/// The same, naming the instance.
+fn routed_at(host: &Host, verb: &str, at: &PluginName, args: Value) -> Result<Value, String> {
+    host.call_verb(
+        &Verb::parse(verb).expect("test verb"),
+        Some(at),
+        Payload::of(&args).expect("test payload"),
     )
     .map(|p| p.parse().expect("json"))
     .map_err(|e| e.to_string())

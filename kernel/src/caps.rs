@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use portos_abi::ids::Verb;
+use portos_abi::ids::{PluginName, Verb};
 use portos_abi::wire::{Grant, Payload, ToolMeta};
 use portos_abi::{Capability, Constraints};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -209,17 +209,17 @@ impl CapStore {
         &self,
         subject: &str,
         now: u64,
-        meta: impl Fn(&Verb) -> Option<ToolMeta>,
+        answerers: impl Fn(&Verb) -> Vec<(PluginName, ToolMeta)>,
     ) -> Result<Vec<Grant>, KernelError> {
         let mut merged: BTreeMap<Verb, Option<u64>> = BTreeMap::new();
         for cap in self.list_live(subject, now)? {
-            let Some(family) = cap.resource.strip_prefix("driver:") else {
+            let Some(driver) = cap.resource.strip_prefix("driver:") else {
                 continue;
             };
             for short in &cap.verbs {
                 // A capability row naming a verb this kernel cannot parse is
                 // unroutable anyway; leave it out rather than fail the call.
-                let Ok(verb) = Verb::new(family, short) else {
+                let Ok(verb) = Verb::new(driver, short) else {
                     continue;
                 };
                 let this = cap.constraints.counts.get(short).copied();
@@ -237,12 +237,18 @@ impl CapStore {
         Ok(merged
             .into_iter()
             .map(|(verb, counts_left)| {
-                let m = meta(&verb).unwrap_or_default();
+                // Instances of one driver describe its verbs alike, so the
+                // first one's words stand for all of them; which instances
+                // there are is the part a caller has to be told.
+                let mut found = answerers(&verb);
+                found.sort_by(|a, b| a.0.cmp(&b.0));
+                let m = found.first().map(|(_, m)| m.clone()).unwrap_or_default();
                 Grant {
                     description: m.description,
                     schema: m.schema.unwrap_or_else(empty_object_schema),
                     verb,
                     counts_left,
+                    instances: found.into_iter().map(|(name, _)| name).collect(),
                 }
             })
             .collect())
@@ -251,7 +257,7 @@ impl CapStore {
     /// Revoke everything `subject` holds. Used when a plugin stops: a
     /// capability is held by a *running* plugin, not by a name, so authority
     /// does not survive the process that was granted it. Capabilities other
-    /// subjects hold *about* that plugin's family are untouched — those go
+    /// subjects hold *about* that plugin's driver are untouched — those go
     /// inert with the route and come back if it does.
     pub fn revoke_subject(&self, subject: &str, now: u64) -> Result<u64, KernelError> {
         let mut n = 0;

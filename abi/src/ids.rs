@@ -3,7 +3,7 @@
 //! Each of these was a bare `String` that every call site re-validated, or
 //! more often did not: `verb.rsplit("::").next().unwrap_or(verb)` is a
 //! parse that cannot fail because it silently accepts nonsense. Parsing
-//! once, at the boundary, makes the accessors below total — `family()` and
+//! once, at the boundary, makes the accessors below total — `driver()` and
 //! `short()` return the real thing or the value never existed.
 
 use serde::{Deserialize, Serialize};
@@ -11,11 +11,11 @@ use std::fmt;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum IdError {
-    #[error("verb must be `family::verb`, got {0:?}")]
+    #[error("verb must be `driver::verb`, got {0:?}")]
     VerbShape(String),
     #[error("verb segment must match [a-z][a-z0-9_]* and contain no `__`, got {0:?}")]
     VerbSegment(String),
-    #[error("tool name must be `family__verb`, got {0:?}")]
+    #[error("tool name must be `driver__verb`, got {0:?}")]
     ToolName(String),
     #[error("topic segment must match [a-z0-9_-]+ (last may be `*`), got {0:?}")]
     Topic(String),
@@ -23,10 +23,10 @@ pub enum IdError {
     PluginName(String),
 }
 
-/// A verb name: `family::verb`, both segments lowercase.
+/// A verb name: `driver::verb`, both segments lowercase.
 ///
 /// The kernel routes verbs without understanding them, but it does need the
-/// family (to find the capability resource) and the short name (to check the
+/// driver (to find the capability resource) and the short name (to check the
 /// grant). Splitting is therefore done once, here, and recorded — `sep` is
 /// the byte offset of the `::`.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -38,20 +38,20 @@ pub struct Verb {
 
 impl Verb {
     pub fn parse(s: &str) -> Result<Verb, IdError> {
-        let Some((family, short)) = s.split_once("::") else {
+        let Some((driver, short)) = s.split_once("::") else {
             return Err(IdError::VerbShape(s.to_string()));
         };
         if short.contains("::") {
             return Err(IdError::VerbShape(s.to_string()));
         }
-        for seg in [family, short] {
+        for seg in [driver, short] {
             if !is_verb_segment(seg) {
                 return Err(IdError::VerbSegment(seg.to_string()));
             }
         }
         Ok(Verb {
             text: s.to_string(),
-            sep: family.len(),
+            sep: driver.len(),
         })
     }
 
@@ -59,7 +59,10 @@ impl Verb {
         &self.text
     }
 
-    pub fn family(&self) -> &str {
+    /// The driver this verb belongs to: the interface, not whoever
+    /// implements it. Any number of instances may answer a driver's verbs;
+    /// which one a call reaches is routing, not naming.
+    pub fn driver(&self) -> &str {
         &self.text[..self.sep]
     }
 
@@ -67,16 +70,16 @@ impl Verb {
         &self.text[self.sep + 2..]
     }
 
-    /// The capability resource a verb of this family is granted on. The
+    /// The capability resource a verb of this driver is granted on. The
     /// kernel's convention: subject `plugin:<name>`, resource
-    /// `driver:<family>`, verb the short name.
+    /// `driver:<driver>`, verb the short name.
     pub fn resource(&self) -> String {
-        format!("driver:{}", self.family())
+        format!("driver:{}", self.driver())
     }
 
-    /// Build a verb from its family and short name, both validated.
-    pub fn new(family: &str, short: &str) -> Result<Verb, IdError> {
-        Verb::parse(&format!("{family}::{short}"))
+    /// Build a verb from its driver and short name, both validated.
+    pub fn new(driver: &str, short: &str) -> Result<Verb, IdError> {
+        Verb::parse(&format!("{driver}::{short}"))
     }
 
     /// The name this verb takes on a model provider's tool surface.
@@ -84,14 +87,14 @@ impl Verb {
     /// maps to `__`. Banning `__` inside a segment is exactly what makes
     /// this a bijection, which is why [`Verb::parse`] rejects it.
     pub fn tool_name(&self) -> String {
-        format!("{}__{}", self.family(), self.short())
+        format!("{}__{}", self.driver(), self.short())
     }
 
     pub fn from_tool_name(name: &str) -> Result<Verb, IdError> {
-        let Some((family, short)) = name.split_once("__") else {
+        let Some((driver, short)) = name.split_once("__") else {
             return Err(IdError::ToolName(name.to_string()));
         };
-        Verb::new(family, short).map_err(|_| IdError::ToolName(name.to_string()))
+        Verb::new(driver, short).map_err(|_| IdError::ToolName(name.to_string()))
     }
 }
 
@@ -247,7 +250,7 @@ mod tests {
     #[test]
     fn verb_splits_once_and_totally() {
         let v = Verb::parse("browser::wait_for").unwrap();
-        assert_eq!(v.family(), "browser");
+        assert_eq!(v.driver(), "browser");
         assert_eq!(v.short(), "wait_for");
         assert_eq!(v.resource(), "driver:browser");
         assert_eq!(v.as_str(), "browser::wait_for");
@@ -256,7 +259,7 @@ mod tests {
     #[test]
     fn verb_rejects_what_the_old_string_code_accepted() {
         // Each of these used to flow through `split("::").next().unwrap_or()`
-        // and come out as a plausible-looking family or verb.
+        // and come out as a plausible-looking driver or verb.
         for bad in ["", "noseparator", "a::b::c", "::b", "a::", "Browser::Open"] {
             assert!(Verb::parse(bad).is_err(), "should reject {bad:?}");
         }

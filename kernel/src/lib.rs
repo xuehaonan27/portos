@@ -67,6 +67,8 @@ pub enum KernelError {
     Corrupt(String),
     Denied(String),
     NotFound(String),
+    /// Several instances answer the verb and the caller named none.
+    Ambiguous(String),
 }
 
 impl From<std::io::Error> for KernelError {
@@ -87,6 +89,7 @@ impl std::fmt::Display for KernelError {
             KernelError::Corrupt(s) => write!(f, "corrupt: {s}"),
             KernelError::Denied(s) => write!(f, "denied: {s}"),
             KernelError::NotFound(s) => write!(f, "not found: {s}"),
+            KernelError::Ambiguous(s) => write!(f, "ambiguous: {s}"),
         }
     }
 }

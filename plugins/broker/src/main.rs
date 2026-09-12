@@ -215,7 +215,7 @@ fn main() -> std::io::Result<()> {
     portos_sdk::serve(
         // Undescribed on purpose: the model is not meant to discover the
         // gateway. It reaches the outside world by asking a driver that asks
-        // us, and `tool_families_exclude` keeps `egress` off its surface.
+        // us, and `tool_drivers_exclude` keeps `egress` off its surface.
         Plugin::new("portos-broker")
             .verb("egress::http", move |args, client| {
                 buffered(&agent_http, &cfg_http, client, args.parse()?)

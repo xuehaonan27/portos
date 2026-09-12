@@ -2,7 +2,7 @@
 //!
 //! Starts the plugins listed in `<root>/chat.json`, then the standard egress
 //! broker and model driver (sibling binaries) for whichever of those two
-//! families nothing listed answers, mints the configured capability grants,
+//! drivers nothing listed answers, mints the configured capability grants,
 //! then runs a REPL: each line goes to `model::send`
 //! while deltas and tool activity stream live from the session's event
 //! topic. The kernel stays in this process (library-linked); daemonization
@@ -22,6 +22,8 @@
 //! A `bin` with no directory is looked for beside this binary, then on PATH.
 //! Listing a plugin that answers `model::*` or `egress::*` replaces the
 //! standard one: this front end addresses both by verb and never by name.
+//! `"name"` gives an entry its instance identifier — two browsers are two
+//! entries with two names, and a caller with a choice names one.
 //!
 //! **Reload is re-plug.** `SIGHUP` re-reads `chat.json` (and the two
 //! built-in drivers' config directories) and brings the running set back in
@@ -88,6 +90,10 @@ struct PluginSpec {
     /// on the next reload without anyone declaring which files matter.
     #[serde(default)]
     config: Option<serde_json::Value>,
+    /// The instance identifier. Needed only to run two instances of one
+    /// driver; otherwise the plugin's own name is used.
+    #[serde(default)]
+    name: Option<String>,
     #[serde(default)]
     args: Vec<String>,
     #[serde(default)]
@@ -236,8 +242,17 @@ pub fn run(root: &str, repl: bool, resume: Resume) -> Result<(), Box<dyn std::er
     if let Some(first) = failures.first() {
         return Err(first.clone().into());
     }
-    if host.answerer_of(&model::START).is_none() {
-        return Err("no model driver: nothing answers model::start".into());
+    match host.answerers_of(&model::START).as_slice() {
+        [] => return Err("no model driver: nothing answers model::start".into()),
+        [_] => {}
+        several => {
+            let names: Vec<String> = several.iter().map(|n| n.to_string()).collect();
+            return Err(format!(
+                "several model drivers are running ({}); this REPL drives one — list one in chat.json",
+                names.join(", ")
+            )
+            .into());
+        }
     }
 
     let render_builtin = load_chat_config(&root).render == RenderMode::Builtin;
@@ -283,7 +298,11 @@ pub fn run(root: &str, repl: bool, resume: Resume) -> Result<(), Box<dyn std::er
     }
 
     // One session; deltas render live from its event topic.
-    let started = host.call_verb(&model::START, Payload::of(&start_args(&root, &resume)?)?)?;
+    let started = host.call_verb(
+        &model::START,
+        None,
+        Payload::of(&start_args(&root, &resume)?)?,
+    )?;
     let sid = started.parse::<model::StartReply>()?.session;
     *current.lock().unwrap() = Some(sid.clone());
     let (_sub, rx) = host.subscribe_local(&sid.topic());
@@ -351,7 +370,7 @@ pub fn run(root: &str, repl: bool, resume: Resume) -> Result<(), Box<dyn std::er
         })?;
         // `send` returns as soon as the turn is accepted; the turn itself is
         // over when a terminal event arrives, however long that takes.
-        match host.call_verb(&model::SEND, args) {
+        match host.call_verb(&model::SEND, None, args) {
             Ok(_) => {
                 busy.store(true, Ordering::SeqCst);
                 let _ = done_rx.recv();
@@ -363,7 +382,7 @@ pub fn run(root: &str, repl: bool, resume: Resume) -> Result<(), Box<dyn std::er
     if let Ok(end) = Payload::of(&model::EndArgs {
         session: sid.clone(),
     }) {
-        let _ = host.call_verb(&model::END, end);
+        let _ = host.call_verb(&model::END, None, end);
     }
     host.shutdown_all();
     Ok(())
@@ -410,7 +429,7 @@ fn spawn_signal_handler(
                 if let Some(session) = session {
                     eprintln!("\n[chat] cancelling — interrupt again to quit");
                     if let Ok(p) = Payload::of(&model::CancelArgs { session }) {
-                        let _ = rt.host.call_verb(&model::CANCEL, p);
+                        let _ = rt.host.call_verb(&model::CANCEL, None, p);
                     }
                     continue;
                 }
@@ -531,6 +550,8 @@ impl Desired {
         h.update(self.spec.bundle.as_deref().unwrap_or("").as_bytes());
         // Config is part of what the plugin *is*: change it and the next
         // reload re-plugs this one and nothing else.
+        h.update(b"\0n");
+        h.update(self.spec.name.as_deref().unwrap_or("").as_bytes());
         h.update(b"\0c");
         h.update(
             self.spec
@@ -591,6 +612,7 @@ fn configured(root: &Path, exe: &Path) -> Vec<Desired> {
             spec: LaunchSpec {
                 artifact: p.artifact.clone(),
                 bin: p.bin.as_deref().map(|b| resolve_bin(exe, b)),
+                name: p.name.clone(),
                 bundle: p.bundle.clone(),
                 config: p
                     .config
@@ -616,7 +638,7 @@ fn configured(root: &Path, exe: &Path) -> Vec<Desired> {
 /// says whether something already provides it.
 ///
 /// Defaults rather than fixtures: one is started only if nothing listed
-/// answers for its family. So replacing the model driver is listing another
+/// answers for its driver. So replacing the model driver is listing another
 /// in `chat.json` — this front end addresses it by verb and has no way to
 /// tell whose implementation it got, which is the property that makes any
 /// plugin replaceable at all.
@@ -709,8 +731,8 @@ fn converge(
     // the same name, and the route table refuses a duplicate. A standard
     // plugin keeps its fingerprint across reloads, so it is left alone —
     // which is also the limit: listing a replacement for one that is already
-    // running takes a restart, because the running one still holds the family
-    // when the replacement tries to claim it.
+    // running takes a restart, because the standard one keeps running beside
+    // it as a second instance, and this REPL refuses to choose between two.
     let stale: Vec<String> = state
         .running
         .keys()
@@ -723,7 +745,7 @@ fn converge(
             // Stopping revokes what that plugin *held* — a capability belongs
             // to a running plugin, not to a name — so forget having granted
             // it and the loop below will grant it again to the one that comes
-            // back. What *others* hold about its family is untouched and
+            // back. What *others* hold about its driver is untouched and
             // needs no re-minting: it goes inert with the route and means
             // something again when the route returns.
             let subject = name.subject();
@@ -734,26 +756,27 @@ fn converge(
         }
     }
     // What is listed comes first and decides; the standard pair fills in
-    // whichever family is still unanswered. Judged by claim rather than by
-    // route, because a listed driver waiting on the grant minted below has
-    // still spoken for its family.
+    // whichever driver is still unanswered. Judged by what is declared rather
+    // than by what is routed, because a listed driver waiting on the grant
+    // minted below has declared its verbs all the same.
     for (fp, d) in &listed {
         if !state.running.contains_key(fp) {
             start(host, state, fp, d, &mut failures);
         }
     }
     for (probe, fp, d) in &standard {
-        if !state.running.contains_key(fp) && host.answerer_of(probe).is_none() {
+        if !state.running.contains_key(fp) && host.answerers_of(probe).is_empty() {
             start(host, state, fp, d, &mut failures);
         }
     }
 
-    // Grants. The model driver — whichever one — always gets egress: its LLM
-    // calls go through the broker, and it holds no key and no network of its
-    // own.
-    let Some(model_driver) = host.answerer_of(&model::START) else {
+    // Grants. Every model driver — whichever, and however many — gets
+    // egress: its LLM calls go through the broker, and it holds no key and no
+    // network of its own.
+    let model_drivers = host.answerers_of(&model::START);
+    if model_drivers.is_empty() {
         return failures;
-    };
+    }
     let mut mint = |subject: String, resource: &str, verbs: BTreeSet<String>| {
         let key = format!(
             "{subject}|{resource}|{}",
@@ -770,17 +793,24 @@ fn converge(
             Err(e) => eprintln!("[chat] grant {subject} → {resource} failed: {e}"),
         }
     };
-    mint(
-        model_driver.subject(),
-        "driver:egress",
-        BTreeSet::from([
-            egress::HTTP.short().to_string(),
-            egress::HTTP_STREAM.short().to_string(),
-        ]),
-    );
+    for driver in &model_drivers {
+        mint(
+            driver.subject(),
+            "driver:egress",
+            BTreeSet::from([
+                egress::HTTP.short().to_string(),
+                egress::HTTP_STREAM.short().to_string(),
+            ]),
+        );
+    }
     for g in &load_chat_config(root).grants {
-        let subject = g.subject.clone().unwrap_or_else(|| model_driver.subject());
-        mint(subject, &g.resource, g.verbs.clone());
+        let subjects: Vec<String> = match &g.subject {
+            Some(s) => vec![s.clone()],
+            None => model_drivers.iter().map(|d| d.subject()).collect(),
+        };
+        for subject in subjects {
+            mint(subject, &g.resource, g.verbs.clone());
+        }
     }
     // Grants are half of whether a plugin can work, and they land after the
     // plugins do; without this a driver that was only ever waiting on a

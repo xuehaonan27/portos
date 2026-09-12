@@ -1,6 +1,6 @@
 //! A model driver that answers with what it was told.
 //!
-//! The second implementation of the `model::*` family, and it exists to keep
+//! The second implementation of the `model::*` driver, and it exists to keep
 //! the first one honest: whoever drives a model driver addresses it by verb
 //! and cannot tell whose implementation answered, so `portos chat` runs
 //! against this one in `cli/tests/chat.rs` exactly as it runs against

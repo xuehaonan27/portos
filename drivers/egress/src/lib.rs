@@ -1,7 +1,7 @@
-//! The `egress::*` family interface.
+//! The `egress::*` driver interface.
 //!
-//! A driver family interface is the contract between whoever implements a
-//! family and whoever calls it — here, the trusted egress broker and any
+//! A driver interface is the contract between whoever implements a
+//! driver and whoever calls it — here, the trusted egress broker and any
 //! plugin that needs the outside world. It lives outside the kernel because
 //! the kernel must not know what "egress" means; it lives outside both
 //! implementations because a wire contract copied into two crates is a
@@ -70,7 +70,7 @@ impl EgressRequest {
     }
 }
 
-/// The methods this family forwards. Accepted in any case, since callers
+/// The methods this driver forwards. Accepted in any case, since callers
 /// write both `POST` and `post`; recorded in one.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "UPPERCASE")]

@@ -108,6 +108,23 @@ impl KernelClient {
         self.request(&ClientOp::Invoke(wire::Invoke {
             verb: verb.clone(),
             args,
+            at: None,
+        }))
+    }
+
+    /// Invoke a verb on a named instance. Needed exactly when more than one
+    /// instance answers the verb — two browsers — and the kernel refuses to
+    /// choose; with one, `invoke` is enough.
+    pub fn invoke_at(
+        &self,
+        at: &PluginName,
+        verb: &Verb,
+        args: Payload,
+    ) -> Result<Payload, PluginError> {
+        self.request(&ClientOp::Invoke(wire::Invoke {
+            verb: verb.clone(),
+            args,
+            at: Some(at.clone()),
         }))
     }
 
@@ -226,7 +243,9 @@ impl KernelClient {
 /// know about. Neither mistake is visible at compile time, and both were
 /// possible in every driver.
 pub struct Plugin<'a> {
-    pub name: &'a str,
+    /// What this instance is called. The plugin's own default; the launcher
+    /// overrides it (`PORTOS_PLUGIN_NAME`) when it runs more than one.
+    pub name: String,
     /// Shared with the [`Registrar`] handed to `on_ready`, because a plugin
     /// that mirrors somebody else only learns what it answers once it is
     /// running — and the serve loop is dispatching out of this at the time.
@@ -306,11 +325,11 @@ struct Entry {
 
 /// This plugin's implementation of the `router` driver: the verbs it answers.
 ///
-/// It satisfies the one-answerer-per-family law by construction — every verb
-/// here is answered by this plugin — so nothing enforces it. What it does
-/// enforce is the law that was quietly broken before: a name claimed twice
-/// used to be found by `find`, which silently took the first and left the
-/// second unreachable with no complaint from anyone.
+/// One handler per verb, because nothing outside this process can name a
+/// handler and a second one could never be reached. That also enforces the
+/// law that was quietly broken before: a name claimed twice used to be found
+/// by `find`, which silently took the first and left the second unreachable
+/// with no complaint from anyone.
 #[derive(Default)]
 pub struct VerbTable {
     routes: BTreeMap<Verb, Entry>,
@@ -319,13 +338,28 @@ pub struct VerbTable {
 impl portos_router::Router for VerbTable {
     type Target = HandlerId;
 
-    fn resolve(&self, verb: &Verb) -> Option<portos_router::Resolved<'_, HandlerId>> {
-        self.routes.get(verb).map(|e| portos_router::Resolved {
+    fn resolve(
+        &self,
+        verb: &Verb,
+        at: Option<&HandlerId>,
+    ) -> Result<portos_router::Resolved<'_, HandlerId>, portos_router::Miss> {
+        let e = self.routes.get(verb).ok_or(portos_router::Miss::NoRoute)?;
+        if at.is_some_and(|id| id != &e.handler) {
+            return Err(portos_router::Miss::NoRoute);
+        }
+        Ok(portos_router::Resolved {
             target: &e.handler,
             // A plugin's verbs are its own; nothing here crosses a boundary
             // that would call them something else.
             name: verb.clone(),
         })
+    }
+
+    fn answerers(&self, verb: &Verb) -> Vec<(&HandlerId, &ToolMeta)> {
+        self.routes
+            .get(verb)
+            .map(|e| vec![(&e.handler, &e.meta)])
+            .unwrap_or_default()
     }
 
     fn add(
@@ -334,8 +368,10 @@ impl portos_router::Router for VerbTable {
         target: HandlerId,
         meta: ToolMeta,
     ) -> Result<(), portos_router::Conflict> {
+        // One handler per verb: nobody can name a handler from outside, so
+        // a second one could never be reached.
         if self.routes.contains_key(&verb) {
-            return Err(portos_router::Conflict::Verb(verb));
+            return Err(portos_router::Conflict(verb));
         }
         self.routes.insert(
             verb,
@@ -345,10 +381,6 @@ impl portos_router::Router for VerbTable {
             },
         );
         Ok(())
-    }
-
-    fn meta(&self, verb: &Verb) -> Option<&ToolMeta> {
-        self.routes.get(verb).map(|e| &e.meta)
     }
 
     fn remove_where(&mut self, f: &dyn Fn(&Verb, &HandlerId) -> bool) -> usize {
@@ -363,9 +395,9 @@ impl portos_router::Router for VerbTable {
 }
 
 impl<'a> Plugin<'a> {
-    pub fn new(name: &'a str) -> Plugin<'a> {
+    pub fn new(name: impl Into<String>) -> Plugin<'a> {
         Plugin {
-            name,
+            name: name.into(),
             inner: Arc::new(Mutex::new(Served::default())),
             needs: Vec::new(),
             on_ready: None,
@@ -464,13 +496,13 @@ impl<'a> Plugin<'a> {
             .verbs()
             .into_iter()
             .filter_map(|v| {
-                let meta = inner.table.meta(&v)?;
+                let (_, meta) = inner.table.answerers(&v).into_iter().next()?;
                 (meta != &ToolMeta::default()).then(|| (v, meta.clone()))
             })
             .collect();
         Ok(HelloFrame {
             hello: Hello {
-                name: PluginName::parse(self.name)?,
+                name: PluginName::parse(&self.name)?,
                 abi: ABI_VERSION.to_string(),
                 role,
                 token: token.to_string(),
@@ -497,12 +529,12 @@ impl<'a> Plugin<'a> {
     fn dispatch(&mut self, verb: &Verb, args: &Payload, client: &Arc<KernelClient>) -> CallResult {
         // Resolve, then reach — the handler is found by the name the table
         // gave back, not by the one that came in.
-        let Some(id) = self
+        let Ok(id) = self
             .inner
             .lock()
             .unwrap()
             .table
-            .resolve(verb)
+            .resolve(verb, None)
             .map(|r| *r.target)
         else {
             // Unreachable through the kernel, which only routes what the
@@ -534,6 +566,12 @@ where
         std::io::Error::new(std::io::ErrorKind::NotFound, "PORTOS_PLUGIN_SOCK unset")
     })?;
     let token = std::env::var("PORTOS_PLUGIN_TOKEN").unwrap_or_default();
+    // The launcher's name for this instance wins over the plugin's own: two
+    // instances of one driver need two names, and only the launcher knows
+    // there are two.
+    if let Ok(name) = std::env::var("PORTOS_PLUGIN_NAME") {
+        plugin.name = name;
+    }
     let hello_for = |role| plugin.hello(role, &token).map_err(std::io::Error::other);
 
     let serve_stream = UnixStream::connect(&sock)?;

@@ -190,6 +190,10 @@ pub struct Grant {
     pub schema: Payload,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub counts_left: Option<u64>,
+    /// The instances answering this verb right now. A caller shown more
+    /// than one has a choice to make, and has to be told so.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub instances: Vec<PluginName>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -229,6 +233,10 @@ pub struct Invoke {
     pub verb: Verb,
     #[serde(default)]
     pub args: Payload,
+    /// Which instance, when the caller knows. A verb with one answerer
+    /// needs no name; one with several is not routed without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<PluginName>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -356,6 +364,9 @@ impl Serialize for ClientOp {
             ClientOp::Invoke(v) => {
                 m.serialize_entry("verb", &v.verb)?;
                 m.serialize_entry("args", &v.args)?;
+                if let Some(at) = &v.at {
+                    m.serialize_entry("at", at)?;
+                }
             }
             ClientOp::Grants => {}
             ClientOp::Emit(v) => {
@@ -487,6 +498,7 @@ mod tests {
             ClientOp::Invoke(Invoke {
                 verb: verb("browser::open"),
                 args: Payload::of(&serde_json::json!({"url": "https://example.com"})).unwrap(),
+                at: Some(PluginName::parse("portos-browser").unwrap()),
             }),
             ClientOp::Grants,
             ClientOp::Emit(Emit {
@@ -549,7 +561,7 @@ mod tests {
         let ClientOp::Invoke(inv) = op else {
             panic!("expected invoke")
         };
-        assert_eq!(inv.verb.family(), "browser");
+        assert_eq!(inv.verb.driver(), "browser");
         assert_eq!(inv.args.as_raw(), r#"{"url":"x"}"#);
 
         // The JS driver sends `labels: null` when a page has no origin.

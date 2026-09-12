@@ -51,8 +51,8 @@ fn setup(tag: &str) -> (Arc<Kernel>, Host, PathBuf) {
     (kernel, host, root)
 }
 
-fn spawn_echo(host: &Host, family: &str) -> portos_abi::ids::PluginName {
-    host.spawn(Path::new(ECHO_BIN), &[], &[("PORTOS_ECHO_FAMILY", family)])
+fn spawn_echo(host: &Host, driver: &str) -> portos_abi::ids::PluginName {
+    host.spawn(Path::new(ECHO_BIN), &[], &[("PORTOS_ECHO_DRIVER", driver)])
         .unwrap()
 }
 
@@ -405,7 +405,7 @@ fn teardown_collects_a_plugin_s_grandchildren() {
         Path::new(ECHO_BIN),
         &[],
         &[
-            ("PORTOS_ECHO_FAMILY", "echo"),
+            ("PORTOS_ECHO_DRIVER", "echo"),
             ("PORTOS_ECHO_GRANDCHILD", pid_file.to_str().unwrap()),
         ],
     )

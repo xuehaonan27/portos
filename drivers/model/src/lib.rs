@@ -1,4 +1,4 @@
-//! The `model::*` family interface.
+//! The `model::*` driver interface.
 //!
 //! The contract between a model driver and whoever drives it: how a session
 //! is opened, fed and closed, and what a session publishes while a turn is

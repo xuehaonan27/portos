@@ -32,13 +32,13 @@
 //! stay opaque: this module moves [`Payload`] bytes and has no way to read a
 //! field out of them, which makes domain ignorance structural rather than a
 //! rule to remember. The capability convention for invoke is subject
-//! `plugin:<name>`, resource `driver:<family>`, verb the short name.
+//! `plugin:<name>`, resource `driver:<driver>`, verb the short name.
 //!
 //! Known limitation: the invoke graph must be acyclic. A cycle (A invokes B
 //! while B's serve loop is blocked invoking A) deadlocks; current flows
 //! (cli → model driver → {broker, browser}) are acyclic by construction.
 
-use crate::routes::{Answerer, Builtin, RouteTable};
+use crate::routes::{Answerer, RouteTable};
 use crate::{Kernel, KernelError};
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
@@ -50,7 +50,7 @@ use portos_abi::wire::{
     ToolMeta, UnsubscribeReply,
 };
 use portos_abi::{ABI_VERSION, chunk, frame};
-use portos_router::Router as _;
+use portos_router::{Miss, Router as _};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -113,6 +113,16 @@ pub struct LaunchSpec {
     pub config: Option<Payload>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// The identifier this instance runs under.
+    ///
+    /// Two instances of one driver — two browsers — need two, and the
+    /// launcher is the one who knows there are two, so it names them; what a
+    /// plugin calls itself is only the name it gets when nobody says
+    /// otherwise. A plugin that was named and answers to something else is
+    /// refused: a launcher that cannot trust the name it gave cannot address
+    /// what it started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// Minted once the plugin is up and has declared its name.
     #[serde(default)]
     pub grants: Vec<GrantSpec>,
@@ -350,18 +360,50 @@ impl Host {
         list_plugins(&self.kernel, &self.inner)
     }
 
-    /// Which plugin has spoken for this verb, whether or not it is answering
-    /// yet.
+    /// Every running instance that answers this verb — routed, or still
+    /// waiting on a grant or a dependency, because a plugin that is waiting
+    /// is exactly the one a front end is about to grant something to.
     ///
-    /// The claim rather than the route, on purpose: a plugin still waiting
-    /// on a grant is exactly the one a front end is about to grant something
-    /// to, and it owns its names while it waits. This is how anything
-    /// outside the kernel finds "the model driver" — by what it answers,
-    /// never by what it is called — which is what lets one be replaced.
-    pub fn answerer_of(&self, verb: &Verb) -> Option<PluginName> {
-        match self.inner.routes.lock().unwrap().claimed_by(verb) {
-            Some(Answerer::Plugin(name)) => Some(name.clone()),
-            _ => None,
+    /// This is how anything outside the kernel finds "the model driver": by
+    /// what it answers, never by what it is called. That is what lets one be
+    /// replaced, and what lets there be two.
+    pub fn answerers_of(&self, verb: &Verb) -> Vec<PluginName> {
+        self.inner
+            .plugins
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, h)| h.declared.lock().unwrap().verbs.contains(verb))
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
+}
+
+/// Resolve a verb to who answers it and what they call it, turning a miss
+/// into the error a caller can act on: nobody, or several and none named.
+fn route(
+    inner: &Arc<HostInner>,
+    verb: &Verb,
+    at: Option<&PluginName>,
+) -> Result<(Answerer, Verb), KernelError> {
+    let routes = inner.routes.lock().unwrap();
+    let who = at.map(Answerer::named);
+    match routes.resolve(verb, who.as_ref()) {
+        Ok(r) => Ok((r.target.clone(), r.name)),
+        Err(Miss::NoRoute) => Err(KernelError::NotFound(match at {
+            Some(at) => format!("no route for verb: {verb} at {at}"),
+            None => format!("no route for verb: {verb}"),
+        })),
+        Err(Miss::Ambiguous) => {
+            let names: Vec<String> = routes
+                .answerers(verb)
+                .into_iter()
+                .map(|(a, _)| a.id().to_string())
+                .collect();
+            Err(KernelError::Ambiguous(format!(
+                "{verb} is answered by {}; name one",
+                names.join(", ")
+            )))
         }
     }
 }
@@ -592,6 +634,9 @@ fn spawn_process(
     if let Some(config) = &spec.config {
         cmd.env("PORTOS_PLUGIN_CONFIG", config.as_raw());
     }
+    if let Some(name) = &spec.name {
+        cmd.env("PORTOS_PLUGIN_NAME", name);
+    }
     for (k, v) in &spec.env {
         cmd.env(k, v);
     }
@@ -683,20 +728,21 @@ fn spawn_process(
     // Register verbs; a route conflict aborts the spawn.
     {
         let mut plugins = inner.plugins.lock().unwrap();
-        let mut routes = inner.routes.lock().unwrap();
-        if plugins.contains_key(&name) {
+        // The kernel is not in this map, but it took its name first like
+        // anything else does.
+        if plugins.contains_key(&name) || name.as_str() == crate::routes::KERNEL {
             let _ = child.kill();
             return Err(KernelError::Denied(format!("plugin name taken: {name}")));
         }
-
-        // Names are claimed here even though the routes may not go in yet: a
-        // plugin merely waiting for a dependency still owns its names, or a
-        // second plugin could take them while it waits and the first would
-        // never get to become usable. `claim` is where the laws are enforced
-        // — the only place, so there is no second place to get them wrong.
-        if let Err(conflict) = routes.claim(&verbs, &Answerer::Plugin(name.clone())) {
-            let _ = child.kill();
-            return Err(KernelError::Denied(conflict.to_string()));
+        // A launcher that named this instance must get the name it gave, or
+        // it cannot address what it started.
+        if let Some(wanted) = &spec.name {
+            if wanted != name.as_str() {
+                let _ = child.kill();
+                return Err(KernelError::Denied(format!(
+                    "launched as {wanted} but it calls itself {name}"
+                )));
+            }
         }
 
         let (events_tx, events_rx) = sync_channel::<ServeMsg>(EVENT_QUEUE);
@@ -756,15 +802,20 @@ impl Host {
         call_on(&handle, verb, args)
     }
 
-    /// Kernel-initiated call routed by verb.
-    pub fn call_verb(&self, verb: &Verb, args: Payload) -> Result<Payload, KernelError> {
-        let target = match self.inner.routes.lock().unwrap().resolve(verb) {
-            Some(r) => r.target.clone(),
-            None => return Err(KernelError::NotFound(format!("no route for verb: {verb}"))),
-        };
+    /// Kernel-initiated call routed by verb. `at` names the instance when
+    /// the caller knows which one it wants; with one instance it need not.
+    pub fn call_verb(
+        &self,
+        verb: &Verb,
+        at: Option<&PluginName>,
+        args: Payload,
+    ) -> Result<Payload, KernelError> {
+        let (target, name_there) = route(&self.inner, verb, at)?;
         match target {
-            Answerer::Plugin(name) => self.call(&name, verb, args),
-            Answerer::Builtin(b) => reply_of(builtin_verb(&self.kernel, &self.inner, b, args)?),
+            Answerer::Plugin(name) => self.call(&name, &name_there, args),
+            Answerer::Kernel => {
+                reply_of(builtin_verb(&self.kernel, &self.inner, &name_there, args)?)
+            }
         }
     }
 
@@ -870,10 +921,6 @@ fn shutdown_on(kernel: &Arc<Kernel>, inner: &Arc<HostInner>, plugin: &PluginName
     // `setsid` is no longer in the group and has been ignoring every signal
     // above. `cgroup.kill` has no such gap. Removing the directory is the
     // proof it worked — `rmdir` refuses a cgroup that still holds anything.
-    {
-        let mut routes = inner.routes.lock().unwrap();
-        routes.release(&Answerer::Plugin(plugin.clone()));
-    }
     // Its routes are gone; whoever needed them is no longer usable either.
     settle(kernel, inner);
     if let Some(cg) = &h.cgroup {
@@ -1082,7 +1129,7 @@ fn settle(kernel: &Arc<Kernel>, inner: &Arc<HostInner>) {
             // surface mid-turn instead of at startup.
             let subject = name.subject();
             let ready = declared.needs.iter().all(|need| {
-                routes.meta(need).is_some()
+                !routes.answerers(need).is_empty()
                     && kernel.caps.allows(
                         &subject,
                         &need.resource(),
@@ -1102,13 +1149,14 @@ fn settle(kernel: &Arc<Kernel>, inner: &Arc<HostInner>) {
                     }
                     let meta = declared.tools.get(v).cloned().unwrap_or_default();
                     if let Err(conflict) = routes.add(v.clone(), who.clone(), meta) {
-                        // Claimed before it got here, so this cannot happen;
-                        // if it does, the claim and the table have drifted.
+                        // Only a verb this plugin already answers is refused,
+                        // and the SDK never declares one twice; if it does,
+                        // the declaration and the table have drifted.
                         eprintln!("[kernel] {name}: {conflict}");
                     }
                 }
             } else {
-                routes.remove_where(&|_, a| a.same_as(&who));
+                routes.remove_where(&|_, a| a == &who);
             }
 
             // Progress is what the table *did*, not what we meant it to do.
@@ -1138,7 +1186,7 @@ fn unmet(
         .needs
         .iter()
         .filter(|need| {
-            routes.meta(need).is_none()
+            routes.answerers(need).is_empty()
                 || !kernel.caps.allows(
                     &subject,
                     &need.resource(),
@@ -1227,18 +1275,9 @@ fn handle_client_op(
             }));
             // No branch for the kernel's own verbs: they are rows, and
             // resolution finds them the way it finds anything else.
-            let resolved = {
-                let routes = inner.routes.lock().unwrap();
-                match routes.resolve(&verb) {
-                    Some(r) => (r.target.clone(), r.name),
-                    None => {
-                        return Err(KernelError::NotFound(format!("no route for verb: {verb}")));
-                    }
-                }
-            };
-            let (target, name_there) = resolved;
+            let (target, name_there) = route(inner, &verb, req.at.as_ref())?;
             match target {
-                Answerer::Builtin(b) => builtin_verb(kernel, inner, b, req.args),
+                Answerer::Kernel => builtin_verb(kernel, inner, &name_there, req.args),
                 Answerer::Plugin(plugin) => {
                     let handle = inner
                         .plugins
@@ -1262,7 +1301,14 @@ fn handle_client_op(
             // One table. What the kernel answers itself is in it like
             // anything else, so there is nothing to look in first.
             let grants = kernel.caps.grants_for(&subject, now, |verb| {
-                inner.routes.lock().unwrap().meta(verb).cloned()
+                inner
+                    .routes
+                    .lock()
+                    .unwrap()
+                    .answerers(verb)
+                    .into_iter()
+                    .map(|(a, m)| (a.id(), m.clone()))
+                    .collect()
             })?;
             ok(&GrantsReply { grants })
         }
@@ -1324,14 +1370,7 @@ fn handle_client_op(
         // until it has asked them, and asking requires being up. So the
         // hello is the ordinary way to declare verbs, not the only one.
         ClientOp::Claim(req) => {
-            let who = Answerer::Plugin(name.clone());
             let verbs: Vec<Verb> = req.tools.keys().cloned().collect();
-            {
-                let mut routes = inner.routes.lock().unwrap();
-                routes
-                    .claim(&verbs, &who)
-                    .map_err(|c| KernelError::Denied(format!("{name} cannot take {c}")))?;
-            }
             if let Some(handle) = inner.plugins.lock().unwrap().get(name) {
                 let mut declared = handle.declared.lock().unwrap();
                 for (v, meta) in req.tools {
@@ -1442,11 +1481,11 @@ struct PluginsReply {
 fn builtin_verb(
     kernel: &Arc<Kernel>,
     inner: &Arc<HostInner>,
-    which: Builtin,
+    verb: &Verb,
     args: Payload,
 ) -> Result<Option<Vec<u8>>, KernelError> {
-    match which {
-        Builtin::Spawn => {
+    match verb.short() {
+        "spawn" => {
             let spec: LaunchSpec = args
                 .parse()
                 .map_err(|e| KernelError::Corrupt(format!("kernel::spawn args: {e}")))?;
@@ -1458,7 +1497,7 @@ fn builtin_verb(
                 .unwrap_or_default();
             ok(&SpawnReply { name, verbs, unmet })
         }
-        Builtin::Stop => {
+        "stop" => {
             let a: StopArgs = args
                 .parse()
                 .map_err(|e| KernelError::Corrupt(format!("kernel::stop args: {e}")))?;
@@ -1466,12 +1505,17 @@ fn builtin_verb(
                 stopped: shutdown_on(kernel, inner, &a.name),
             })
         }
-        Builtin::Plugins => ok(&PluginsReply {
+        "plugins" => ok(&PluginsReply {
             plugins: list_plugins(kernel, inner)
                 .into_iter()
                 .map(|(name, verbs, unmet)| PluginInfo { name, verbs, unmet })
                 .collect(),
         }),
+        // Routed here, so the table says the kernel answers it; a verb it
+        // does not know is the table and this list having drifted.
+        _ => Err(KernelError::Corrupt(format!(
+            "the kernel does not answer {verb}"
+        ))),
     }
 }
 
@@ -1484,10 +1528,12 @@ fn reply_of(encoded: Option<Vec<u8>>) -> Result<Payload, KernelError> {
     reply.into_result().map_err(KernelError::Denied)
 }
 
-/// The kernel's own verbs, as rows. Registered before any plugin exists,
-/// which is the whole of what "reserved" means here — and their descriptions
-/// live here rather than in a second table, because a second table keyed by
-/// verb is the mistake this whole change is about.
+/// The kernel's own verbs, as rows answered by the instance named `kernel`.
+/// Nothing is reserved: a plugin may answer `kernel::spawn` as well — a
+/// launcher for a form the kernel does not know — and callers then name
+/// which of the two they mean. The descriptions live here rather than in a
+/// second table, because a second table keyed by verb is the mistake this
+/// whole change is about.
 fn builtin_routes() -> RouteTable {
     let tool = |verb: &str, description: &str, schema: serde_json::Value| {
         (
@@ -1556,16 +1602,12 @@ fn builtin_routes() -> RouteTable {
     ]);
 
     let mut table = RouteTable::default();
-    for (verb, which) in [
-        ("kernel::spawn", Builtin::Spawn),
-        ("kernel::stop", Builtin::Stop),
-        ("kernel::plugins", Builtin::Plugins),
-    ] {
+    for verb in ["kernel::spawn", "kernel::stop", "kernel::plugins"] {
         let verb = Verb::parse(verb).expect("constant verb");
         let meta = described.get(&verb).cloned().unwrap_or_default();
         table
-            .add(verb, Answerer::Builtin(which), meta)
-            .expect("the kernel registers first");
+            .add(verb, Answerer::Kernel, meta)
+            .expect("each kernel verb is registered once");
     }
     table
 }

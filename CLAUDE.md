@@ -150,8 +150,8 @@ theoretical elegance is not. Current state and build order live in
   alone. A plugin never learns which runtime form it got, and must not have
   to.
 - **Driver model.** The kernel does not know what a "browser" is. It knows
-  processes, `family::verb` strings, capabilities, handles and events. All
-  domain knowledge lives in plugins; a driver family interface is defined
+  processes, `driver::verb` strings, capabilities, handles and events. All
+  domain knowledge lives in plugins; a driver interface is defined
   outside the kernel. This is where extensibility comes from — adding a new
   kind of plugin must never require a new kernel mechanism.
 - **Types at the boundary, opacity inside.** A frame's envelope is a typed
@@ -195,7 +195,7 @@ theoretical elegance is not. Current state and build order live in
   without learning a domain: `bare` (a child process leading its own group)
   and `cgroup` (that child inside a cgroup of its own, the default).
   Containers and microVMs belong on this axis too, as drivers — a form is a
-  verb family, so the route table is the launcher registry and no new
+  driver, so the route table is the launcher registry and no new
   mechanism is needed. A cgroup closes the two holes a process group has,
   both measured rather than assumed: a child can leave a process group with
   `setsid` and cannot leave a cgroup, and a killed runtime leaves a *named
@@ -211,10 +211,12 @@ theoretical elegance is not. Current state and build order live in
   the event plane, and `model::cancel` stops it. The consequence to respect:
   every such verb owes its subscribers exactly one terminal event — done,
   cancelled, or failed — or a front end waits forever.
-- **`kernel::` is the kernel's own verb family, and it is reserved.** A
-  plugin declaring it is rejected. `spawn`/`stop`/`plugins` are dispatched
-  internally *after* the same capability check a routed verb gets, and they
-  carry built-in tool metadata, so a caller granted `driver:kernel` sees
+- **`kernel::` is the kernel's own driver, answered by the instance named
+  `kernel`.** Nothing is reserved: a plugin may answer `kernel::spawn` too —
+  a launcher for a form the kernel does not know — and callers then name
+  which. `spawn`/`stop`/`plugins` are rows in the same table as everything
+  else, dispatched *after* the same capability check a routed verb gets,
+  with built-in tool metadata, so a caller granted `driver:kernel` sees
   `kernel__spawn` as an ordinary tool. This is what lets a running system
   gain a capability it did not have: the agent starts a driver mid-session
   and the tool surface, recomputed every turn, shows it on the next one.
@@ -224,7 +226,7 @@ theoretical elegance is not. Current state and build order live in
   process group, capabilities — and `kernel::stop` collects all five. One
   rule makes it work: a capability is held by a *running plugin*, not by a
   name, so stopping revokes what it held, while what others were granted
-  about its family goes inert with the route and returns if it does.
+  about its driver goes inert with the route and returns if it does.
   Artifacts and the audit log survive on purpose: immutable records are not
   state. `plugins/echo/tests/hotplug.rs` asserts the list.
 - **A result the model might not read does not enter its context.** Every
@@ -235,16 +237,17 @@ theoretical elegance is not. Current state and build order live in
   as context discipline too: `shell::run` takes a whole `sh -c` string
   precisely so `… 2>&1 | tail -40` can shrink a log before it is ever
   carried.
-- **Another node is a driver, not a kernel feature.** `plugins/remote`
-  dials a peer's `bridge-http` and re-declares what it finds, renaming the
-  family: `browser::open` on node `mac` is `mac_browser::open` here, and
-  `model::session::s1` arrives as `mac_model::session::s1`. That keeps two
-  nodes' browsers from colliding in a flat route table and makes a grant
-  read honestly. Authority stays split, which is the part worth keeping:
-  the far node decides *what is exposed* (the grants on its bridge, read
-  once at startup), this node decides *who may use it* — and the two
-  failures are distinguishable, since a verb the peer never exposed has no
-  local route at all.
+- **Another node is an instance, not a kernel feature.** `plugins/remote`
+  dials a peer's `bridge-http` and declares what it finds under the same
+  verbs: `browser::open` there is `browser::open` here, answered by the
+  instance `portos-remote-mac`, and a caller with a browser on each node
+  names the one it means. Nothing is renamed — an earlier version prefixed
+  the node onto the driver, which was the instance smuggled into the name.
+  Authority stays split, which is the part worth keeping: the far node
+  decides *what is exposed* (the grants on its bridge, read once at
+  startup), this node decides *who may use it* — and the two failures are
+  distinguishable, since a verb the peer never exposed has no local route
+  at all.
 - **Reload is re-plug.** `SIGHUP` to `portos chat` re-reads the config and
   brings the running set back in line — whatever changed is stopped and
   started again, whatever did not is left alone. There is no second
@@ -258,8 +261,9 @@ theoretical elegance is not. Current state and build order live in
   owes it its capabilities again, since stopping revokes what it *held*.
   Two limits still standing: a grant removed from the file is not revoked
   until restart, and listing a replacement for a standard plugin that is
-  already running takes a restart, because the running one still holds the
-  family when the replacement tries to claim it.
+  already running takes a restart, because the standard one keeps running
+  beside it as a second instance and this REPL refuses to choose between
+  two model drivers.
 - **A conversation outlives the driver that held it.** The transcript is
   written to the CAS after every turn and `modeld/sessions.json` records
   where it went — handles and small facts only, so listing sessions never
@@ -272,16 +276,31 @@ theoretical elegance is not. Current state and build order live in
 - **One decision, one mechanism: routing.** *Given a name, who answers it?*
   was being decided in several places and differently each time, and where
   it did not fit the answer was an `if` before the general path. The
-  `router` driver states the laws — a name has exactly one answerer, a
-  *family* has one answerer (the capability resource is the family, so a
-  split family makes one grant mean two things), resolution yields the name
-  the **target** knows, a miss is an error and never a default — and each
-  implementation keeps its own table and its own idea of what a target is.
-  The kernel's targets are a plugin or itself; the SDK's are its handlers;
-  the model driver's are "here" or "out through the kernel". A target names
-  an answerer; reaching it is a separate step, which is what lets one table
-  route to a process, a function, or something across a link without
-  knowing the difference.
+  `router` driver states the laws, and each implementation keeps its own
+  table and its own idea of what a target is. The kernel's targets are a
+  plugin or itself; the SDK's are its handlers; the model driver's are
+  "here" or "out through the kernel". A target names an answerer; reaching
+  it is a separate step, which is what lets one table route to a process, a
+  function, or something across a link without knowing the difference.
+- **A verb names a driver's verb; which instance answers is routing, not
+  naming.** `browser::open` is what the browser interface calls opening.
+  Any number of instances may answer it — two browsers here, one on
+  another node — and each is a plugin under its own name, given by the
+  launcher (`LaunchSpec.name`, `"name"` in `chat.json`) because only the
+  launcher knows there are two. With one instance the verb alone resolves;
+  with several the caller names one (`invoke_at`, `Invoke.at`, the
+  `instance` argument modeld puts on the tool exactly when there is a
+  choice) and an unnamed call is *ambiguous* — an error listing who could
+  have been named, never a choice made on the caller's behalf. Grants stay
+  on the driver (`driver:browser`): whether you may call it is authority,
+  which one you reach is routing, and a grant reports the instances so a
+  caller knows a choice exists. This replaced "a family has one answerer",
+  which made the name do two jobs, and the second job leaked out as encoded
+  names (`mac_browser::open`) that nothing could parse back. "Family" is
+  gone from the vocabulary with it: the first segment of a verb is the
+  driver. Deliberately not done: events carry no instance, so two nodes'
+  `model::session::s1` are indistinguishable — the trigger is a front end
+  that needs to tell them apart.
 - **A plugin says what it cannot work without; nothing declares an order.**
   `Plugin::needs(&egress::HTTP)` — a `&Verb`, which should be a driver's own
   constant, because a dependency is a statement in some driver's vocabulary
@@ -327,10 +346,12 @@ MCP later is the opposite direction and is fine).
 ## Build and Validate
 
 ```sh
-cargo build --workspace
-cargo test --workspace          # 97 tests; all must pass, zero warnings
-cargo fmt --all
+cargo build --workspace         # first: tests find plugin binaries beside
+cargo test --workspace          # their own, and a package with no tests
+cargo fmt --all                 # (remote) is not rebuilt by `cargo test`
 ```
+
+98 tests; all must pass, zero warnings.
 
 The end-to-end tests are the ones that matter and they are hermetic:
 
@@ -355,7 +376,8 @@ The end-to-end tests are the ones that matter and they are hermetic:
   `.gitignore`, and a timeout that collects only the leader instead of the
   process group.
 - `plugins/echo/tests/hotplug.rs` — a running system gaining and losing
-  a capability, and the residue list after it loses one.
+  a capability, the residue list after it loses one, a plugin waiting for
+  what it needs, and two instances of one driver told apart by name.
 - `plugins/echo/tests/form.rs` — the runtime form, measured against
   its control: a grandchild that leaves the process group with `setsid`
   survives teardown in `bare` form and does not in `cgroup` form, a busy
@@ -365,8 +387,9 @@ The end-to-end tests are the ones that matter and they are hermetic:
   form gets added. Skips with a reason where cgroup v2 is not writable.
 - `plugins/echo/tests/remote.rs` — two nodes in one process, sharing
   nothing but a loopback socket: the far node's verbs arriving as ordinary
-  local ones, the two grant tables that each get a say, and the fact that an
-  ephemeral ref crosses untranslated while a handle cannot.
+  local ones, a driver on each node being two instances that a call tells
+  apart by name, the two grant tables that each get a say, and the fact that
+  an ephemeral ref crosses untranslated while a handle cannot.
 - `plugins/echo/tests/bridge.rs` — the extensibility claim itself: a
   plugin carrying the event plane and the invoke path over HTTP, written
   against the published ABI with no kernel change. If a change here starts
@@ -408,14 +431,14 @@ walking skeleton test is what proves the wiring.
   Links the kernel as a library; daemonization is deferred to W4.
   `chat --resume [id]` continues a stored conversation; `SIGHUP` reloads.
   The standard broker and model driver are defaults, started only for a
-  family nothing in `chat.json` answers; the front end finds the model
+  driver nothing in `chat.json` answers; the front end finds the model
   driver by asking who answers `model::start`, never by name.
 - `drivers`: interfaces that regulate a class of behaviour, depended on by
   implementations and callers alike so a shape is never written twice.
   `egress`, `model`, `router`. **These never run.** A new plugin that needs a
   new interface adds a driver here and becomes its first implementation.
 
-  The kernel must not know that a *domain* family exists — `egress`, `model`
+  The kernel must not know that a *domain* driver exists — `egress`, `model`
   and whatever comes next are none of its business, and that is where
   extensibility comes from. But a driver is not always a domain: `router` is
   the interface for resolving a name to something you can reach, and the

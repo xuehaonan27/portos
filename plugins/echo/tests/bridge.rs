@@ -167,7 +167,7 @@ fn bridge_carries_the_event_plane_and_the_invoke_path() {
     let (kernel, host, root) = setup("plane");
 
     let echo = host
-        .spawn(Path::new(ECHO_BIN), &[], &[("PORTOS_ECHO_FAMILY", "echo")])
+        .spawn(Path::new(ECHO_BIN), &[], &[("PORTOS_ECHO_DRIVER", "echo")])
         .unwrap();
 
     let port_file = root.join("port");

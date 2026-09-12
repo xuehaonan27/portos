@@ -42,13 +42,13 @@ fn setup(tag: &str) -> (Arc<Kernel>, Host, PathBuf) {
 /// An echo driver whose grandchild deliberately leaves the process group.
 fn spawn_with_escaping_grandchild(
     host: &Host,
-    family: &str,
+    driver: &str,
     pidfile: &Path,
     form: Form,
 ) -> PluginName {
     host.spawn_spec(&LaunchSpec {
         env: [
-            ("PORTOS_ECHO_FAMILY".to_string(), family.to_string()),
+            ("PORTOS_ECHO_DRIVER".to_string(), driver.to_string()),
             (
                 "PORTOS_ECHO_GRANDCHILD".to_string(),
                 pidfile.to_string_lossy().into_owned(),
@@ -151,7 +151,7 @@ fn a_plugin_can_be_named_by_what_it_is_instead_of_where_it_is() {
     let before = std::fs::metadata(&copy).unwrap().modified().unwrap();
     let second = host
         .spawn_spec(&LaunchSpec {
-            env: [("PORTOS_ECHO_FAMILY".to_string(), "echotwo".to_string())]
+            env: [("PORTOS_ECHO_DRIVER".to_string(), "echotwo".to_string())]
                 .into_iter()
                 .collect(),
             ..LaunchSpec::from_artifact(meta.id.clone())
@@ -264,7 +264,7 @@ fn a_plugin_of_several_files_travels_as_one_bundle() {
         .unwrap();
     let second = host
         .spawn_spec(&LaunchSpec {
-            env: [("PORTOS_ECHO_FAMILY".to_string(), "echobun".to_string())]
+            env: [("PORTOS_ECHO_DRIVER".to_string(), "echobun".to_string())]
                 .into_iter()
                 .collect(),
             ..LaunchSpec::from_bundle(meta.id.clone(), "bin/portos-echo")
@@ -298,7 +298,7 @@ fn the_same_plugin_behaves_identically_under_every_form() {
     if cgroups_or_skip().is_none() {
         return;
     }
-    // Separate kernels so both can use the same plugin name and family, and
+    // Separate kernels so both can use the same plugin name and driver, and
     // the results are comparable down to the artifact ids.
     let (_kb, bare_host, bare_root) = setup("same-bare");
     let (_kc, cg_host, cg_root) = setup("same-cgroup");

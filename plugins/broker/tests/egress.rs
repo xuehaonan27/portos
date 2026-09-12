@@ -380,7 +380,7 @@ fn plugin_invoke_reaches_broker_capability_gated() {
     );
     assert_eq!(broker.as_str(), "portos-broker");
     let caller = host
-        .spawn(&echo_bin, &[], &[("PORTOS_ECHO_FAMILY", "echoa")])
+        .spawn(&echo_bin, &[], &[("PORTOS_ECHO_DRIVER", "echoa")])
         .unwrap();
 
     // Granted: egress::http. Not granted: egress::http_stream.

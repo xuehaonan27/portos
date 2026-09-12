@@ -1,8 +1,8 @@
 //! portos-modeld: the model driver — the LLM as a peripheral,
 //! provider-neutral by construction.
 //!
-//! Verb family `model::` — `start` / `send` / `end`, defined by the
-//! `portos-model-api` family interface. A `send` runs the agentic loop: the
+//! Driver `model::` — `start` / `send` / `end`, defined by the
+//! `portos-model-api` driver interface. A `send` runs the agentic loop: the
 //! configured [`backend`](crate::backend) produces turns, tool calls route
 //! through kernel `invoke` (capability-gated there — this plugin holds no
 //! authority of its own, not even network: LLM traffic goes through the
@@ -190,7 +190,7 @@ fn main() -> std::io::Result<()> {
     let config_tools = Arc::new(load_tools(&cfg).map_err(std::io::Error::other)?);
     let introspect = cfg["introspect_tools"].as_bool().unwrap_or(true);
     let exclude: Arc<Vec<String>> = Arc::new(
-        cfg["tool_families_exclude"]
+        cfg["tool_drivers_exclude"]
             .as_array()
             .map(|a| {
                 a.iter()
@@ -421,18 +421,25 @@ impl Turn {
         let invoke = |verb: &Verb, a: Payload| -> Result<Payload, String> {
             let answer = table
                 .borrow()
-                .resolve(verb)
-                .map(|r| *r.target)
+                .resolve(verb, None)
+                .map(|r| r.target.clone())
                 // A miss is an error, not a fall-through to the kernel: a
                 // verb absent from the table is one the model was not
-                // offered, and a family excluded from the surface is now
+                // offered, and a driver excluded from the surface is now
                 // genuinely not offered rather than merely unlisted.
-                .ok_or_else(|| format!("not a tool you have: {verb}"))?;
+                .map_err(|_| format!("not a tool you have: {verb}"))?;
             match answer {
                 tools::Answer::Here(tools::Local::ReadArtifact) => {
                     read_artifact(client, a, self.read_max).map_err(|e| e.to_string())
                 }
-                tools::Answer::Kernel => client.invoke(verb, a).map_err(|e| e.to_string()),
+                tools::Answer::Kernel { instances } => {
+                    let (at, a) = tools::pick_instance(&instances, a)?;
+                    match at {
+                        Some(at) => client.invoke_at(&at, verb, a),
+                        None => client.invoke(verb, a),
+                    }
+                    .map_err(|e| e.to_string())
+                }
             }
         };
         let gw = Gw {

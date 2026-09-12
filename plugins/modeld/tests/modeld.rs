@@ -249,7 +249,7 @@ fn agentic_loop_end_to_end_with_tool_call() {
         &[("PORTOS_BROKER_DIR", broker_dir.to_str().unwrap())],
     )
     .unwrap();
-    host.spawn(&echo_bin, &[], &[("PORTOS_ECHO_FAMILY", "echoa")])
+    host.spawn(&echo_bin, &[], &[("PORTOS_ECHO_DRIVER", "echoa")])
         .unwrap();
 
     // Model driver: anthropic backend pointed at the mock, one tool.
@@ -420,7 +420,7 @@ fn introspected_tools_and_artifact_read() {
         &[("PORTOS_BROKER_DIR", broker_dir.to_str().unwrap())],
     )
     .unwrap();
-    host.spawn(&echo_bin, &[], &[("PORTOS_ECHO_FAMILY", "echoa")])
+    host.spawn(&echo_bin, &[], &[("PORTOS_ECHO_DRIVER", "echoa")])
         .unwrap();
 
     // NOTE: no tools in the config — introspection provides the surface.

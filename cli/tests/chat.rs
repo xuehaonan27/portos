@@ -358,7 +358,7 @@ fn portos_chat_with_renderer_plugin() {
 /// plugin there is: `portos chat` driven by a *different* model driver,
 /// listed in `chat.json` with nothing else changed. The front end addresses
 /// the driver by verb, so it cannot tell — and the standard one is never
-/// started, because something already answers for its family.
+/// started, because something already answers for its driver.
 #[test]
 fn portos_chat_with_another_model_driver() {
     let cli = Path::new(CLI_BIN);
@@ -413,7 +413,7 @@ fn portos_chat_with_another_model_driver() {
     );
     assert!(
         !stdout.contains("started portos-modeld"),
-        "and the standard one was not, because its family was answered:\n{stdout}"
+        "and the standard one was not, because its driver was answered:\n{stdout}"
     );
     assert!(
         stdout.contains("say this back"),
