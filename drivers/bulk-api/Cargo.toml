@@ -1,0 +1,12 @@
+[package]
+name = "portos-bulk-api"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+portos-proto = { path = "../../crates/portos-proto" }
+portos-sdk = { path = "../../crates/portos-sdk" }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

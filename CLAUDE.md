@@ -141,6 +141,14 @@ theoretical elegance is not. Current state and build order live in
   about its family goes inert with the route and returns if it does.
   Artifacts and the audit log survive on purpose: immutable records are not
   state. `crates/portos-echo/tests/hotplug.rs` asserts the list.
+- **A result the model might not read does not enter its context.** Every
+  bulky verb answers `{text}` when small and `{handle, size, preview}` when
+  not — one shape, defined once in `portos-bulk-api`, because `modeld`
+  already promised the model that shape in the `artifact::read` tool
+  description. Where the line falls is a constant, not a knob. Pipes count
+  as context discipline too: `shell::run` takes a whole `sh -c` string
+  precisely so `… 2>&1 | tail -40` can shrink a log before it is ever
+  carried.
 - **Another node is a driver, not a kernel feature.** `drivers/remote`
   dials a peer's `bridge-http` and re-declares what it finds, renaming the
   family: `browser::open` on node `mac` is `mac_browser::open` here, and
@@ -168,7 +176,7 @@ MCP later is the opposite direction and is fine).
 
 ```sh
 cargo build --workspace
-cargo test --workspace          # 63 tests; all must pass, zero warnings
+cargo test --workspace          # 74 tests; all must pass, zero warnings
 cargo fmt --all
 ```
 
@@ -182,6 +190,11 @@ The end-to-end tests are the ones that matter and they are hermetic:
   before believing a green run.
 - `crates/portos-echo/tests/abi_v2.rs` — plugin ABI conformance.
 - `crates/portos-broker/tests/egress.rs` — allowlist, injection, sanitizing.
+- `drivers/fs/tests/fs.rs` and `drivers/shell/tests/shell.rs` — the context
+  discipline, measured rather than asserted (`host.meter()` after a big
+  result), and the two things easy to get wrong: a walk that ignores
+  `.gitignore`, and a timeout that collects only the leader instead of the
+  process group.
 - `crates/portos-echo/tests/hotplug.rs` — a running system gaining and losing
   a capability, and the residue list after it loses one.
 - `crates/portos-echo/tests/remote.rs` — two nodes in one process, sharing
@@ -226,14 +239,19 @@ walking skeleton test is what proves the wiring.
 - `drivers`: driver plugins and family-interface libraries.
     - Family interfaces — the contract between an implementation and its
       callers, depended on by both so a wire shape is never written twice:
-      `egress-api` (`portos-egress-api`), `model-api` (`portos-model-api`).
-      The kernel depends on neither; it must not know these families exist.
+      `egress-api` (`portos-egress-api`), `model-api` (`portos-model-api`),
+      and `bulk-api` (`portos-bulk-api`) — not a family but a cross-driver
+      result convention, the Rust twin of `drivers/browser/src/sink.js`.
+      The kernel depends on none of them; it must not know these exist.
     - Implementations: `model` (Rust — neutral agentic loop in `core.rs`,
       providers under `backends/`), `browser` (JS/Playwright), `render-tty`
       (renderer reference), `bridge-http` (the event plane and the invoke
       path over HTTP/SSE, so a presenter can live off-box; transport and
       presentation are separate files on purpose), `remote` (the other end
-      of that socket: another node's verbs, mirrored here).
+      of that socket: another node's verbs, mirrored here), `fs` and
+      `shell` (the file tree and command execution; both answer bulky verbs
+      through `bulk-api`, which is the third family-shaped library here —
+      the `{handle, size, preview}` result shape the model was promised).
 - `docs`: does not exist yet. Solid documentation goes here only after human
   approval; until then everything lives in `.dev`.
 - `.dev` (gitignored): temporal development space, never added into git worktree.
