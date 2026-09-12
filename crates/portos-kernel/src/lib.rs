@@ -22,6 +22,7 @@
 pub mod audit;
 pub mod caps;
 pub mod cas;
+pub mod cgroup;
 pub mod db;
 pub mod host;
 pub mod metrics;

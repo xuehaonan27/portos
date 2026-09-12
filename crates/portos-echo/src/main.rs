@@ -20,6 +20,7 @@ use serde::Serialize;
 use serde_json::json;
 use std::collections::{BTreeMap, HashSet};
 use std::io::{Read, Write};
+use std::os::unix::process::CommandExt;
 use std::sync::{Arc, Mutex};
 
 /// One event this plugin received, kept so a test can ask for them back.
@@ -34,7 +35,16 @@ fn main() -> std::io::Result<()> {
     // how a real driver's cost shows up (the browser driver's chromium), and
     // it is what teardown has to reach past this process to collect.
     if let Some(path) = std::env::var_os("PORTOS_ECHO_GRANDCHILD") {
-        let child = std::process::Command::new("sleep").arg("300").spawn()?;
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("300");
+        // `PORTOS_ECHO_GRANDCHILD_ESCAPES` makes it leave the process group
+        // outright, which is the case a process group provably cannot
+        // collect and a cgroup can. Real drivers do this without meaning to:
+        // anything that daemonises calls `setsid`.
+        if std::env::var_os("PORTOS_ECHO_GRANDCHILD_ESCAPES").is_some() {
+            cmd.process_group(0);
+        }
+        let child = cmd.spawn()?;
         std::fs::write(path, child.id().to_string())?;
     }
 

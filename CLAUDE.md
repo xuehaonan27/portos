@@ -112,14 +112,30 @@ theoretical elegance is not. Current state and build order live in
   driver builds its tool list from `grants` introspection. Capabilities are a
   routing and accounting mechanism here, not a security ceremony — `chat.json`
   declares grants and that is the whole approval story.
-- **Teardown is enforced, not requested.** Each plugin is spawned as its own
-  process-group leader, and shutdown escalates — `shutdown` frame, then
-  SIGTERM to the group, then SIGKILL — so a plugin that ignores the polite
-  request goes anyway, and so does everything it started. A driver's real
-  cost is usually its grandchildren (chromium under the browser driver), and
-  `Child::kill` never sees those. The CLI blocks SIGINT/SIGTERM and waits for
-  them on a dedicated thread rather than dying in a default handler, because
-  a signal that skips teardown orphans the whole tree.
+- **Teardown is enforced, not requested.** Shutdown escalates — `shutdown`
+  frame, then SIGTERM to the process group, then SIGKILL — so a plugin that
+  ignores the polite request goes anyway, and so does everything it started.
+  A driver's real cost is usually its grandchildren (chromium under the
+  browser driver), and `Child::kill` never sees those. The CLI blocks
+  SIGINT/SIGTERM and waits for them on a dedicated thread rather than dying
+  in a default handler, because a signal that skips teardown orphans the
+  whole tree.
+- **What a plugin is and how it runs are two axes.** The second is
+  `LaunchSpec.form`, and the kernel implements exactly the two it can
+  without learning a domain: `bare` (a child process leading its own group)
+  and `cgroup` (that child inside a cgroup of its own, the default).
+  Containers and microVMs belong on this axis too, as drivers — a form is a
+  verb family, so the route table is the launcher registry and no new
+  mechanism is needed. A cgroup closes the two holes a process group has,
+  both measured rather than assumed: a child can leave a process group with
+  `setsid` and cannot leave a cgroup, and a killed runtime leaves a *named
+  directory* where a process group leaves nothing, so the next run collects
+  what the last one dropped. Removing the cgroup is the proof it worked —
+  `rmdir` refuses one that still holds anything. It needs no root and no
+  controller; it falls back to `bare` where cgroup v2 is unavailable. What
+  it does *not* reclaim is worth knowing: mounts, network config and IPC
+  objects belong to namespaces, and nothing at any level undoes a request
+  that already went out.
 - **A long operation is accepted, not awaited.** `model::send` returns once
   the turn is admitted; the turn runs on its own thread and reports through
   the event plane, and `model::cancel` stops it. The consequence to respect:
@@ -201,7 +217,7 @@ MCP later is the opposite direction and is fine).
 
 ```sh
 cargo build --workspace
-cargo test --workspace          # 85 tests; all must pass, zero warnings
+cargo test --workspace          # 88 tests; all must pass, zero warnings
 cargo fmt --all
 ```
 
@@ -226,6 +242,11 @@ The end-to-end tests are the ones that matter and they are hermetic:
   process group.
 - `crates/portos-echo/tests/hotplug.rs` — a running system gaining and losing
   a capability, and the residue list after it loses one.
+- `crates/portos-echo/tests/form.rs` — the runtime form, measured against
+  its control: a grandchild that leaves the process group with `setsid`
+  survives teardown in `bare` form and does not in `cgroup` form, a busy
+  cgroup refuses `rmdir`, and a cgroup left by a dead run is collected by
+  the next one. Skips with a reason where cgroup v2 is not writable.
 - `crates/portos-echo/tests/remote.rs` — two nodes in one process, sharing
   nothing but a loopback socket: the far node's verbs arriving as ordinary
   local ones, the two grant tables that each get a say, and the fact that an
@@ -252,7 +273,9 @@ walking skeleton test is what proves the wiring.
     - `portos-kernel`: four responsibilities only — `caps` (authorization,
       and the join that builds the tool surface), `cas` (data plane),
       `host` (ABI v2: spawn, verb routing, event bus, chunked streaming),
-      `audit`. Domain vocabulary here is an architectural violation.
+      `audit`, plus `cgroup`, which is how it makes a child on Linux rather
+      than a domain it knows. Domain vocabulary here is an architectural
+      violation.
     - `portos-proto`: the wire. `wire` holds the protocol as types — the
       envelope is an enum so a malformed frame is refused rather than
       defaulted, and `Payload` is unparsed JSON the kernel forwards without

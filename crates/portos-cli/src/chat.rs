@@ -42,7 +42,7 @@
 use nix::sys::signal::{SigSet, Signal};
 use portos_egress_api as egress;
 use portos_kernel::Kernel;
-use portos_kernel::host::{Host, LaunchSpec};
+use portos_kernel::host::{Form, Host, LaunchSpec};
 use portos_model_api as model;
 use portos_proto::ids::PluginName;
 use portos_proto::wire::Payload;
@@ -75,6 +75,10 @@ struct PluginSpec {
     /// re-plugs this driver and nothing else.
     #[serde(default)]
     watch: Vec<String>,
+    /// How it runs: `cgroup` (the default) or `bare`. Part of the spec, so a
+    /// change to it re-plugs the driver like any other.
+    #[serde(default)]
+    form: Form,
 }
 
 /// A grant is declared, not negotiated: whatever is listed here is what the
@@ -519,6 +523,8 @@ impl Desired {
             h.update(b"=");
             h.update(v.as_bytes());
         }
+        h.update(b"\0f");
+        h.update(format!("{:?}", self.spec.form).as_bytes());
         for p in &self.watch {
             h.update(b"\0w");
             h.update(p.as_os_str().as_encoded_bytes());
@@ -588,6 +594,7 @@ fn desired_set(root: &Path, exe: &Path) -> Result<Vec<Desired>, String> {
                 args: p.args.iter().map(|a| resolve_arg(root, a)).collect(),
                 env: p.env.clone(),
                 grants: Vec::new(),
+                form: p.form,
             },
             watch: p.watch.iter().map(|w| root.join(w)).collect(),
         });

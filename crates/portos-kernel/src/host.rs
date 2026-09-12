@@ -38,6 +38,7 @@
 //! while B's serve loop is blocked invoking A) deadlocks; current flows
 //! (cli → model driver → {broker, browser}) are acyclic by construction.
 
+use crate::cgroup::{Cgroup, CgroupRoot};
 use crate::{Kernel, KernelError};
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
@@ -73,6 +74,27 @@ pub struct LaunchSpec {
     /// Minted once the plugin is up and has declared its name.
     #[serde(default)]
     pub grants: Vec<GrantSpec>,
+    /// How it runs. What a plugin *is* and how it runs are two axes; this is
+    /// the second one, and the kernel knows only the two it can do without
+    /// learning a domain — a child process, optionally inside a cgroup.
+    /// Containers and VMs belong to drivers.
+    #[serde(default)]
+    pub form: Form,
+}
+
+/// The runtime forms the kernel implements itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Form {
+    /// A child process leading its own process group. Always available, and
+    /// the bootstrap that must never depend on anything else being present.
+    Bare,
+    /// The same child, inside a cgroup of its own — a boundary it cannot
+    /// leave with `setsid`, and one that leaves a findable directory if this
+    /// runtime dies without teardown. Falls back to [`Form::Bare`] where
+    /// cgroup v2 is not available or not writable.
+    #[default]
+    Cgroup,
 }
 
 /// A capability to mint. `subject` defaults to the plugin being started,
@@ -100,6 +122,10 @@ const SPAWN_DEADLINE_MS: u64 = 10_000;
 const GRACE_MS: u64 = 1_000;
 
 struct PluginHandle {
+    /// Present when this plugin was started in [`Form::Cgroup`]. Teardown
+    /// ends with emptying it, and removing it is the proof that it worked —
+    /// `rmdir` only succeeds on an empty cgroup.
+    cgroup: Option<Cgroup>,
     child: Mutex<std::process::Child>,
     serve: Mutex<UnixStream>,
     /// Dedicated event-delivery stream, when the plugin declared one.
@@ -129,6 +155,12 @@ struct RouteEntry {
 }
 
 struct HostInner {
+    cgroups: Option<CgroupRoot>,
+    /// Distinguishes this host's cgroups from another host's in the same
+    /// process. Without it two hosts number their plugins from one and
+    /// collide — and a shared cgroup means stopping one plugin kills the
+    /// other's.
+    cgroup_tag: String,
     plugins: Mutex<BTreeMap<PluginName, Arc<PluginHandle>>>,
     routes: Mutex<BTreeMap<Verb, RouteEntry>>,
     subs: Mutex<Vec<Sub>>,
@@ -147,9 +179,28 @@ pub struct Host {
 impl Host {
     pub fn new(kernel: Arc<Kernel>, sock_dir: &Path) -> Result<Host, KernelError> {
         std::fs::create_dir_all(sock_dir)?;
+        let cgroups = CgroupRoot::detect();
+        match &cgroups {
+            Some(root) => {
+                // Before anything starts: whatever a previous run left when
+                // it died without teardown. This is the half of reclamation
+                // a process group cannot do at all, because it leaves
+                // nothing behind to come back to.
+                let reaped = root.reap_orphans();
+                if reaped > 0 {
+                    eprintln!("[kernel] collected {reaped} cgroup(s) left by an earlier run");
+                }
+            }
+            None => eprintln!(
+                "[kernel] no writable cgroup v2: plugins run as process groups, \
+                 which a child can leave with setsid"
+            ),
+        }
         Ok(Host {
             kernel,
             inner: Arc::new(HostInner {
+                cgroups,
+                cgroup_tag: rand_token()[..8].to_string(),
                 plugins: Mutex::new(BTreeMap::new()),
                 routes: Mutex::new(BTreeMap::new()),
                 subs: Mutex::new(Vec::new()),
@@ -178,6 +229,7 @@ impl Host {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             grants: Vec::new(),
+            form: Form::default(),
         })
     }
 
@@ -247,6 +299,14 @@ fn spawn_process(
     listener.set_nonblocking(true)?;
     let token = rand_token();
 
+    let cgroup = match spec.form {
+        Form::Cgroup => inner
+            .cgroups
+            .as_ref()
+            .and_then(|r| r.create(&format!("{}-{idx}", inner.cgroup_tag))),
+        Form::Bare => None,
+    };
+
     let mut cmd = std::process::Command::new(&spec.bin);
     cmd.args(&spec.args)
         .env("PORTOS_PLUGIN_SOCK", &sock_path)
@@ -254,8 +314,32 @@ fn spawn_process(
         // Each plugin leads its own process group, so teardown can reach
         // whatever it started. A driver's real cost is usually its
         // grandchildren — the browser driver's chromium, a shell driver's
-        // pipeline — and `Child::kill` never sees those.
+        // pipeline — and `Child::kill` never sees those. The process group
+        // stays even in cgroup form: it is what makes a *polite* SIGTERM
+        // possible, and a cgroup only offers the final, unanswerable one.
         .process_group(0);
+    if let Some(cg) = &cgroup {
+        match cg.procs_file() {
+            Ok(file) => {
+                // Between fork and exec, the child puts itself in the cgroup.
+                // It has to be here rather than after spawning: anything the
+                // plugin forks inherits the cgroup, and a process moved in
+                // later leaves its existing children outside it.
+                //
+                // Safety: the closure runs in the forked child before exec
+                // and does one `write` on an already-open descriptor — no
+                // allocation, no locks, nothing that a fork could have left
+                // inconsistent.
+                unsafe {
+                    cmd.pre_exec(move || {
+                        use std::io::Write;
+                        (&file).write_all(b"0")
+                    });
+                }
+            }
+            Err(e) => eprintln!("[kernel] cgroup unusable, falling back to process group: {e}"),
+        }
+    }
     for (k, v) in &spec.env {
         cmd.env(k, v);
     }
@@ -364,6 +448,7 @@ fn spawn_process(
         }
         let (events_tx, events_rx) = sync_channel::<ServeMsg>(EVENT_QUEUE);
         let handle = Arc::new(PluginHandle {
+            cgroup,
             child: Mutex::new(child),
             serve: Mutex::new(serve_stream),
             events: events.map(Mutex::new),
@@ -524,6 +609,19 @@ fn shutdown_on(kernel: &Arc<Kernel>, inner: &Arc<HostInner>, plugin: &PluginName
     let _ = child.kill();
     let _ = child.wait();
     signal_group(pgid, Signal::SIGKILL);
+    // And then the part a process group cannot do: a child that called
+    // `setsid` is no longer in the group and has been ignoring every signal
+    // above. `cgroup.kill` has no such gap. Removing the directory is the
+    // proof it worked — `rmdir` refuses a cgroup that still holds anything.
+    if let Some(cg) = &h.cgroup {
+        cg.kill();
+        if !cg.remove() {
+            eprintln!(
+                "[kernel] {plugin}: cgroup {} would not empty",
+                cg.path().display()
+            );
+        }
+    }
     let _ = std::fs::remove_file(&h.sock_path);
     true
 }
