@@ -662,3 +662,159 @@ fn a_turn_is_accepted_immediately_and_can_be_cancelled_mid_flight() {
     host.shutdown_all();
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A conversation outlives the driver that held it.
+///
+/// This is the whole of session persistence in one test: run a turn, take
+/// the driver away entirely, start a new one over the same directory, resume
+/// — and check what the provider is shown on the next turn, because that is
+/// the only thing that proves the history is really there rather than merely
+/// listed somewhere.
+#[test]
+fn a_session_survives_the_driver_that_held_it() {
+    let Some(broker_bin) = sibling("portos-broker") else {
+        eprintln!("skipping: sibling binaries not built (run under cargo test --workspace)");
+        return;
+    };
+    let (kernel, host, root) = setup("persist");
+
+    let reply = |text: &str| {
+        sse(&[
+            ("message_start", json!({"type": "message_start"})),
+            (
+                "content_block_start",
+                json!({"type": "content_block_start", "index": 0,
+                       "content_block": {"type": "text", "text": ""}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"type": "content_block_delta", "index": 0,
+                       "delta": {"type": "text_delta", "text": text}}),
+            ),
+            (
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": 0}),
+            ),
+            (
+                "message_delta",
+                json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}}),
+            ),
+            ("message_stop", json!({"type": "message_stop"})),
+        ])
+    };
+    let (port, captured) = mock_provider(vec![reply("noted"), reply("still here")]);
+
+    let broker_dir = root.join("broker");
+    write_json(
+        &broker_dir.join("config.json"),
+        &json!({"allow": [{"host": "127.0.0.1", "insecure_http": true,
+                            "inject": {"x-api-key": "k1"}}]}),
+    );
+    write_json(&broker_dir.join("secrets.json"), &json!({"k1": "fake"}));
+    host.spawn(
+        &broker_bin,
+        &[],
+        &[("PORTOS_BROKER_DIR", broker_dir.to_str().unwrap())],
+    )
+    .unwrap();
+
+    let modeld_dir = root.join("modeld");
+    write_json(
+        &modeld_dir.join("config.json"),
+        &json!({
+            "backend": "anthropic-compatible",
+            "base_url": format!("http://127.0.0.1:{port}"),
+            "model": "test-model",
+            "max_tokens": 512,
+            "system": "You are a test assistant.",
+            "introspect_tools": false,
+        }),
+    );
+    // Spawning *and* granting: stopping a plugin revokes what it held, so
+    // whoever brings it back owes it its capabilities again. That rule is
+    // what makes a stopped plugin harmless; the cost is this line.
+    let spawn_modeld = || {
+        let name = host
+            .spawn(
+                Path::new(MODELD_BIN),
+                &[],
+                &[("PORTOS_MODELD_DIR", modeld_dir.to_str().unwrap())],
+            )
+            .unwrap();
+        kernel
+            .caps
+            .mint(
+                "plugin:portos-modeld",
+                "driver:egress",
+                ["http", "http_stream"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect::<BTreeSet<_>>(),
+                Constraints::default(),
+                None,
+            )
+            .unwrap();
+        name
+    };
+
+    // ---- first life -----------------------------------------------------
+    let modeld = spawn_modeld();
+    let started = call(&host, &modeld, "model::start", json!({})).unwrap();
+    let sid = started["session"].as_str().unwrap().to_string();
+    let (_sub, rx) = host.subscribe_local(&tp(&format!("model::session::{sid}")));
+    call(
+        &host,
+        &modeld,
+        "model::send",
+        json!({"session": sid, "text": "remember this"}),
+    )
+    .unwrap();
+    let (_kinds, deltas, _terminal) = drain_turn(&rx);
+    assert_eq!(deltas, "noted");
+
+    // The index is handles and facts, never content: a listing must not have
+    // to read a transcript to know a conversation exists.
+    let index = portos_model_api::SessionIndex::read(&modeld_dir);
+    let rec = index.sessions.get(&sid).expect("the session was recorded");
+    assert!(rec.artifact.starts_with("blake3:"), "{rec:?}");
+    assert_eq!(rec.turns, 1);
+    assert_eq!(rec.title, "remember this");
+
+    // ---- the driver goes away entirely ----------------------------------
+    host.shutdown(&modeld);
+    assert!(
+        call(&host, &modeld, "model::start", json!({})).is_err(),
+        "the driver really is gone"
+    );
+
+    // ---- second life ----------------------------------------------------
+    let modeld = spawn_modeld();
+    let resumed = call(&host, &modeld, "model::start", json!({"resume": sid})).unwrap();
+    assert_eq!(resumed["session"].as_str(), Some(sid.as_str()));
+
+    let (_sub2, rx2) = host.subscribe_local(&tp(&format!("model::session::{sid}")));
+    call(
+        &host,
+        &modeld,
+        "model::send",
+        json!({"session": sid, "text": "what did I say?"}),
+    )
+    .unwrap();
+    let (_kinds, deltas, terminal) = drain_turn(&rx2);
+    assert_eq!(deltas, "still here", "terminal was {terminal}");
+
+    // The proof: the provider was shown the earlier exchange, by a driver
+    // that had never seen it.
+    let second = captured.lock().unwrap()[1].clone();
+    assert!(
+        second.contains("remember this") && second.contains("noted"),
+        "the resumed turn carried the history: {second}"
+    );
+
+    // A new session after a restart must not reuse a stored id.
+    let fresh = call(&host, &modeld, "model::start", json!({})).unwrap();
+    assert_ne!(fresh["session"].as_str(), Some(sid.as_str()));
+
+    host.shutdown_all();
+    let _ = std::fs::remove_dir_all(&root);
+}

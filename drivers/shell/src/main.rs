@@ -44,10 +44,13 @@ use std::io::Read;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
-/// How long the group gets between SIGTERM and SIGKILL.
+/// How long anything gets between SIGTERM and SIGKILL — the leader, and then
+/// the rest of its group.
 const GRACE_MS: u64 = 500;
 const POLL_MS: u64 = 20;
 /// Provenance labels carry the command; a whole script would not be a label.
@@ -90,6 +93,11 @@ struct RunReply {
     stdout: Bulk,
     stderr: Bulk,
     timed_out: bool,
+    /// Output was still arriving when we stopped waiting for it. Only
+    /// reachable if something in the group survived a SIGKILL, but a caller
+    /// that is told "this is all of it" deserves to know when it is not.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    output_truncated: bool,
     duration_ms: u64,
 }
 
@@ -115,8 +123,8 @@ fn run(base: &PathBuf, sink: &Sink, client: &KernelClient, a: RunArgs) -> CallRe
     let pgid = child.id();
     // Drain both pipes on their own threads. A command that fills one pipe
     // while we wait on the other deadlocks, and a large build fills both.
-    let out = drain(child.stdout.take());
-    let err = drain(child.stderr.take());
+    let mut out = drain(child.stdout.take());
+    let mut err = drain(child.stderr.take());
 
     let began = Instant::now();
     let mut timed_out = false;
@@ -142,20 +150,37 @@ fn run(base: &PathBuf, sink: &Sink, client: &KernelClient, a: RunArgs) -> CallRe
         std::thread::sleep(Duration::from_millis(POLL_MS));
     };
 
-    // The leader has been reaped, which says nothing about its group. A
+    // The leader has been reaped, which says nothing about its group: a
     // backgrounded grandchild outlives it, is no longer anything we can wait
-    // on, and holds the output pipe open — so joining first would hang, and
-    // returning first would leak. The kernel sweeps a plugin's group
-    // unconditionally for exactly this reason; the escalation above is not a
-    // substitute for it, because escalation stops as soon as the *leader*
-    // goes.
+    // on, and holds the output pipe open. Two separate things follow from
+    // that, and conflating them was the first version's mistake.
     //
-    // The consequence, which callers should know: `shell::run` leaves nothing
+    // The group gets the *same* escalation the leader got, not a bare
+    // SIGKILL. These are the processes actually doing work — the ones with a
+    // buffer to flush or a lock file to remove — so being polite to `sh` and
+    // brutal to them had the courtesy exactly backwards.
+    //
+    // And the wait is bounded, because liveness must not depend on a pipe
+    // somebody else decides when to close. Killing writers to obtain EOF is
+    // using resource reclamation to fix a liveness bug; the deadline is what
+    // actually fixes it, and the signals are then only about reclamation.
+    //
+    // The consequence callers should know: `shell::run` leaves nothing
     // running. `some-daemon &` does not survive the call. Something meant to
     // keep running is a plugin, not a background job.
-    signal_group(pgid, Signal::SIGKILL);
-    let stdout = out.join().unwrap_or_default();
-    let stderr = err.join().unwrap_or_default();
+    //
+    // A process group is the weakest form of this boundary — it can be left
+    // with `setsid`, and a reaped leader's pgid can in principle be reused.
+    // A cgroup has neither hole, which is why the runtime-form work exists.
+    signal_group(pgid, Signal::SIGTERM);
+    let mut settled = wait_for_eof(&mut out, &mut err, GRACE_MS);
+    if !settled {
+        signal_group(pgid, Signal::SIGKILL);
+        settled = wait_for_eof(&mut out, &mut err, GRACE_MS);
+    }
+    let stdout = out.take();
+    let stderr = err.take();
+    let output_truncated = !settled;
 
     let label = Label::with_integ(&format!("shell:{}", truncate(&a.cmd, LABEL_CMD_CHARS)));
     Ok(Payload::of(&RunReply {
@@ -164,20 +189,66 @@ fn run(base: &PathBuf, sink: &Sink, client: &KernelClient, a: RunArgs) -> CallRe
         stdout: sink.deliver(client, &stdout, "text/plain", Some(label.clone()))?,
         stderr: sink.deliver(client, &stderr, "text/plain", Some(label))?,
         timed_out,
+        output_truncated,
         duration_ms: began.elapsed().as_millis() as u64,
     })?)
 }
 
-/// Read a pipe to the end on its own thread. Output is decoded lossily: a
-/// build that prints one stray byte is still a build whose log we want.
-fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<String> {
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut p) = pipe {
-            let _ = p.read_to_end(&mut buf);
+/// Wait for both pipes to reach EOF, or give up. Returns whether they did.
+fn wait_for_eof(out: &mut Drain, err: &mut Drain, ms: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_millis(ms);
+    // Both, not short-circuited: the second one still has until the deadline.
+    let a = out.settled_by(deadline);
+    let b = err.settled_by(deadline);
+    a && b
+}
+
+/// A pipe being read on its own thread, with the bytes readable *before* the
+/// read finishes. That is the whole point: whoever is waiting can stop
+/// waiting and still have what arrived.
+struct Drain {
+    buf: Arc<Mutex<Vec<u8>>>,
+    done: Receiver<()>,
+    settled: bool,
+}
+
+impl Drain {
+    fn settled_by(&mut self, deadline: Instant) -> bool {
+        if !self.settled {
+            let left = deadline.saturating_duration_since(Instant::now());
+            self.settled = self.done.recv_timeout(left).is_ok();
         }
-        String::from_utf8_lossy(&buf).into_owned()
-    })
+        self.settled
+    }
+
+    /// Output decoded lossily: a build that prints one stray byte is still a
+    /// build whose log we want.
+    fn take(&self) -> String {
+        String::from_utf8_lossy(&self.buf.lock().unwrap()).into_owned()
+    }
+}
+
+fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> Drain {
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let (tx, done) = std::sync::mpsc::channel();
+    let sink = buf.clone();
+    std::thread::spawn(move || {
+        if let Some(mut p) = pipe {
+            let mut chunk = [0u8; 8192];
+            while let Ok(n) = p.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                sink.lock().unwrap().extend_from_slice(&chunk[..n]);
+            }
+        }
+        let _ = tx.send(());
+    });
+    Drain {
+        buf,
+        done,
+        settled: false,
+    }
 }
 
 fn wait_briefly(child: &mut std::process::Child, ms: u64) -> Option<std::process::ExitStatus> {

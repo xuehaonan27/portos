@@ -8,6 +8,7 @@ name = "portos"
 path = "src/main.rs"
 
 [dependencies]
+blake3 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 nix = { workspace = true }

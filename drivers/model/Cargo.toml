@@ -18,3 +18,4 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 portos-kernel = { path = "../../crates/portos-kernel" }
+portos-model-api = { path = "../model-api" }

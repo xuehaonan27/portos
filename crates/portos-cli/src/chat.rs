@@ -19,6 +19,17 @@
 //!     "render":  "builtin" | "none" }
 //! Relative paths in `args` resolve against `<root>` when they exist there.
 //!
+//! **Reload is re-plug.** `SIGHUP` re-reads `chat.json` (and the two
+//! built-in drivers' config directories) and brings the running set back in
+//! line: whatever changed is stopped and started again, whatever did not is
+//! left alone. There is no second mechanism for it — `kernel::stop` plus
+//! `spawn` already collect a plugin's whole residue and put it back, so a
+//! reload is a policy over the plugin lifecycle rather than a per-field
+//! "which settings are live" matrix, which is the kind of thing that grows
+//! without end. A plugin's config files count as part of what it *is*:
+//! filling in an API key changes the broker without changing its command
+//! line, and that is exactly the case reload exists for.
+//!
 //! Rendering is not a special mechanism: a renderer is an ordinary plugin
 //! subscribed to the event plane; list one under `plugins` and set
 //! `"render": "none"` to replace the builtin stdout rendering — or leave
@@ -31,7 +42,7 @@
 use nix::sys::signal::{SigSet, Signal};
 use portos_egress_api as egress;
 use portos_kernel::Kernel;
-use portos_kernel::host::Host;
+use portos_kernel::host::{Host, LaunchSpec};
 use portos_model_api as model;
 use portos_proto::ids::PluginName;
 use portos_proto::wire::Payload;
@@ -59,6 +70,11 @@ struct PluginSpec {
     args: Vec<String>,
     #[serde(default)]
     env: BTreeMap<String, String>,
+    /// Files this plugin reads when it starts. Listing one here makes its
+    /// contents part of what the plugin *is*, so editing it and reloading
+    /// re-plugs this driver and nothing else.
+    #[serde(default)]
+    watch: Vec<String>,
 }
 
 /// A grant is declared, not negotiated: whatever is listed here is what the
@@ -81,7 +97,93 @@ enum RenderMode {
     None,
 }
 
-pub fn run(root: &str, repl: bool) -> Result<(), Box<dyn std::error::Error>> {
+/// Which conversation a run should open.
+pub enum Resume {
+    /// A new one.
+    New,
+    /// The most recently touched stored one.
+    Latest,
+    Named(String),
+}
+
+/// `portos sessions <root>` — what has been stored, newest first.
+///
+/// Reads the driver's index rather than asking it, so it works with nothing
+/// running. The format is `portos_model_api::SessionIndex`, which is where
+/// the writer and this reader agree; the transcripts themselves stay in the
+/// CAS and are not touched to produce this list.
+pub fn sessions(root: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let index = model::SessionIndex::read(&PathBuf::from(root).join("modeld"));
+    let listed = index.by_recency();
+    if listed.is_empty() {
+        println!("no stored sessions");
+        return Ok(());
+    }
+    println!(
+        "{:<8} {:>6}  {:<20} {}",
+        "SESSION", "TURNS", "UPDATED", "OPENING"
+    );
+    for (id, rec) in listed {
+        println!(
+            "{:<8} {:>6}  {:<20} {}",
+            id,
+            rec.turns,
+            stamp(rec.updated_at),
+            rec.title
+        );
+    }
+    Ok(())
+}
+
+/// Unix seconds as something a person can read, without pulling in a date
+/// library for one column.
+fn stamp(secs: u64) -> String {
+    let days = secs / 86_400;
+    let (h, m) = ((secs % 86_400) / 3600, (secs % 3600) / 60);
+    // 1970-01-01 plus `days`, by the civil-from-days algorithm.
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y + 1 } else { y };
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}")
+}
+
+/// What to ask the driver for. Resuming and starting are the same verb; this
+/// only decides which id, if any, to name.
+fn start_args(
+    root: &Path,
+    resume: &Resume,
+) -> Result<model::StartArgs, Box<dyn std::error::Error>> {
+    let index = || model::SessionIndex::read(&root.join("modeld"));
+    let id = match resume {
+        Resume::New => None,
+        Resume::Named(name) => Some(model::SessionId::parse(name)?),
+        Resume::Latest => match index().by_recency().first() {
+            Some((id, _)) => Some(model::SessionId::parse(id)?),
+            None => {
+                println!("[chat] nothing stored to resume — starting a new session");
+                None
+            }
+        },
+    };
+    if let Some(id) = &id {
+        let idx = index();
+        let turns = idx.sessions.get(id.as_str()).map(|r| r.turns).unwrap_or(0);
+        println!("[chat] resuming {id} ({turns} turns)");
+    }
+    Ok(model::StartArgs {
+        resume: id,
+        ..Default::default()
+    })
+}
+
+pub fn run(root: &str, repl: bool, resume: Resume) -> Result<(), Box<dyn std::error::Error>> {
     // Block the interrupt signals before anything else starts a thread, so
     // every thread inherits the mask and only the handler thread below ever
     // sees them. Without this, Ctrl-C tears the process down without running
@@ -96,76 +198,24 @@ pub fn run(root: &str, repl: bool) -> Result<(), Box<dyn std::error::Error>> {
     write_templates(&root)?;
 
     let exe = std::env::current_exe()?;
-    let sibling = |name: &str| -> Result<PathBuf, String> {
-        let p = exe.with_file_name(name);
-        if p.exists() {
-            Ok(p)
-        } else {
-            Err(format!("missing sibling binary: {}", p.display()))
-        }
-    };
-
-    let broker_dir = root.join("broker");
-    host.spawn(
-        &sibling("portos-broker")?,
-        &[],
-        &[("PORTOS_BROKER_DIR", broker_dir.to_str().unwrap())],
-    )?;
-    let modeld_dir = root.join("modeld");
-    let modeld = host.spawn(
-        &sibling("portos-modeld")?,
-        &[],
-        &[("PORTOS_MODELD_DIR", modeld_dir.to_str().unwrap())],
-    )?;
-    println!("[chat] plugins: portos-broker, {modeld}");
-
-    // The model driver always gets egress (its LLM calls go through the
-    // broker; it holds no key and no network of its own).
-    kernel.caps.mint(
-        &modeld.subject(),
-        "driver:egress",
-        BTreeSet::from([
-            egress::HTTP.short().to_string(),
-            egress::HTTP_STREAM.short().to_string(),
-        ]),
-        Default::default(),
-        None,
-    )?;
-
     warn_if_provider_host_unlisted(&root);
 
-    let cfg: ChatConfig = match std::fs::read_to_string(root.join("chat.json")) {
-        Ok(text) => serde_json::from_str(&text)?,
-        Err(_) => {
-            println!("[chat] no chat.json — model-only chat (add one to wire in drivers)");
-            ChatConfig::default()
-        }
-    };
-    let render_builtin = cfg.render == RenderMode::Builtin;
+    // What this process started, and what it has already granted. Startup and
+    // reload run the same code over it; at startup everything is new.
+    let state = Arc::new(Mutex::new(RuntimeState::default()));
+    let failures = converge(&kernel, &host, &root, &exe, &mut state.lock().unwrap())?;
+    if let Some(first) = failures.first() {
+        return Err(first.clone().into());
+    }
+    let modeld = state
+        .lock()
+        .unwrap()
+        .modeld()
+        .ok_or("the model driver did not start")?;
+
+    let render_builtin = load_chat_config(&root).render == RenderMode::Builtin;
     if !render_builtin {
         println!("[chat] builtin rendering off — renderer plugins own the output");
-    }
-    for p in &cfg.plugins {
-        let args: Vec<String> = p.args.iter().map(|a| resolve_arg(&root, a)).collect();
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let env_refs: Vec<(&str, &str)> = p
-            .env
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-        let name = host.spawn(Path::new(&p.bin), &arg_refs, &env_refs)?;
-        println!("[chat] plugin: {name}");
-    }
-    for g in &cfg.grants {
-        let subject = g.subject.clone().unwrap_or_else(|| modeld.subject());
-        kernel.caps.mint(
-            &subject,
-            &g.resource,
-            g.verbs.clone(),
-            Default::default(),
-            None,
-        )?;
-        println!("[chat] grant: {subject} → {}", g.resource);
     }
 
     // Whether a turn is in flight, and which session it belongs to, so an
@@ -174,7 +224,13 @@ pub fn run(root: &str, repl: bool) -> Result<(), Box<dyn std::error::Error>> {
     let current: Arc<Mutex<Option<model::SessionId>>> = Arc::new(Mutex::new(None));
     spawn_signal_handler(
         signals,
-        host.clone(),
+        Reloadable {
+            kernel: kernel.clone(),
+            host: host.clone(),
+            root: root.clone(),
+            exe,
+            state,
+        },
         modeld.clone(),
         busy.clone(),
         current.clone(),
@@ -188,7 +244,13 @@ pub fn run(root: &str, repl: bool) -> Result<(), Box<dyn std::error::Error>> {
         // Known gap: a signal kills this process without running `Drop for
         // Host`, so plugins are orphaned rather than shut down. The fix is
         // process-group teardown, not a handler here.
-        println!("[chat] runtime up, no REPL — drive it through a front end; Ctrl-C to stop");
+        if !matches!(resume, Resume::New) {
+            println!("[chat] --resume has no effect without a REPL: a front end opens its own");
+        }
+        println!(
+            "[chat] runtime up, no REPL — drive it through a front end; \
+             SIGHUP to reload config, Ctrl-C to stop"
+        );
         let (_keep, never) = std::sync::mpsc::channel::<()>();
         let _ = never.recv();
         return Ok(());
@@ -198,7 +260,7 @@ pub fn run(root: &str, repl: bool) -> Result<(), Box<dyn std::error::Error>> {
     let started = host.call(
         &modeld,
         &model::START,
-        Payload::of(&model::StartArgs::default())?,
+        Payload::of(&start_args(&root, &resume)?)?,
     )?;
     let sid = started.parse::<model::StartReply>()?.session;
     *current.lock().unwrap() = Some(sid.clone());
@@ -292,6 +354,10 @@ fn block_interrupts() -> Result<SigSet, Box<dyn std::error::Error>> {
     let mut set = SigSet::empty();
     set.add(Signal::SIGINT);
     set.add(Signal::SIGTERM);
+    // SIGHUP joins them because it is handled on the same thread, for the
+    // same reason: reloading means stopping and starting plugins, which is
+    // real work and must not happen inside a signal handler.
+    set.add(Signal::SIGHUP);
     set.thread_block()?;
     Ok(set)
 }
@@ -301,15 +367,19 @@ fn block_interrupts() -> Result<SigSet, Box<dyn std::error::Error>> {
 /// none of which is safe inside an actual signal handler.
 fn spawn_signal_handler(
     signals: SigSet,
-    host: Arc<Host>,
+    rt: Reloadable,
     modeld: PluginName,
     busy: Arc<AtomicBool>,
     current: Arc<Mutex<Option<model::SessionId>>>,
 ) {
     std::thread::spawn(move || {
         loop {
-            if signals.wait().is_err() {
+            let Ok(sig) = signals.wait() else {
                 return;
+            };
+            if sig == Signal::SIGHUP {
+                rt.reload();
+                continue;
             }
             // A turn in flight is cancelled, not killed: an interrupt almost
             // always means "stop this", not "lose the session". Interrupting
@@ -319,16 +389,42 @@ fn spawn_signal_handler(
                 if let Some(session) = session {
                     eprintln!("\n[chat] cancelling — interrupt again to quit");
                     if let Ok(p) = Payload::of(&model::CancelArgs { session }) {
-                        let _ = host.call(&modeld, &model::CANCEL, p);
+                        let _ = rt.host.call(&modeld, &model::CANCEL, p);
                     }
                     continue;
                 }
             }
             eprintln!("\n[chat] shutting down");
-            host.shutdown_all();
+            rt.host.shutdown_all();
             std::process::exit(130);
         }
     });
+}
+
+/// What the signal thread needs in order to reload.
+struct Reloadable {
+    kernel: Arc<Kernel>,
+    host: Arc<Host>,
+    root: PathBuf,
+    exe: PathBuf,
+    state: Arc<Mutex<RuntimeState>>,
+}
+
+impl Reloadable {
+    fn reload(&self) {
+        let mut state = self.state.lock().unwrap();
+        eprintln!("[chat] reloading");
+        match converge(&self.kernel, &self.host, &self.root, &self.exe, &mut state) {
+            // A bad edit must not leave the runtime emptier than it found it,
+            // so a failed start is reported and the rest still converges.
+            Ok(failures) => {
+                for f in failures {
+                    eprintln!("[chat] reload: {f}");
+                }
+            }
+            Err(e) => eprintln!("[chat] reload failed: {e}"),
+        }
+    }
 }
 
 /// The provider is vendor-neutral: modeld's backend `base_url` decides where
@@ -371,6 +467,226 @@ fn warn_if_provider_host_unlisted(root: &Path) {
              broker allowlist — LLM calls will be denied; add it to broker/config.json"
         );
     }
+}
+
+/// What this process started and granted. Nothing else: a plugin an agent
+/// started with `kernel::spawn` is not in here, and a reload leaves it alone.
+#[derive(Default)]
+struct RuntimeState {
+    /// fingerprint → the name the plugin declared. Keyed by fingerprint
+    /// rather than by name because a name is something a plugin declares
+    /// *after* it starts, while the decision to start it is made before.
+    running: BTreeMap<String, PluginName>,
+    /// Grants already minted, so a reload does not mint a second copy of
+    /// every capability and hand the model a duplicated tool list.
+    minted: BTreeSet<String>,
+}
+
+impl RuntimeState {
+    fn modeld(&self) -> Option<PluginName> {
+        self.running
+            .values()
+            .find(|n| n.as_str() == "portos-modeld")
+            .cloned()
+    }
+}
+
+/// One plugin the runtime wants running.
+struct Desired {
+    spec: LaunchSpec,
+    /// Files it reads when it starts. Their contents are part of what it
+    /// *is* — filling in an API key changes the broker without changing its
+    /// command line, and a reload that compared only command lines would
+    /// miss the one case it exists for.
+    watch: Vec<PathBuf>,
+}
+
+impl Desired {
+    /// What "the same plugin" means here.
+    ///
+    /// Hashed rather than kept: the secrets file goes through this, and the
+    /// CLI has no business holding an API key in memory to compare it later.
+    fn fingerprint(&self) -> String {
+        let mut h = blake3::Hasher::new();
+        h.update(self.spec.bin.as_bytes());
+        for a in &self.spec.args {
+            h.update(b"\0a");
+            h.update(a.as_bytes());
+        }
+        for (k, v) in &self.spec.env {
+            h.update(b"\0e");
+            h.update(k.as_bytes());
+            h.update(b"=");
+            h.update(v.as_bytes());
+        }
+        for p in &self.watch {
+            h.update(b"\0w");
+            h.update(p.as_os_str().as_encoded_bytes());
+            // A file that is not there yet is a state like any other: create
+            // it later and the fingerprint changes, which is the point.
+            if let Ok(bytes) = std::fs::read(p) {
+                h.update(&bytes);
+            }
+        }
+        h.finalize().to_hex().to_string()
+    }
+}
+
+fn load_chat_config(root: &Path) -> ChatConfig {
+    match std::fs::read_to_string(root.join("chat.json")) {
+        Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
+            eprintln!("[chat] chat.json is not readable, ignoring it: {e}");
+            ChatConfig::default()
+        }),
+        Err(_) => ChatConfig::default(),
+    }
+}
+
+/// Everything that should be running, in start order: the two trusted
+/// built-ins, then whatever `chat.json` lists.
+fn desired_set(root: &Path, exe: &Path) -> Result<Vec<Desired>, String> {
+    let sibling = |name: &str| -> Result<String, String> {
+        let p = exe.with_file_name(name);
+        if p.exists() {
+            Ok(p.to_string_lossy().into_owned())
+        } else {
+            Err(format!("missing sibling binary: {}", p.display()))
+        }
+    };
+    let env1 =
+        |k: &str, v: &Path| BTreeMap::from([(k.to_string(), v.to_string_lossy().into_owned())]);
+
+    let broker_dir = root.join("broker");
+    let modeld_dir = root.join("modeld");
+    let mut want = vec![
+        Desired {
+            spec: LaunchSpec {
+                bin: sibling("portos-broker")?,
+                env: env1("PORTOS_BROKER_DIR", &broker_dir),
+                ..Default::default()
+            },
+            // The reason reload exists: the API key lands in secrets.json,
+            // and only the broker ever reads it.
+            watch: vec![
+                broker_dir.join("config.json"),
+                broker_dir.join("secrets.json"),
+            ],
+        },
+        Desired {
+            spec: LaunchSpec {
+                bin: sibling("portos-modeld")?,
+                env: env1("PORTOS_MODELD_DIR", &modeld_dir),
+                ..Default::default()
+            },
+            watch: vec![modeld_dir.join("config.json")],
+        },
+    ];
+    for p in &load_chat_config(root).plugins {
+        want.push(Desired {
+            spec: LaunchSpec {
+                bin: p.bin.clone(),
+                args: p.args.iter().map(|a| resolve_arg(root, a)).collect(),
+                env: p.env.clone(),
+                grants: Vec::new(),
+            },
+            watch: p.watch.iter().map(|w| root.join(w)).collect(),
+        });
+    }
+    Ok(want)
+}
+
+/// Bring the running set in line with the config, and mint anything newly
+/// granted. Returns the failures rather than stopping at the first, so one
+/// bad entry does not leave the runtime emptier than it found it.
+///
+/// Reload is nothing more than this function running a second time. There is
+/// no per-setting "is this live?" question to answer, because the unit of
+/// change is a plugin: `kernel::stop` already collects its whole residue and
+/// starting it again puts it back.
+fn converge(
+    kernel: &Kernel,
+    host: &Host,
+    root: &Path,
+    exe: &Path,
+    state: &mut RuntimeState,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let wanted: BTreeMap<String, Desired> = desired_set(root, exe)?
+        .into_iter()
+        .map(|d| (d.fingerprint(), d))
+        .collect();
+    let mut failures = Vec::new();
+
+    // Stopping comes first: a plugin whose config changed comes back under
+    // the same name, and the route table refuses a duplicate.
+    let stale: Vec<String> = state
+        .running
+        .keys()
+        .filter(|fp| !wanted.contains_key(*fp))
+        .cloned()
+        .collect();
+    for fp in stale {
+        if let Some(name) = state.running.remove(&fp) {
+            host.shutdown(&name);
+            // Stopping revokes what that plugin *held* — a capability belongs
+            // to a running plugin, not to a name — so forget having granted
+            // it and the loop below will grant it again to the one that comes
+            // back. What *others* hold about its family is untouched and
+            // needs no re-minting: it goes inert with the route and means
+            // something again when the route returns.
+            let subject = name.subject();
+            state
+                .minted
+                .retain(|k| !k.starts_with(&format!("{subject}|")));
+            println!("[chat] stopped {name}");
+        }
+    }
+    for (fp, d) in &wanted {
+        if state.running.contains_key(fp) {
+            continue;
+        }
+        match host.spawn_spec(&d.spec) {
+            Ok(name) => {
+                println!("[chat] started {name}");
+                state.running.insert(fp.clone(), name);
+            }
+            Err(e) => failures.push(format!("{}: {e}", d.spec.bin)),
+        }
+    }
+
+    // Grants. The model driver always gets egress: its LLM calls go through
+    // the broker, and it holds no key and no network of its own.
+    let Some(modeld) = state.modeld() else {
+        return Ok(failures);
+    };
+    let mut mint = |subject: String, resource: &str, verbs: BTreeSet<String>| {
+        let key = format!(
+            "{subject}|{resource}|{}",
+            verbs.iter().cloned().collect::<Vec<_>>().join(",")
+        );
+        if !state.minted.insert(key) {
+            return;
+        }
+        match kernel
+            .caps
+            .mint(&subject, resource, verbs, Default::default(), None)
+        {
+            Ok(_) => println!("[chat] grant: {subject} → {resource}"),
+            Err(e) => eprintln!("[chat] grant {subject} → {resource} failed: {e}"),
+        }
+    };
+    mint(
+        modeld.subject(),
+        "driver:egress",
+        BTreeSet::from([
+            egress::HTTP.short().to_string(),
+            egress::HTTP_STREAM.short().to_string(),
+        ]),
+    );
+    for g in &load_chat_config(root).grants {
+        let subject = g.subject.clone().unwrap_or_else(|| modeld.subject());
+        mint(subject, &g.resource, g.verbs.clone());
+    }
+    Ok(failures)
 }
 
 fn resolve_arg(root: &Path, arg: &str) -> String {
@@ -436,4 +752,67 @@ fn write_templates(root: &Path) -> std::io::Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn desired(watch: Vec<PathBuf>) -> Desired {
+        Desired {
+            spec: LaunchSpec {
+                bin: "/bin/true".into(),
+                ..Default::default()
+            },
+            watch,
+        }
+    }
+
+    /// The whole reason reload keys on a fingerprint rather than a command
+    /// line: filling in an API key changes nothing a process listing would
+    /// show, and it is the change that matters most.
+    #[test]
+    fn a_watched_files_contents_are_part_of_what_the_plugin_is() {
+        let dir = std::env::temp_dir().join(format!("portos-fp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let secrets = dir.join("secrets.json");
+
+        // Absent is a state like any other.
+        let missing = desired(vec![secrets.clone()]).fingerprint();
+
+        std::fs::write(&secrets, r#"{"key":""}"#).unwrap();
+        let empty = desired(vec![secrets.clone()]).fingerprint();
+        assert_ne!(missing, empty, "the file appearing is a change");
+
+        std::fs::write(&secrets, r#"{"key":"filled-in"}"#).unwrap();
+        let filled = desired(vec![secrets.clone()]).fingerprint();
+        assert_ne!(empty, filled, "filling in the key must re-plug the broker");
+
+        assert_eq!(
+            filled,
+            desired(vec![secrets.clone()]).fingerprint(),
+            "and an unchanged plugin must be left alone"
+        );
+
+        // A plugin that watches nothing is decided by its spec alone.
+        assert_eq!(desired(vec![]).fingerprint(), desired(vec![]).fingerprint());
+        assert_ne!(desired(vec![]).fingerprint(), filled);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two plugins differing only in one environment variable are two
+    /// plugins — which is what makes editing `chat.json` re-plug just the
+    /// driver that changed.
+    #[test]
+    fn the_spec_decides_identity_when_nothing_is_watched() {
+        let base = desired(vec![]);
+        let mut other = desired(vec![]);
+        other
+            .spec
+            .env
+            .insert("PORTOS_FS_ROOT".into(), "/srv".into());
+        assert_ne!(base.fingerprint(), other.fingerprint());
+    }
 }

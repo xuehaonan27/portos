@@ -6,7 +6,8 @@
 //!   portos meta <root> <artifact-id>
 //!   portos get <root> <artifact-id> <out-file>
 //!   portos audit-verify <root>
-//!   portos chat <root> [--no-repl]
+//!   portos sessions <root>
+//!   portos chat <root> [--no-repl] [--resume [<session>]]
 
 mod chat;
 
@@ -63,14 +64,18 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let entries = portos_kernel::audit::AuditLog::verify(&path)?;
             println!("audit chain OK: {} entries", entries.len());
         }
+        "sessions" => {
+            let root = need(args, 2, "root")?;
+            chat::sessions(&root)?;
+        }
         "chat" => {
             let root = need(args, 2, "root")?;
             let repl = !args.iter().any(|a| a == "--no-repl");
-            chat::run(&root, repl)?;
+            chat::run(&root, repl, parse_resume(args))?;
         }
         _ => {
             println!("portos — AgentOS M0 CLI");
-            println!("  init | put | meta | get | audit-verify | chat");
+            println!("  init | put | meta | get | audit-verify | sessions | chat");
         }
     }
     Ok(())
@@ -80,4 +85,16 @@ fn need(args: &[String], i: usize, what: &str) -> Result<String, String> {
     args.get(i)
         .cloned()
         .ok_or_else(|| format!("missing arg: {what}"))
+}
+
+/// `--resume` alone continues the most recent conversation; followed by an
+/// id, that one. Absent, a new one.
+fn parse_resume(args: &[String]) -> chat::Resume {
+    match args.iter().position(|a| a == "--resume") {
+        None => chat::Resume::New,
+        Some(i) => match args.get(i + 1) {
+            Some(id) if !id.starts_with("--") => chat::Resume::Named(id.clone()),
+            _ => chat::Resume::Latest,
+        },
+    }
 }

@@ -210,6 +210,45 @@ fn a_background_child_does_not_survive_a_command_that_exits_normally() {
     fx.close();
 }
 
+/// The courtesy the first version got backwards. `sh` — the process least
+/// likely to have anything to clean up — was given SIGTERM then SIGKILL,
+/// while the children actually doing the work were given only SIGKILL. Now
+/// the group gets the same escalation, so a child that handles SIGTERM can
+/// finish what it was doing.
+#[test]
+fn a_background_child_gets_a_chance_to_clean_up() {
+    let fx = Fixture::open("grace");
+    let marker = fx.cwd.join("cleaned");
+
+    let out = fx.run(json!({
+        // `sleep & wait` rather than a bare sleep: a POSIX shell runs a trap
+        // only once the foreground command returns, so a plain `sleep 300`
+        // would swallow the signal until it finished.
+        "cmd": format!(
+            "(trap 'echo done > {}; exit 0' TERM; sleep 300 & wait) & echo started",
+            marker.display()
+        ),
+        "timeout_ms": 5000,
+    }));
+    assert_eq!(out["status"], 0);
+    assert_eq!(out["stdout"]["text"], "started\n");
+    assert!(
+        out["output_truncated"].as_bool().unwrap_or(false) == false,
+        "the child closed the pipe on its own, so nothing was cut short: {out}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !marker.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        marker.exists(),
+        "the background child was killed outright instead of being asked first"
+    );
+
+    fx.close();
+}
+
 /// `kill -0`: does a process still exist?
 fn alive(pid: i32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()

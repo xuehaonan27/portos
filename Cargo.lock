@@ -465,6 +465,7 @@ dependencies = [
 name = "portos-cli"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "nix",
  "portos-egress-api",
  "portos-kernel",

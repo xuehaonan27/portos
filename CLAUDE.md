@@ -159,6 +159,28 @@ theoretical elegance is not. Current state and build order live in
   once at startup), this node decides *who may use it* — and the two
   failures are distinguishable, since a verb the peer never exposed has no
   local route at all.
+- **Reload is re-plug.** `SIGHUP` to `portos chat` re-reads the config and
+  brings the running set back in line — whatever changed is stopped and
+  started again, whatever did not is left alone. There is no second
+  mechanism: `kernel::stop` already collects a plugin's whole residue and
+  starting it again puts it back, so reload is a policy over the plugin
+  lifecycle rather than a per-setting "which of these are live?" matrix.
+  A plugin's config files count as part of what it is — listed under
+  `watch` in `chat.json`, built in for the broker and model driver — because
+  filling in an API key changes the broker without changing its command
+  line, and that is the case reload exists for. Whoever re-plugs a plugin
+  owes it its capabilities again, since stopping revokes what it *held*.
+  The limit still standing: a grant removed from the file is not revoked
+  until restart.
+- **A conversation outlives the driver that held it.** The transcript is
+  written to the CAS after every turn and `modeld/sessions.json` records
+  where it went — handles and small facts only, so listing sessions never
+  reads one. In-memory sessions are a *cache*: `model::send` to an id this
+  process has not seen loads it from the store rather than calling it
+  unknown, which is what makes restarting the driver invisible to a front
+  end. The ordering is load-bearing in the same way the cancel flag was: a
+  terminal event promises the turn is durable, so the checkpoint happens
+  *before* `done` goes out, never after.
 - **Rendering is event subscription.** A renderer is an ordinary plugin with
   zero verbs and zero capabilities that subscribes to `model::session::*`.
   Several may compose. `drivers/render-tty` is the reference.
@@ -179,7 +201,7 @@ MCP later is the opposite direction and is fine).
 
 ```sh
 cargo build --workspace
-cargo test --workspace          # 79 tests; all must pass, zero warnings
+cargo test --workspace          # 85 tests; all must pass, zero warnings
 cargo fmt --all
 ```
 
@@ -193,6 +215,10 @@ The end-to-end tests are the ones that matter and they are hermetic:
   before believing a green run.
 - `crates/portos-echo/tests/abi_v2.rs` — plugin ABI conformance.
 - `crates/portos-broker/tests/egress.rs` — allowlist, injection, sanitizing.
+- `drivers/model/tests/modeld.rs` — the agentic loop, cancellation, and a
+  conversation outliving the driver: run a turn, take the driver away, start
+  another over the same directory, and check what the *provider* is shown
+  next, which is the only thing that proves the history is really there.
 - `drivers/fs/tests/fs.rs` and `drivers/shell/tests/shell.rs` — the context
   discipline, measured rather than asserted (`host.meter()` after a big
   result), and the two things easy to get wrong: a walk that ignores
@@ -236,8 +262,9 @@ walking skeleton test is what proves the wiring.
     - `portos-sdk`: the Rust plugin side; `sdk/js/client.js` is its JS twin.
     - `portos-broker`: the egress chokepoint. Trusted, kernel-spawned, not a
       driver.
-    - `portos-cli`: `portos init|put|meta|get|audit-verify|chat`. Links the
-      kernel as a library; daemonization is deferred to W4.
+    - `portos-cli`: `portos init|put|meta|get|audit-verify|sessions|chat`.
+      Links the kernel as a library; daemonization is deferred to W4.
+      `chat --resume [id]` continues a stored conversation; `SIGHUP` reloads.
     - `portos-echo`: the toy plugin the ABI conformance tests drive.
 - `drivers`: driver plugins and family-interface libraries.
     - Family interfaces — the contract between an implementation and its

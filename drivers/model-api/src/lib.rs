@@ -6,8 +6,10 @@
 //! or any other vendor, because a provider is an implementation detail one
 //! level further down.
 
-use portos_proto::ids::{Topic, Verb};
+use portos_proto::ids::{IdError, Topic, Verb};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 pub static START: LazyLock<Verb> =
@@ -25,6 +27,22 @@ pub struct SessionId(String);
 impl SessionId {
     pub fn new(n: u64) -> SessionId {
         SessionId(format!("s{n}"))
+    }
+
+    /// Parse an id that came from outside — a command-line flag, a stored
+    /// index. Validated against exactly what [`topic`] promises, so that
+    /// method's `expect` stays true for ids this process did not mint.
+    ///
+    /// [`topic`]: SessionId::topic
+    pub fn parse(s: &str) -> Result<SessionId, IdError> {
+        let ok = !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+        if ok {
+            Ok(SessionId(s.to_string()))
+        } else {
+            Err(IdError::Topic(s.to_string()))
+        }
     }
 
     pub fn as_str(&self) -> &str {
@@ -59,6 +77,12 @@ pub struct StartArgs {
     /// Overrides the driver's configured system prompt for this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,
+    /// Continue a stored conversation instead of opening a new one. Starting
+    /// is the same act either way — the driver either finds a transcript
+    /// under this id or fails — so there is no separate `resume` verb to
+    /// forget to call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<SessionId>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -141,6 +165,63 @@ impl SessionEvent {
             self,
             SessionEvent::Done { .. } | SessionEvent::Cancelled | SessionEvent::Failed { .. }
         )
+    }
+}
+
+/// The stored-session index: the contract between the driver that writes
+/// conversations down and whoever lists them.
+///
+/// It holds **handles and small facts only** — the transcripts themselves are
+/// artifacts in the CAS. That is what keeps listing every session cheap no
+/// matter how long they got, and it is the same split the model's own context
+/// obeys.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SessionIndex {
+    #[serde(default)]
+    pub sessions: BTreeMap<String, SessionRecord>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SessionRecord {
+    /// CAS handle of the transcript.
+    pub artifact: String,
+    /// User messages, which is what a person means by "how long is it".
+    pub turns: usize,
+    /// Unix seconds.
+    pub updated_at: u64,
+    /// Enough of the opening line to recognise the conversation.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+}
+
+impl SessionIndex {
+    /// Where it lives, stated once so a reader and the writer cannot disagree.
+    pub fn path_in(modeld_dir: &Path) -> PathBuf {
+        modeld_dir.join("sessions.json")
+    }
+
+    pub fn read(modeld_dir: &Path) -> SessionIndex {
+        std::fs::read_to_string(SessionIndex::path_in(modeld_dir))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    /// Most recently touched first — the order anyone listing them wants.
+    pub fn by_recency(&self) -> Vec<(&String, &SessionRecord)> {
+        let mut v: Vec<_> = self.sessions.iter().collect();
+        v.sort_by(|a, b| b.1.updated_at.cmp(&a.1.updated_at).then(b.0.cmp(a.0)));
+        v
+    }
+
+    /// The highest `sN` recorded. A restarted driver must not hand out an id
+    /// that already names a stored conversation.
+    pub fn highest_id(&self) -> u64 {
+        self.sessions
+            .keys()
+            .filter_map(|k| k.strip_prefix('s')?.parse::<u64>().ok())
+            .max()
+            .unwrap_or(0)
     }
 }
 

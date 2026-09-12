@@ -9,6 +9,12 @@
 //! egress gateway, which injects an API key this process never sees), and
 //! progress streams as `SessionEvent`s on the session's topic.
 //!
+//! Sessions outlive the process. A transcript is written to the CAS after
+//! every turn and `$PORTOS_MODELD_DIR/sessions.json` records where it went,
+//! so `model::start {resume}` continues a conversation the driver has no
+//! memory of — after a restart, after a config reload, after a crash. The
+//! index holds handles and small facts only; see `store.rs` for why.
+//!
 //! Config: `$PORTOS_MODELD_DIR/config.json` —
 //! `{backend, model, max_tokens, system, max_turns, tools: […]}`.
 //! The tool surface comes from grants introspection by default — each verb
@@ -18,8 +24,10 @@
 mod backend;
 mod backends;
 mod core;
+mod store;
 
 use crate::core::{EgressStream, Gateway, ModelError, Session, ToolDef};
+use crate::store::Store;
 use portos_egress_api::{self as egress, EgressRequest, StreamEvent};
 use portos_model_api as model;
 use portos_proto::ids::{Topic, Verb};
@@ -67,9 +75,12 @@ impl Gateway for Gw {
     }
 }
 
+fn modeld_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("PORTOS_MODELD_DIR").map(std::path::PathBuf::from)
+}
+
 fn load_config() -> Value {
-    std::env::var_os("PORTOS_MODELD_DIR")
-        .map(std::path::PathBuf::from)
+    modeld_dir()
         .and_then(|d| std::fs::read_to_string(d.join("config.json")).ok())
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| json!({}))
@@ -211,7 +222,15 @@ fn main() -> std::io::Result<()> {
 
     let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
     let running: Running = Arc::new(Mutex::new(BTreeMap::new()));
-    let mut next_session = 0u64;
+    let store = Arc::new(Store::open(modeld_dir().as_deref()));
+    // Start numbering above whatever is already stored: a restarted driver
+    // that handed out `s1` again would be writing over a conversation it
+    // knows nothing about.
+    let mut next_session = store
+        .as_ref()
+        .as_ref()
+        .map(|s| s.load().highest_id())
+        .unwrap_or(0);
     let mut subscribed = false;
 
     portos_sdk::serve(
@@ -221,17 +240,37 @@ fn main() -> std::io::Result<()> {
         ),
         move |verb, args, client| -> CallResult {
             match verb.short() {
+                // Opening a conversation and continuing one are the same
+                // act: `resume` decides which. A resumed session that is
+                // already in memory is handed back as it is, so reconnecting
+                // a front end never costs a read.
                 "start" => {
                     let a: model::StartArgs = args.parse()?;
-                    next_session += 1;
-                    let id = model::SessionId::new(next_session);
-                    sessions.lock().unwrap().insert(
-                        id.as_str().to_string(),
-                        Arc::new(Mutex::new(Session {
-                            system: a.system.unwrap_or_else(|| default_system.clone()),
-                            messages: Vec::new(),
-                        })),
-                    );
+                    let id = match a.resume {
+                        Some(id) => {
+                            session_of(&sessions, &store, client, &id)?;
+                            id
+                        }
+                        None => {
+                            next_session += 1;
+                            let id = model::SessionId::new(next_session);
+                            let session = Session {
+                                system: a.system.unwrap_or_else(|| default_system.clone()),
+                                messages: Vec::new(),
+                            };
+                            if let Some(store) = store.as_ref() {
+                                // Recorded before a word is said, so an
+                                // abandoned session is still listable rather
+                                // than invisible.
+                                store.save(client, id.as_str(), &session)?;
+                            }
+                            sessions
+                                .lock()
+                                .unwrap()
+                                .insert(id.as_str().to_string(), Arc::new(Mutex::new(session)));
+                            id
+                        }
+                    };
                     Ok(Payload::of(&model::StartReply { session: id })?)
                 }
 
@@ -241,12 +280,7 @@ fn main() -> std::io::Result<()> {
                 "send" => {
                     let a: model::SendArgs = args.parse()?;
                     let sid = a.session;
-                    let session = sessions
-                        .lock()
-                        .unwrap()
-                        .get(sid.as_str())
-                        .cloned()
-                        .ok_or_else(|| CallError::from(format!("unknown session: {sid}")))?;
+                    let session = session_of(&sessions, &store, client, &sid)?;
 
                     let flag = Arc::new(AtomicBool::new(false));
                     {
@@ -271,6 +305,7 @@ fn main() -> std::io::Result<()> {
                         client: client.clone(),
                         slot: slot.clone(),
                         running: running.clone(),
+                        store: store.clone(),
                         config_tools: config_tools.clone(),
                         exclude: exclude.clone(),
                         introspect,
@@ -293,6 +328,10 @@ fn main() -> std::io::Result<()> {
                     Ok(Payload::of(&model::CancelReply { cancelled })?)
                 }
 
+                // Ending a session closes it, it does not delete it: the
+                // transcript stays on disk and `start {resume}` brings it
+                // back. Closing a conversation and throwing it away are
+                // different intentions and should not share a verb.
                 "end" => {
                     let a: model::EndArgs = args.parse()?;
                     if let Some(flag) = running.lock().unwrap().get(a.session.as_str()) {
@@ -324,12 +363,45 @@ fn main() -> std::io::Result<()> {
     )
 }
 
+/// The session with this id, loading it from the store if this process has
+/// not seen it.
+///
+/// The map in memory is a **cache**; the store is the truth. A conversation
+/// that is on disk but not in memory is not "unknown" — it is a driver that
+/// has been restarted since, and no front end should have to know that
+/// happened. This is what makes a config reload invisible to whoever is
+/// talking.
+fn session_of(
+    sessions: &Sessions,
+    store: &Option<Store>,
+    client: &KernelClient,
+    sid: &model::SessionId,
+) -> Result<Arc<Mutex<Session>>, CallError> {
+    if let Some(existing) = sessions.lock().unwrap().get(sid.as_str()).cloned() {
+        return Ok(existing);
+    }
+    let stored = match store {
+        Some(st) => st.restore(client, sid.as_str())?,
+        None => None,
+    };
+    let Some(restored) = stored else {
+        return Err(CallError::from(format!("unknown session: {sid}")));
+    };
+    let shared = Arc::new(Mutex::new(restored));
+    sessions
+        .lock()
+        .unwrap()
+        .insert(sid.as_str().to_string(), shared.clone());
+    Ok(shared)
+}
+
 /// Everything one turn needs, gathered so it can move to its own thread.
 struct Turn {
     backend: Arc<dyn core::Backend + Send + Sync>,
     client: Arc<KernelClient>,
     slot: Arc<Mutex<Option<SyncSender<StreamEvent>>>>,
     running: Running,
+    store: Arc<Option<Store>>,
     config_tools: Arc<Vec<ToolDef>>,
     exclude: Arc<Vec<String>>,
     introspect: bool,
@@ -373,6 +445,13 @@ impl Turn {
         // Recomputed per turn inside the loop: a turn that starts a plugin
         // sees its verbs on the very next turn, not the next message.
         let tools = || assemble_tools(client, self.introspect, &self.exclude, &self.config_tools);
+        let checkpoint = |s: &Session| {
+            if let Some(store) = self.store.as_ref() {
+                if let Err(e) = store.save(client, sid.as_str(), s) {
+                    eprintln!("[modeld] could not store session {sid}: {e}");
+                }
+            }
+        };
 
         let result = {
             let mut s = session.lock().unwrap();
@@ -380,6 +459,7 @@ impl Turn {
                 &*self.backend,
                 &gw,
                 &mut s,
+                &checkpoint,
                 &tools,
                 text,
                 self.max_turns,
@@ -389,11 +469,15 @@ impl Turn {
             )
         };
         // Exactly one terminal event per turn. `run_send` emits Done and
-        // Cancelled itself — and with them, above, the deregistration. A
+        // Cancelled itself — and, just before each, the checkpoint above. A
         // failure has no other way to be heard, and a front end waiting for
         // a terminal event would wait forever.
+        //
+        // A failed turn is stored too: it has a user message and no answer,
+        // and that is what actually happened.
         if let Err(e) = result {
             if !matches!(e, ModelError::Cancelled) {
+                checkpoint(&session.lock().unwrap());
                 emit(model::SessionEvent::Failed {
                     error: e.to_string(),
                 });
