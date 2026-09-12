@@ -1,0 +1,22 @@
+[package]
+name = "portos-modeld"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "portos-modeld"
+path = "src/main.rs"
+
+[dependencies]
+portos-egress-api = { path = "../../drivers/egress" }
+portos-model-api = { path = "../../drivers/model" }
+portos-abi = { path = "../../abi" }
+portos-router = { path = "../../drivers/router" }
+portos-sdk = { path = "../../sdk/rust" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+portos-kernel = { path = "../../kernel" }
+portos-model-api = { path = "../../drivers/model" }

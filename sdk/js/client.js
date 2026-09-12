@@ -1,6 +1,6 @@
 // PortOS plugin protocol client — ABI v2, JS side. Zero dependencies.
 //
-// Mirrors crates/portos-sdk: a plugin connects to $PORTOS_PLUGIN_SOCK twice
+// Mirrors sdk/rust: a plugin connects to $PORTOS_PLUGIN_SOCK twice
 // (roles "serve" and "client", both authenticated by $PORTOS_PLUGIN_TOKEN).
 // Frames are 4-byte LE length + JSON; payloads ride after a frame as raw
 // chunks (4-byte LE length + bytes, zero-length terminator) and never inside
@@ -166,6 +166,16 @@ export class KernelClient {
     return this._serial(async () => {
       this.chan.writeFrame({ op: "unsubscribe", sub });
       return unwrapOk(await this.chan.readFrame()).removed ?? false;
+    });
+  }
+
+  /** Where an artifact's bytes are on disk, for handing to something that
+   *  only speaks in paths. The file is read-only. Prefer this over `read`
+   *  whenever the consumer is a program rather than this process. */
+  locate(id) {
+    return this._serial(async () => {
+      this.chan.writeFrame({ op: "locate", id });
+      return unwrapOk(await this.chan.readFrame()).path;
     });
   }
 

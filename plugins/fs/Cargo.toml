@@ -1,0 +1,20 @@
+[package]
+name = "portos-fs"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "portos-fs"
+path = "src/main.rs"
+
+[dependencies]
+globset = "0.4"
+ignore = "0.4"
+portos-abi = { path = "../../abi" }
+portos-sdk = { path = "../../sdk/rust" }
+regex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+portos-kernel = { path = "../../kernel" }

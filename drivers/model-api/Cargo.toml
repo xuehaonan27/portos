@@ -1,9 +1,0 @@
-[package]
-name = "portos-model-api"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-portos-proto = { path = "../../crates/portos-proto" }
-serde = { workspace = true }
-serde_json = { workspace = true }

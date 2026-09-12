@@ -1,9 +1,12 @@
 [package]
-name = "portos-model-api"
+name = "portos-sdk"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
+nix = { workspace = true }
 portos-abi = { path = "../../abi" }
+portos-router = { path = "../../drivers/router" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }

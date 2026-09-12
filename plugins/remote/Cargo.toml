@@ -1,0 +1,16 @@
+[package]
+name = "portos-remote"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "portos-remote"
+path = "src/main.rs"
+
+[dependencies]
+portos-abi = { path = "../../abi" }
+portos-sdk = { path = "../../sdk/rust" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+ureq = { workspace = true }

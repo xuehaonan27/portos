@@ -1,7 +1,17 @@
 # PortOS Agent Guide
 
 `AGENTS.md` links to this file (`CLAUDE.md`); edit this shared source.
-PortOS is a Rust workspace developing an Agent OS/Runtime. Drivers and plugins exists in separate directories like `drivers/` and `plugins/`.
+PortOS is a Rust workspace developing an Agent OS/Runtime.
+
+**There is one kind of runnable thing: a plugin** — a process that speaks the
+ABI. The kernel has no notion of kinds and nothing branches on one. The tree
+says so: `abi/` is the wire, `kernel/` is the kernel, `sdk/` is the plugin
+side, `drivers/` holds the interfaces that regulate a class of plugin (they
+never run), `plugins/` holds everything that does, and `cli/` is the front
+door. **New components are written as plugins, and any plugin can be
+replaced by another implementation of its driver's interface with no change
+anywhere else.** Nothing outside a plugin may find it by name — only by what
+it answers. `cli/tests/chat.rs` proves it on the model driver.
 
 ## Behavioral Guidelines
 
@@ -23,6 +33,26 @@ Before implementing:
 - If multiple interpretations exist, present them; don't pick silently.
 - If a simpler approach exists, say so. Push back when warranted.
 - If something is unclear, stop. Name what's confusing. Ask.
+
+### 1b. No Special Cases
+
+**A special case is a design defect reporting itself. Stop.**
+
+When something needs an `if` before the general path — a reserved name handled
+before dispatch, a verb intercepted before it is routed, one caller that must
+be treated differently — do not write the branch. Go back and look at the
+design, because the branch is evidence that the general mechanism is the wrong
+shape or is missing something.
+
+This is not a style preference. It has cost real time here: `kernel::*` was
+intercepted before routing, `artifact::read` was intercepted before invoking,
+`remote` built a parallel router outside the kernel, and each of those made the
+missing abstraction — one routing mechanism — look *less* needed rather than
+more. Three workarounds read as three solved problems.
+
+Corollary, because it is the harder half: **a good workaround is worse than a
+bad one.** It hides the gap. When you find yourself pleased with how cleanly
+you routed around something, that is the moment to stop.
 
 ### 2. Simplicity First
 
@@ -96,6 +126,29 @@ theoretical elegance is not. Current state and build order live in
   A large tool result goes into the CAS; the model receives a handle plus a
   preview and dereferences with `artifact::read` when it actually needs the
   bytes. Keeping context bytes far below data bytes is the health metric.
+- **The CAS is a filesystem with one rule: the name is derived from the
+  content.** `<root>/objects/<hh>/<rest>`, one file per artifact, holding
+  exactly the bytes — not a layer over a filesystem, a naming discipline on
+  one. The rule earns its keep where a path cannot: the same bytes get the
+  same name on every machine, a handle still means the same bytes after five
+  intervening tool calls, what ran is checkable afterwards, and a
+  materialised copy never needs invalidating. Objects are stored **0444**, so
+  immutability is enforced rather than promised — which is what makes it safe
+  to hand a plugin the *path* of one instead of copying the bytes.
+  `ClientOp::Locate` does that, and it is what stops a stored result being a
+  dead end: `shell::run {artifacts: {LOG: handle}}` lets `grep` work where
+  the bytes already are, and `fs::write {artifact}` gets them back out — both
+  without anything crossing the model's context. Paths go to plugins, never
+  to the model: the model knows only handles, because a path is a mutable
+  name for immutable content.
+- **Plumbing belongs in the SDK, not in every plugin.** A plugin should be
+  about its business. Running a child you can be sure of collecting
+  (`scope`), knowing what you were configured to be (`config`), and
+  answering with something that might be large (`bulk`) are the same problem
+  for every plugin, and each was re-invented before it moved — the shell
+  driver's hand-rolled reclamation got it wrong twice while it owned it
+  alone. A plugin never learns which runtime form it got, and must not have
+  to.
 - **Driver model.** The kernel does not know what a "browser" is. It knows
   processes, `family::verb` strings, capabilities, handles and events. All
   domain knowledge lives in plugins; a driver family interface is defined
@@ -130,8 +183,13 @@ theoretical elegance is not. Current state and build order live in
   *name* things rather than contain them. The kernel materialises an
   artifact into `<root>/exec/<id>` once — content addressing makes that
   cache correct with no invalidation rule — and the audit records which of
-  the two a plugin was started by. Only single executables so far; a
-  multi-file plugin needs a bundle or an image.
+  the two a plugin was started by. A plugin of several files adds `bundle`:
+  a tar in the CAS, unpacked once and made the process's working directory,
+  so paths *inside* the plugin keep meaning what they meant when it was
+  built. `bundle` is a second question, not an alternative — what files it
+  has, versus what runs — and a JS plugin needs one answer to each, from
+  different places (its script from the bundle, `node` from the host).
+  `portos bundle <root> <base> [paths…]` builds one.
 - The second axis is
   `LaunchSpec.form`, and the kernel implements exactly the two it can
   without learning a domain: `bare` (a child process leading its own group)
@@ -168,16 +226,16 @@ theoretical elegance is not. Current state and build order live in
   name, so stopping revokes what it held, while what others were granted
   about its family goes inert with the route and returns if it does.
   Artifacts and the audit log survive on purpose: immutable records are not
-  state. `crates/portos-echo/tests/hotplug.rs` asserts the list.
+  state. `plugins/echo/tests/hotplug.rs` asserts the list.
 - **A result the model might not read does not enter its context.** Every
   bulky verb answers `{text}` when small and `{handle, size, preview}` when
-  not — one shape, defined once in `portos-bulk-api`, because `modeld`
+  not — one shape, defined once in `portos_sdk::bulk`, because `modeld`
   already promised the model that shape in the `artifact::read` tool
   description. Where the line falls is a constant, not a knob. Pipes count
   as context discipline too: `shell::run` takes a whole `sh -c` string
   precisely so `… 2>&1 | tail -40` can shrink a log before it is ever
   carried.
-- **Another node is a driver, not a kernel feature.** `drivers/remote`
+- **Another node is a driver, not a kernel feature.** `plugins/remote`
   dials a peer's `bridge-http` and re-declares what it finds, renaming the
   family: `browser::open` on node `mac` is `mac_browser::open` here, and
   `model::session::s1` arrives as `mac_model::session::s1`. That keeps two
@@ -198,8 +256,10 @@ theoretical elegance is not. Current state and build order live in
   filling in an API key changes the broker without changing its command
   line, and that is the case reload exists for. Whoever re-plugs a plugin
   owes it its capabilities again, since stopping revokes what it *held*.
-  The limit still standing: a grant removed from the file is not revoked
-  until restart.
+  Two limits still standing: a grant removed from the file is not revoked
+  until restart, and listing a replacement for a standard plugin that is
+  already running takes a restart, because the running one still holds the
+  family when the replacement tries to claim it.
 - **A conversation outlives the driver that held it.** The transcript is
   written to the CAS after every turn and `modeld/sessions.json` records
   where it went — handles and small facts only, so listing sessions never
@@ -209,9 +269,48 @@ theoretical elegance is not. Current state and build order live in
   end. The ordering is load-bearing in the same way the cancel flag was: a
   terminal event promises the turn is durable, so the checkpoint happens
   *before* `done` goes out, never after.
+- **One decision, one mechanism: routing.** *Given a name, who answers it?*
+  was being decided in several places and differently each time, and where
+  it did not fit the answer was an `if` before the general path. The
+  `router` driver states the laws — a name has exactly one answerer, a
+  *family* has one answerer (the capability resource is the family, so a
+  split family makes one grant mean two things), resolution yields the name
+  the **target** knows, a miss is an error and never a default — and each
+  implementation keeps its own table and its own idea of what a target is.
+  The kernel's targets are a plugin or itself; the SDK's are its handlers;
+  the model driver's are "here" or "out through the kernel". A target names
+  an answerer; reaching it is a separate step, which is what lets one table
+  route to a process, a function, or something across a link without
+  knowing the difference.
+- **A plugin says what it cannot work without; nothing declares an order.**
+  `Plugin::needs(&egress::HTTP)` — a `&Verb`, which should be a driver's own
+  constant, because a dependency is a statement in some driver's vocabulary
+  and a plugin that cannot name the driver it depends on is depending on a
+  rumour. Until every need resolves, the plugin runs and keeps its names but
+  **is not routed**: callers see exactly what they see for a stopped plugin,
+  because "not there yet" and "not there any more" are the same thing to a
+  caller. Readiness is re-judged after every spawn and shutdown, repeatedly
+  until nothing moves — and that loop is the whole of dependency ordering.
+  A need is met when somebody answers it **and** this plugin may call it:
+  a plugin allowed to ask nobody and a plugin forbidden to ask are equally
+  unable to work, so both are judged before it is routed, and the operator
+  learns at startup rather than mid-turn. `kernel::plugins` and the spawn
+  reply report what a plugin is still waiting for; the route table does not,
+  because a third state in it would be a special case for every reader.
+- **A plugin may learn a verb after it is running.** `hello` is the ordinary
+  way to declare verbs, not the only one: a driver that mirrors somebody
+  else cannot know what it answers until it has asked them, and asking
+  requires being up. `Registrar::tool` — handed to the `on_ready` hook, and
+  `Send`, so the asking can take as long as it takes on its own thread —
+  adds to the plugin's table and claims the name with the kernel in one
+  step. So the kernel reconciles a plugin's routes against what it declares
+  rather than toggling them when it first becomes ready; the remote driver
+  starts against a peer that is down, answers nothing, and takes its verbs
+  on when the peer appears, which is the same waiting state a dependency
+  produces because it is the same state.
 - **Rendering is event subscription.** A renderer is an ordinary plugin with
   zero verbs and zero capabilities that subscribes to `model::session::*`.
-  Several may compose. `drivers/render-tty` is the reference.
+  Several may compose. `plugins/render-tty` is the reference.
 - **Credentials stop at the broker.** Plugins get no direct network. Anything
   reaching the outside world invokes `egress::*`; the broker checks the
   allowlist and injects the key, which exists in no other process. That is
@@ -229,43 +328,46 @@ MCP later is the opposite direction and is fine).
 
 ```sh
 cargo build --workspace
-cargo test --workspace          # 90 tests; all must pass, zero warnings
+cargo test --workspace          # 97 tests; all must pass, zero warnings
 cargo fmt --all
 ```
 
 The end-to-end tests are the ones that matter and they are hermetic:
 
-- `crates/portos-cli/tests/chat.rs` — the full chain through the real CLI
+- `cli/tests/chat.rs` — the full chain through the real CLI
   binary: user line → modeld → broker (key injection) → scripted provider →
   tool_use → capability-gated invoke → headless Chromium → tool_result →
-  streamed text. Needs `node` and `npm install` in `drivers/browser`; skips
+  streamed text. Needs `node` and `npm install` in `plugins/browser`; skips
   with a printed reason otherwise, so check for "skipping:" in the output
-  before believing a green run.
-- `crates/portos-echo/tests/abi_v2.rs` — plugin ABI conformance.
-- `crates/portos-broker/tests/egress.rs` — allowlist, injection, sanitizing.
-- `drivers/model/tests/modeld.rs` — the agentic loop, cancellation, and a
+  before believing a green run. Also the substitution: the same CLI with a
+  different model driver listed in `chat.json` and nothing else changed,
+  which is the guarantee a plugin author relies on, tested rather than
+  promised.
+- `plugins/echo/tests/abi_v2.rs` — plugin ABI conformance.
+- `plugins/broker/tests/egress.rs` — allowlist, injection, sanitizing.
+- `plugins/modeld/tests/modeld.rs` — the agentic loop, cancellation, and a
   conversation outliving the driver: run a turn, take the driver away, start
   another over the same directory, and check what the *provider* is shown
   next, which is the only thing that proves the history is really there.
-- `drivers/fs/tests/fs.rs` and `drivers/shell/tests/shell.rs` — the context
+- `plugins/fs/tests/fs.rs` and `plugins/shell/tests/shell.rs` — the context
   discipline, measured rather than asserted (`host.meter()` after a big
   result), and the two things easy to get wrong: a walk that ignores
   `.gitignore`, and a timeout that collects only the leader instead of the
   process group.
-- `crates/portos-echo/tests/hotplug.rs` — a running system gaining and losing
+- `plugins/echo/tests/hotplug.rs` — a running system gaining and losing
   a capability, and the residue list after it loses one.
-- `crates/portos-echo/tests/form.rs` — the runtime form, measured against
+- `plugins/echo/tests/form.rs` — the runtime form, measured against
   its control: a grandchild that leaves the process group with `setsid`
   survives teardown in `bare` form and does not in `cgroup` form, a busy
   cgroup refuses `rmdir`, and a cgroup left by a dead run is collected by
   the next one. It also holds the property a driver author relies on — the
   same binary behaves identically under every form — which is where a new
   form gets added. Skips with a reason where cgroup v2 is not writable.
-- `crates/portos-echo/tests/remote.rs` — two nodes in one process, sharing
+- `plugins/echo/tests/remote.rs` — two nodes in one process, sharing
   nothing but a loopback socket: the far node's verbs arriving as ordinary
   local ones, the two grant tables that each get a say, and the fact that an
   ephemeral ref crosses untranslated while a handle cannot.
-- `crates/portos-echo/tests/bridge.rs` — the extensibility claim itself: a
+- `plugins/echo/tests/bridge.rs` — the extensibility claim itself: a
   plugin carrying the event plane and the invoke path over HTTP, written
   against the published ABI with no kernel change. If a change here starts
   needing one, that is the finding, not an inconvenience.
@@ -283,45 +385,66 @@ walking skeleton test is what proves the wiring.
 
 ## Workspace Codemap
 
-- `crates`: kernel and kernel-side facilities.
-    - `portos-kernel`: four responsibilities only — `caps` (authorization,
-      and the join that builds the tool surface), `cas` (data plane),
-      `host` (ABI v2: spawn, verb routing, event bus, chunked streaming),
-      `audit`, plus `cgroup`, which is how it makes a child on Linux rather
-      than a domain it knows. Domain vocabulary here is an architectural
-      violation.
-    - `portos-proto`: the wire. `wire` holds the protocol as types — the
-      envelope is an enum so a malformed frame is refused rather than
-      defaulted, and `Payload` is unparsed JSON the kernel forwards without
-      being able to read it. `ids` holds `Verb`/`Topic`/`PluginName`/`SubId`,
-      which parse once so their accessors are total. Also the frame codec,
-      chunk streaming, `Capability`, `Label`, artifact metadata.
-    - `portos-sdk`: the Rust plugin side; `sdk/js/client.js` is its JS twin.
-    - `portos-broker`: the egress chokepoint. Trusted, kernel-spawned, not a
-      driver.
-    - `portos-cli`: `portos init|put|meta|get|audit-verify|sessions|chat`.
-      Links the kernel as a library; daemonization is deferred to W4.
-      `chat --resume [id]` continues a stored conversation; `SIGHUP` reloads.
-    - `portos-echo`: the toy plugin the ABI conformance tests drive.
-- `drivers`: driver plugins and family-interface libraries.
-    - Family interfaces — the contract between an implementation and its
-      callers, depended on by both so a wire shape is never written twice:
-      `egress-api` (`portos-egress-api`), `model-api` (`portos-model-api`),
-      and `bulk-api` (`portos-bulk-api`) — not a family but a cross-driver
-      result convention, the Rust twin of `drivers/browser/src/sink.js`.
-      The kernel depends on none of them; it must not know these exist.
-    - Implementations: `model` (Rust — neutral agentic loop in `core.rs`,
-      wire protocols under `backends/`; a backend names a *protocol*, so
-      `anthropic-compatible` speaks the Messages API to whatever `base_url`,
-      `path`, `headers` and `model` the config names, and `base_url`/`model`
-      have no defaults because guessing a vendor is worse than an error), `browser` (JS/Playwright), `render-tty`
-      (renderer reference), `bridge-http` (the event plane and the invoke
-      path over HTTP/SSE, so a presenter can live off-box; transport and
-      presentation are separate files on purpose), `remote` (the other end
-      of that socket: another node's verbs, mirrored here), `fs` and
-      `shell` (the file tree and command execution; both answer bulky verbs
-      through `bulk-api`, which is the third family-shaped library here —
-      the `{handle, size, preview}` result shape the model was promised).
+- `abi` (`portos-abi`): the wire. `wire` holds the protocol as types — the
+  envelope is an enum so a malformed frame is refused rather than defaulted,
+  and `Payload` is unparsed JSON the kernel forwards without being able to
+  read it. `ids` holds `Verb`/`Topic`/`PluginName`/`SubId`, which parse once
+  so their accessors are total. Also the frame codec, chunk streaming,
+  `Capability`, `Label`, artifact metadata, and `boundary`: a cgroup, a
+  boundary whatever is inside cannot leave — here because both sides need
+  it; the kernel puts a plugin in one, a plugin puts its own children in one.
+- `kernel` (`portos-kernel`): `caps` (authorization, and the join that
+  builds the tool surface), `cas` (the data plane), `host` (ABI v2: the two
+  axes of a plugin — what it is and how it runs — plus the event bus and
+  chunked streaming), `routes` (its implementation of the `router` driver),
+  `audit`. Domain vocabulary here is an architectural violation.
+- `sdk/rust` (`portos-sdk`): the plugin side, and the place plumbing goes so
+  that a plugin can be about its business. `config` (what the launcher said
+  this plugin should be, parsed into the plugin's own type), `scope` (running
+  a child you can be sure of collecting: pipes, timeout, escalation,
+  reclamation), `bulk` (how any verb answers when the result might be
+  large). `sdk/js/client.js` is its JS twin.
+- `cli` (`portos-cli`): `portos init|put|bundle|meta|get|audit-verify|sessions|chat`.
+  Links the kernel as a library; daemonization is deferred to W4.
+  `chat --resume [id]` continues a stored conversation; `SIGHUP` reloads.
+  The standard broker and model driver are defaults, started only for a
+  family nothing in `chat.json` answers; the front end finds the model
+  driver by asking who answers `model::start`, never by name.
+- `drivers`: interfaces that regulate a class of behaviour, depended on by
+  implementations and callers alike so a shape is never written twice.
+  `egress`, `model`, `router`. **These never run.** A new plugin that needs a
+  new interface adds a driver here and becomes its first implementation.
+
+  The kernel must not know that a *domain* family exists — `egress`, `model`
+  and whatever comes next are none of its business, and that is where
+  extensibility comes from. But a driver is not always a domain: `router` is
+  the interface for resolving a name to something you can reach, and the
+  kernel is one of its implementations. **The line is what a driver is, not
+  who happens to implement it.** The ambition that serves: the kernel should
+  be a composition of standard implementations of standard interfaces, so
+  that "in-kernel or a plugin?" becomes a deployment choice rather than a
+  rewrite. Only two things can never be plugins, because a plugin needs them
+  in order to *be* one — the ABI accept loop, and the launcher that starts
+  the first plugin.
+
+  A cross-cutting convention with no interface of its own is not a driver —
+  it belongs in the SDK, which is where `bulk` lives.
+- `plugins`: everything that speaks the ABI.
+    - `broker`: the egress chokepoint. Trusted, kernel-spawned.
+    - `echo`: the toy plugin the kernel's conformance tests drive; its
+      `tests/` are where the kernel's end-to-end behaviour is asserted.
+    - `model` (Rust — neutral agentic loop in `core.rs`, wire protocols under
+      `backends/`; a backend names a *protocol*, so `anthropic-compatible`
+      speaks the Messages API to whatever `base_url`, `path`, `headers` and
+      `model` the config names, and `base_url`/`model` have no defaults
+      because guessing a vendor is worse than an error).
+    - `model-echo`: the second model driver — it says the line back. What
+      `portos chat` runs against to prove a plugin is replaceable, and the
+      way to see the whole runtime work with no provider, key or network.
+    - `browser` (JS/Playwright), `fs`, `shell`, `remote` (another node's
+      verbs, mirrored here), `bridge-http` (the event plane and the invoke
+      path over HTTP/SSE; transport and presentation are separate files on
+      purpose), `render-tty` (the renderer reference).
 - `docs`: does not exist yet. Solid documentation goes here only after human
   approval; until then everything lives in `.dev`.
 - `.dev` (gitignored): temporal development space, never added into git worktree.

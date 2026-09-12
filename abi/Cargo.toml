@@ -1,9 +1,12 @@
 [package]
-name = "portos-model-api"
+name = "portos-abi"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-portos-abi = { path = "../../abi" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+blake3 = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }

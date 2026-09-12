@@ -1,0 +1,508 @@
+//! portos-modeld: the model driver — the LLM as a peripheral,
+//! provider-neutral by construction.
+//!
+//! Verb family `model::` — `start` / `send` / `end`, defined by the
+//! `portos-model-api` family interface. A `send` runs the agentic loop: the
+//! configured [`backend`](crate::backend) produces turns, tool calls route
+//! through kernel `invoke` (capability-gated there — this plugin holds no
+//! authority of its own, not even network: LLM traffic goes through the
+//! egress gateway, which injects an API key this process never sees), and
+//! progress streams as `SessionEvent`s on the session's topic.
+//!
+//! Sessions outlive the process. A transcript is written to the CAS after
+//! every turn and `$PORTOS_MODELD_DIR/sessions.json` records where it went,
+//! so `model::start {resume}` continues a conversation the driver has no
+//! memory of — after a restart, after a config reload, after a crash. The
+//! index holds handles and small facts only; see `store.rs` for why.
+//!
+//! Config: `$PORTOS_MODELD_DIR/config.json` —
+//! `{backend, model, max_tokens, system, max_turns, tools: […]}`.
+//! The tool surface comes from grants introspection by default — each verb
+//! this plugin may invoke, joined with the metadata its driver advertised —
+//! with config-declared `tools` overriding per verb.
+
+mod backend;
+mod backends;
+mod core;
+mod store;
+mod tools;
+
+use crate::core::{EgressStream, Gateway, ModelError, Session, ToolDef};
+use crate::store::Store;
+use portos_abi::ids::{Topic, Verb};
+use portos_abi::wire::Payload;
+use portos_egress_api::{self as egress, EgressRequest, StreamEvent};
+use portos_model_api as model;
+use portos_router::Router as _;
+use portos_sdk::{CallError, KernelClient, Plugin};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{SyncSender, sync_channel};
+use std::sync::{Arc, LazyLock, Mutex};
+
+/// The single egress-stream topic this plugin listens on. One turn is in
+/// flight at a time (the serve loop is single-threaded), so one slot is
+/// enough; concurrent sessions would need per-stream topics.
+static STREAM_TOPIC: LazyLock<Topic> =
+    LazyLock::new(|| Topic::parse("portos-modeld::egress").expect("constant topic"));
+
+/// The built-in data-plane tool: oversized tool results arrive as
+/// `{handle, preview}`; this reads the full content back by handle. It is
+/// model-driver plumbing (provider- and driver-neutral), served by the
+/// kernel `read` op rather than an invoke — reads are free but audited.
+static ARTIFACT_READ: LazyLock<Verb> =
+    LazyLock::new(|| Verb::parse("artifact::read").expect("constant verb"));
+
+struct Gw {
+    client: Arc<KernelClient>,
+    slot: Arc<Mutex<Option<SyncSender<StreamEvent>>>>,
+}
+
+impl Gateway for Gw {
+    fn http_stream(&self, req: EgressRequest) -> Result<EgressStream, ModelError> {
+        let (tx, rx) = sync_channel::<StreamEvent>(1024);
+        *self.slot.lock().unwrap() = Some(tx);
+        let req = req.streaming_to(STREAM_TOPIC.clone());
+        let head = self
+            .client
+            .invoke(&egress::HTTP_STREAM, Payload::of(&req)?)
+            .map_err(|e| ModelError::Gateway(e.to_string()))?;
+        let head: egress::StreamHead = head.parse()?;
+        Ok(EgressStream {
+            status: head.status,
+            rx,
+        })
+    }
+}
+
+fn modeld_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os(portos_model_api::DIR_ENV).map(std::path::PathBuf::from)
+}
+
+fn load_config() -> Value {
+    modeld_dir()
+        .and_then(|d| std::fs::read_to_string(d.join("config.json")).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({}))
+}
+
+/// A tool the operator declared in config, overriding or adding to what
+/// grants introspection turns up.
+#[derive(Deserialize)]
+struct ConfigTool {
+    verb: Verb,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    schema: Option<Payload>,
+}
+
+fn load_tools(cfg: &Value) -> Result<Vec<ToolDef>, String> {
+    let Some(list) = cfg.get("tools") else {
+        return Ok(Vec::new());
+    };
+    let tools: Vec<ConfigTool> =
+        serde_json::from_value(list.clone()).map_err(|e| format!("config tools: {e}"))?;
+    Ok(tools
+        .into_iter()
+        .map(|t| ToolDef {
+            verb: t.verb,
+            description: t.description,
+            schema: t.schema.unwrap_or_else(empty_object_schema),
+        })
+        .collect())
+}
+
+fn empty_object_schema() -> Payload {
+    Payload::of(&json!({"type": "object", "properties": {}})).expect("constant schema")
+}
+
+fn artifact_read_meta() -> portos_abi::wire::ToolMeta {
+    portos_abi::wire::ToolMeta {
+        description: "Read (a range of) a stored artifact by id. Large tool results \
+                      arrive as {handle, preview}: pass the handle here to read the \
+                      full content as UTF-8 text. Page through big artifacts with \
+                      offset/len; the result says whether it was truncated."
+            .to_string(),
+        schema: Payload::of(&json!({
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "the artifact handle"},
+                "offset": {"type": "integer"},
+                "len": {"type": "integer"},
+            },
+            "required": ["id"],
+        }))
+        .ok(),
+    }
+}
+
+#[derive(Deserialize)]
+struct ArtifactReadArgs {
+    id: String,
+    #[serde(default)]
+    offset: u64,
+    #[serde(default)]
+    len: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct ArtifactReadReply {
+    text: String,
+    offset: u64,
+    len_read: u64,
+    truncated: bool,
+}
+
+/// The per-turn tool surface: grants introspection (each granted verb joined
+/// with the metadata its driver advertised) + config-declared tools (which
+/// win per verb) + the artifact::read built-in. Families in `exclude` never
+/// surface — egress by default: it is this driver's own plumbing, not a
+/// model tool, even though the capability exists.
+/// The table for one turn: what may be invoked right now, plus the verb this
+/// driver answers itself. Rebuilt each turn because grants change — starting
+/// a plugin mid-turn is exactly that.
+fn assemble_table(
+    client: &Arc<KernelClient>,
+    introspect: bool,
+    exclude: &[String],
+    config_tools: &[ToolDef],
+) -> tools::ToolTable {
+    let grants = if introspect {
+        client.grants().unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    tools::assemble(grants, exclude, config_tools)
+}
+
+/// Sessions outlive any single turn, and a turn runs on its own thread, so a
+/// session is shared rather than owned by the serve loop.
+type Sessions = Arc<Mutex<BTreeMap<String, Arc<Mutex<Session>>>>>;
+/// Cancel flags for turns in flight, keyed by session. Empty means idle.
+type Running = Arc<Mutex<BTreeMap<String, Arc<AtomicBool>>>>;
+
+fn main() -> std::io::Result<()> {
+    let cfg = load_config();
+    let backend = backend::make_backend(&cfg).map_err(std::io::Error::other)?;
+    let config_tools = Arc::new(load_tools(&cfg).map_err(std::io::Error::other)?);
+    let introspect = cfg["introspect_tools"].as_bool().unwrap_or(true);
+    let exclude: Arc<Vec<String>> = Arc::new(
+        cfg["tool_families_exclude"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_else(|| vec!["egress".to_string()]),
+    );
+    let read_max = cfg["read_max"].as_u64().unwrap_or(32 * 1024);
+    let default_system = cfg["system"].as_str().unwrap_or("").to_string();
+    let max_turns = cfg["max_turns"].as_u64().unwrap_or(16) as u32;
+
+    let slot: Arc<Mutex<Option<SyncSender<StreamEvent>>>> = Arc::new(Mutex::new(None));
+    let slot_for_events = slot.clone();
+
+    let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
+    let running: Running = Arc::new(Mutex::new(BTreeMap::new()));
+    let store = Arc::new(Store::open(modeld_dir().as_deref()));
+    // Start numbering above whatever is already stored: a restarted driver
+    // that handed out `s1` again would be writing over a conversation it
+    // knows nothing about.
+    // `next_session` and `subscribed` are owned by the one closure that
+    // touches them — which the single `match` made impossible to see, and
+    // which is the useful half of splitting the verbs apart.
+    let mut next_session = store
+        .as_ref()
+        .as_ref()
+        .map(|s| s.load().highest_id())
+        .unwrap_or(0);
+    let mut subscribed = false;
+
+    let (s_start, st_start, ds) = (sessions.clone(), store.clone(), default_system);
+    let (s_send, st_send, r_send) = (sessions.clone(), store.clone(), running.clone());
+    let r_cancel = running.clone();
+    let (s_end, r_end) = (sessions.clone(), running.clone());
+
+    portos_sdk::serve(
+        Plugin::new("portos-modeld")
+            // Its LLM calls go through the gateway; without one it can take a
+            // session and answer nothing. Said here because this driver is
+            // the only thing that knows it.
+            .needs(&egress::HTTP)
+            .needs(&egress::HTTP_STREAM)
+            // Opening a conversation and continuing one are the same act:
+            // `resume` decides which. A resumed session already in memory is
+            // handed back as it is, so reconnecting a front end costs no read.
+            .verb("model::start", move |args, client| {
+                let a: model::StartArgs = args.parse()?;
+                let id = match a.resume {
+                    Some(id) => {
+                        session_of(&s_start, &st_start, client, &id)?;
+                        id
+                    }
+                    None => {
+                        next_session += 1;
+                        let id = model::SessionId::new(next_session);
+                        let session = Session {
+                            system: a.system.unwrap_or_else(|| ds.clone()),
+                            messages: Vec::new(),
+                        };
+                        if let Some(store) = st_start.as_ref() {
+                            // Recorded before a word is said, so an abandoned
+                            // session is still listable rather than invisible.
+                            store.save(client, id.as_str(), &session)?;
+                        }
+                        s_start
+                            .lock()
+                            .unwrap()
+                            .insert(id.as_str().to_string(), Arc::new(Mutex::new(session)));
+                        id
+                    }
+                };
+                Ok(Payload::of(&model::StartReply { session: id })?)
+            })
+            // Accept the turn and return. Everything it produces arrives on
+            // the session topic, so the caller is free to cancel it, serve
+            // another front end, or simply not be blocked.
+            .verb("model::send", move |args, client| {
+                let a: model::SendArgs = args.parse()?;
+                let sid = a.session;
+                let session = session_of(&s_send, &st_send, client, &sid)?;
+
+                let flag = Arc::new(AtomicBool::new(false));
+                {
+                    // One turn at a time, because the egress stream lands on a
+                    // single topic. Per-turn topics are what lifts this, and
+                    // nothing needs them yet.
+                    let mut r = r_send.lock().unwrap();
+                    if let Some(busy) = r.keys().next() {
+                        return Err(CallError::from(format!(
+                            "a turn is already running on session {busy}"
+                        )));
+                    }
+                    r.insert(sid.as_str().to_string(), flag.clone());
+                }
+                if !subscribed {
+                    client.subscribe(&STREAM_TOPIC)?;
+                    subscribed = true;
+                }
+
+                let turn = Turn {
+                    backend: backend.clone(),
+                    client: client.clone(),
+                    slot: slot.clone(),
+                    running: r_send.clone(),
+                    store: st_send.clone(),
+                    config_tools: config_tools.clone(),
+                    exclude: exclude.clone(),
+                    introspect,
+                    read_max,
+                    max_turns,
+                };
+                std::thread::spawn(move || turn.run(sid, session, a.text, flag));
+                Ok(Payload::of(&model::SendReply::default())?)
+            })
+            .verb("model::cancel", move |args, _client| {
+                let a: model::CancelArgs = args.parse()?;
+                let cancelled = match r_cancel.lock().unwrap().get(a.session.as_str()) {
+                    Some(flag) => {
+                        flag.store(true, Ordering::Relaxed);
+                        true
+                    }
+                    None => false,
+                };
+                Ok(Payload::of(&model::CancelReply { cancelled })?)
+            })
+            // Ending a session closes it, it does not delete it: the
+            // transcript stays on disk and `start {resume}` brings it back.
+            // Closing a conversation and throwing it away are different
+            // intentions and should not share a verb.
+            .verb("model::end", move |args, _client| {
+                let a: model::EndArgs = args.parse()?;
+                if let Some(flag) = r_end.lock().unwrap().get(a.session.as_str()) {
+                    flag.store(true, Ordering::Relaxed);
+                }
+                Ok(Payload::of(&model::EndReply {
+                    ended: s_end.lock().unwrap().remove(a.session.as_str()).is_some(),
+                })?)
+            }),
+        move |topic, data| {
+            if topic == &*STREAM_TOPIC {
+                if let Ok(ev) = data.parse::<StreamEvent>() {
+                    if let Some(tx) = slot_for_events.lock().unwrap().as_ref() {
+                        // A full or gone consumer just drops frames; the
+                        // event thread must never block.
+                        let _ = tx.try_send(ev);
+                    }
+                }
+            }
+        },
+    )
+}
+
+/// The session with this id, loading it from the store if this process has
+/// not seen it.
+///
+/// The map in memory is a **cache**; the store is the truth. A conversation
+/// that is on disk but not in memory is not "unknown" — it is a driver that
+/// has been restarted since, and no front end should have to know that
+/// happened. This is what makes a config reload invisible to whoever is
+/// talking.
+fn session_of(
+    sessions: &Sessions,
+    store: &Option<Store>,
+    client: &KernelClient,
+    sid: &model::SessionId,
+) -> Result<Arc<Mutex<Session>>, CallError> {
+    if let Some(existing) = sessions.lock().unwrap().get(sid.as_str()).cloned() {
+        return Ok(existing);
+    }
+    let stored = match store {
+        Some(st) => st.restore(client, sid.as_str())?,
+        None => None,
+    };
+    let Some(restored) = stored else {
+        return Err(CallError::from(format!("unknown session: {sid}")));
+    };
+    let shared = Arc::new(Mutex::new(restored));
+    sessions
+        .lock()
+        .unwrap()
+        .insert(sid.as_str().to_string(), shared.clone());
+    Ok(shared)
+}
+
+/// Everything one turn needs, gathered so it can move to its own thread.
+struct Turn {
+    backend: Arc<dyn core::Backend + Send + Sync>,
+    client: Arc<KernelClient>,
+    slot: Arc<Mutex<Option<SyncSender<StreamEvent>>>>,
+    running: Running,
+    store: Arc<Option<Store>>,
+    config_tools: Arc<Vec<ToolDef>>,
+    exclude: Arc<Vec<String>>,
+    introspect: bool,
+    read_max: u64,
+    max_turns: u32,
+}
+
+impl Turn {
+    fn run(
+        self,
+        sid: model::SessionId,
+        session: Arc<Mutex<Session>>,
+        text: String,
+        flag: Arc<AtomicBool>,
+    ) {
+        let topic = sid.topic();
+        let client = &self.client;
+        let emit = |ev: model::SessionEvent| {
+            // Free the session *before* the terminal event goes out, not
+            // after the loop returns: that event is exactly the cue a front
+            // end uses to send the next message, and a stop button followed
+            // immediately by a send would otherwise be told a turn is still
+            // running.
+            if ev.is_terminal() {
+                self.running.lock().unwrap().remove(sid.as_str());
+            }
+            if let Ok(p) = Payload::of(&ev) {
+                let _ = client.emit(&topic, p);
+            }
+        };
+        // One table, shared by the two closures below: the list the model is
+        // shown and the decision about where each call goes are the same
+        // thing, and the `if` that used to sit here was the seam between two
+        // copies of it.
+        let table = std::cell::RefCell::new(tools::ToolTable::default());
+        let invoke = |verb: &Verb, a: Payload| -> Result<Payload, String> {
+            let answer = table
+                .borrow()
+                .resolve(verb)
+                .map(|r| *r.target)
+                // A miss is an error, not a fall-through to the kernel: a
+                // verb absent from the table is one the model was not
+                // offered, and a family excluded from the surface is now
+                // genuinely not offered rather than merely unlisted.
+                .ok_or_else(|| format!("not a tool you have: {verb}"))?;
+            match answer {
+                tools::Answer::Here(tools::Local::ReadArtifact) => {
+                    read_artifact(client, a, self.read_max).map_err(|e| e.to_string())
+                }
+                tools::Answer::Kernel => client.invoke(verb, a).map_err(|e| e.to_string()),
+            }
+        };
+        let gw = Gw {
+            client: client.clone(),
+            slot: self.slot.clone(),
+        };
+        // Recomputed per turn inside the loop: a turn that starts a plugin
+        // sees its verbs on the very next turn, not the next message.
+        let tools = || {
+            let fresh = assemble_table(client, self.introspect, &self.exclude, &self.config_tools);
+            let defs = fresh.tool_defs();
+            *table.borrow_mut() = fresh;
+            defs
+        };
+        let checkpoint = |s: &Session| {
+            if let Some(store) = self.store.as_ref() {
+                if let Err(e) = store.save(client, sid.as_str(), s) {
+                    eprintln!("[modeld] could not store session {sid}: {e}");
+                }
+            }
+        };
+
+        let result = {
+            let mut s = session.lock().unwrap();
+            core::run_send(
+                &*self.backend,
+                &gw,
+                &mut s,
+                &checkpoint,
+                &tools,
+                text,
+                self.max_turns,
+                &emit,
+                &invoke,
+                &|| flag.load(Ordering::Relaxed),
+            )
+        };
+        // Exactly one terminal event per turn. `run_send` emits Done and
+        // Cancelled itself — and, just before each, the checkpoint above. A
+        // failure has no other way to be heard, and a front end waiting for
+        // a terminal event would wait forever.
+        //
+        // A failed turn is stored too: it has a user message and no answer,
+        // and that is what actually happened.
+        if let Err(e) = result {
+            if !matches!(e, ModelError::Cancelled) {
+                checkpoint(&session.lock().unwrap());
+                emit(model::SessionEvent::Failed {
+                    error: e.to_string(),
+                });
+            }
+        }
+    }
+}
+
+/// Dereference an artifact for the model, capped at `read_max` bytes so one
+/// tool result cannot flood the context.
+fn read_artifact(
+    client: &Arc<KernelClient>,
+    args: Payload,
+    read_max: u64,
+) -> Result<Payload, CallError> {
+    let a: ArtifactReadArgs = args.parse()?;
+    let len = a.len.map(|l| l.min(read_max)).unwrap_or(read_max);
+    let mut buf = Vec::new();
+    let n = client.read_to(&a.id, a.offset, Some(len), &mut buf)?;
+    Ok(Payload::of(&ArtifactReadReply {
+        text: String::from_utf8_lossy(&buf).into_owned(),
+        offset: a.offset,
+        len_read: n,
+        truncated: n == len,
+    })?)
+}

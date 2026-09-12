@@ -1,0 +1,13 @@
+[package]
+name = "portos-model-echo"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "portos-model-echo"
+path = "src/main.rs"
+
+[dependencies]
+portos-abi = { path = "../../abi" }
+portos-sdk = { path = "../../sdk/rust" }
+portos-model-api = { path = "../../drivers/model" }

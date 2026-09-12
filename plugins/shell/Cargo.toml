@@ -1,0 +1,18 @@
+[package]
+name = "portos-shell"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "portos-shell"
+path = "src/main.rs"
+
+[dependencies]
+nix = { workspace = true }
+portos-abi = { path = "../../abi" }
+portos-sdk = { path = "../../sdk/rust" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+portos-kernel = { path = "../../kernel" }

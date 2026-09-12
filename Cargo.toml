@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/portos-broker", "crates/portos-cli", "crates/portos-echo", "crates/portos-kernel", "crates/portos-proto", "crates/portos-sdk", "drivers/egress-api", "drivers/model-api", "drivers/model", "drivers/remote", "drivers/bulk-api", "drivers/fs", "drivers/shell"]
+members = ["abi", "kernel", "sdk/rust", "cli", "drivers/egress", "drivers/router", "drivers/model", "plugins/broker", "plugins/echo", "plugins/modeld", "plugins/fs", "plugins/shell", "plugins/remote", "plugins/model-echo"]
 
 [workspace.package]
 version = "0.1.0"
@@ -16,5 +16,6 @@ nix = { version = "0.29", features = ["signal"] }
 rand = "0.8"
 regex = "1"
 hex = "0.4"
+tar = "0.4"
 ureq = "2"
 url = "2"

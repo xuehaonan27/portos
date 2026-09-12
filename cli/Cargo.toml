@@ -1,0 +1,19 @@
+[package]
+name = "portos-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "portos"
+path = "src/main.rs"
+
+[dependencies]
+blake3 = { workspace = true }
+serde = { workspace = true }
+tar = { workspace = true }
+serde_json = { workspace = true }
+nix = { workspace = true }
+portos-egress-api = { path = "../drivers/egress" }
+portos-kernel = { path = "../kernel" }
+portos-model-api = { path = "../drivers/model" }
+portos-abi = { path = "../abi" }
