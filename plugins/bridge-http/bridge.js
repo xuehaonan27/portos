@@ -22,7 +22,7 @@
 // the point: transport changes slowly, presentation changes fast.
 //
 // Authority: whatever connects here acts with **this plugin's** grants. The
-// `grants` list in chat.json is therefore the whole access story — binding to
+// `grants` list in portos.json is therefore the whole access story — binding to
 // loopback and reaching it over `ssh -L` keeps that honest.
 //
 // Config (environment):

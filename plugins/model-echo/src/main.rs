@@ -2,10 +2,10 @@
 //!
 //! The second implementation of the `model::*` driver, and it exists to keep
 //! the first one honest: whoever drives a model driver addresses it by verb
-//! and cannot tell whose implementation answered, so `portos chat` runs
-//! against this one in `cli/tests/chat.rs` exactly as it runs against
+//! and cannot tell whose implementation answered, so `portos run` is tested
+//! against this one in `cli/tests/run.rs` exactly as it runs against
 //! `modeld`. It is also the way to watch the whole runtime work with no
-//! provider, no key and no network — list it in `chat.json` and type.
+//! provider, no key and no network — list it in `portos.json` and type.
 //!
 //! A turn is accepted, not awaited, whoever runs it: `send` returns at once
 //! and the text comes back on the session topic as one delta and a `done`.
@@ -41,6 +41,9 @@ fn main() -> std::io::Result<()> {
                     }
                 });
                 Ok(Payload::of(&model::SendReply {})?)
+            })
+            .verb(model::SESSIONS.as_str(), |_args, _client| {
+                Ok(Payload::of(&model::SessionsReply::default())?)
             })
             .verb(model::CANCEL.as_str(), |_args, _client| {
                 Ok(Payload::of(&model::CancelReply { cancelled: false })?)

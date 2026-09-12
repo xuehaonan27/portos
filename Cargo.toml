@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["abi", "kernel", "sdk/rust", "cli", "drivers/egress", "drivers/router", "drivers/model", "plugins/broker", "plugins/echo", "plugins/modeld", "plugins/fs", "plugins/shell", "plugins/remote", "plugins/model-echo"]
+members = ["abi", "kernel", "sdk/rust", "cli", "drivers/egress", "drivers/router", "drivers/model", "plugins/broker", "plugins/echo", "plugins/modeld", "plugins/fs", "plugins/shell", "plugins/remote", "plugins/model-echo", "plugins/tty"]
 
 [workspace.package]
 version = "0.1.0"

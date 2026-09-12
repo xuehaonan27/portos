@@ -636,6 +636,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "portos-tty"
+version = "0.1.0"
+dependencies = [
+ "nix",
+ "portos-abi",
+ "portos-model-api",
+ "portos-sdk",
+ "serde",
+]
+
+[[package]]
 name = "potential_utf"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -32,7 +32,7 @@ PortOS 只有两种交互形状，这里就只暴露两个端点，加上呈现�
 
 ## 跑起来
 
-`<root>/chat.json`：
+`<root>/portos.json`：
 
 ```json
 {
@@ -51,8 +51,7 @@ PortOS 只有两种交互形状，这里就只暴露两个端点，加上呈现�
 开发机上：
 
 ```sh
-portos chat .dev/root              # 终端 REPL 与 web console 可并存
-portos chat .dev/root --no-repl    # 只要 web console 时
+portos run .dev/root               # 终端前端（tty）与 web console 可并存；不列 tty 就只有 web console
 ```
 
 MacBook 上（**不装任何东西**，只用已有的 SSH 和浏览器）：
@@ -72,7 +71,7 @@ open http://127.0.0.1:7777
 
 **连上这个 socket 的任何东西，拿到的是本插件被授予的全部能力。** bridge 自己不做任何裁决——`POST /invoke` 直接转发，准与不准由内核的能力闸决定（测试 `an_unconfigured_bridge_can_invoke_nothing` 钉住了这一点）。
 
-所以 `chat.json` 里的 `grants` 列表就是全部的访问控制。默认绑回环 + 经 `ssh -L` 访问，是让这句话成立的前提。跨信任边界用它之前需要重新想。
+所以 `portos.json` 里的 `grants` 列表就是全部的访问控制。默认绑回环 + 经 `ssh -L` 访问，是让这句话成立的前提。跨信任边界用它之前需要重新想。
 
 ## 已知限制
 

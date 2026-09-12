@@ -24,7 +24,7 @@ verb 说的是 driver 的动作，不说谁来做。两个节点各有一个 bro
 
 | 问题 | 谁答 | 在哪写 |
 |---|---|---|
-| **什么被暴露出来** | 对端节点 | 对端 `chat.json` 里 bridge 的 grants |
+| **什么被暴露出来** | 对端节点 | 对端 `portos.json` 里 bridge 那一条的 grants |
 | **谁可以用它** | 本节点 | 本地 `driver:<driver>` 的 grants |
 
 两边都点头，verb 才走得通，而且谁也不能替对方点头。启动时本驱动读一次对端的 `/grants`——那就是对端关于"我愿意分享什么"的完整声明，这边不重复写一遍。
@@ -42,14 +42,12 @@ verb 说的是 driver 的动作，不说谁来做。两个节点各有一个 bro
 
 ## 跑起来
 
-对端（节点 B）就是一份普通的 `chat.json`，把要分享的东西授给 bridge：
+对端（节点 B）的 `portos.json` 里多一条 bridge，把要分享的东西授给它：
 
 ```json
-{ "plugins": [{ "bin": "node", "args": [".../plugins/bridge-http/bridge.js"],
-                "env": { "PORTOS_BRIDGE_ADDR": "127.0.0.1:7777",
-                         "PORTOS_BRIDGE_TOPICS": "browser::*" } }],
-  "grants": [{ "subject": "plugin:portos-bridge-http",
-               "resource": "driver:browser", "verbs": ["open", "text", "click"] }] }
+{ "bin": "node", "args": [".../plugins/bridge-http/bridge.js"],
+  "env": { "PORTOS_BRIDGE_ADDR": "127.0.0.1:7777", "PORTOS_BRIDGE_TOPICS": "browser::*" },
+  "grants": [{ "resource": "driver:browser", "verbs": ["open", "text", "click"] }] }
 ```
 
 本节点（节点 A），先把对端的端口接过来：
@@ -58,10 +56,15 @@ verb 说的是 driver 的动作，不说谁来做。两个节点各有一个 bro
 ssh -L 7777:127.0.0.1:7777 macmini
 ```
 
+本节点的 `portos.json` 里多一条 remote，并把 browser 的授权加到 model driver 那一条的 `grants` 里：
+
 ```json
-{ "plugins": [{ "bin": "portos-remote",
-                "config": { "url": "http://127.0.0.1:7777", "node": "mac" } }],
-  "grants": [{ "resource": "driver:browser", "verbs": ["open", "text", "click"] }] }
+{ "bin": "portos-remote", "config": { "url": "http://127.0.0.1:7777", "node": "mac" } }
+```
+```json
+{ "bin": "portos-modeld", "...": "...",
+  "grants": [{ "resource": "driver:egress", "verbs": ["http", "http_stream"] },
+             { "resource": "driver:browser", "verbs": ["open", "text", "click"] }] }
 ```
 
 模型下一轮就会看见 `browser__open`；本机也有浏览器时，这个工具多一个 `instance` 参数，可选 `portos-browser` 或 `portos-remote-mac`。

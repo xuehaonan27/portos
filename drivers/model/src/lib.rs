@@ -76,6 +76,29 @@ impl std::fmt::Display for SessionId {
 pub static CANCEL: LazyLock<Verb> =
     LazyLock::new(|| Verb::parse("model::cancel").expect("constant verb"));
 
+/// What has been stored, newest first. Answered from the driver's index —
+/// handles and small facts, never a transcript — so a front end choosing a
+/// conversation to continue never reads one, and never reads the driver's
+/// files either.
+pub static SESSIONS: LazyLock<Verb> =
+    LazyLock::new(|| Verb::parse("model::sessions").expect("constant verb"));
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SessionsArgs {}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SessionsReply {
+    /// Most recently touched first.
+    pub sessions: Vec<SessionEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionEntry {
+    pub id: SessionId,
+    #[serde(flatten)]
+    pub record: SessionRecord,
+}
+
 pub static ALL_SESSIONS: LazyLock<Topic> =
     LazyLock::new(|| Topic::parse("model::session::*").expect("constant topic"));
 

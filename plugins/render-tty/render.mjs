@@ -5,8 +5,8 @@
 // plugin that subscribes to the event plane and presents what flows past —
 // this one styles model-session events for a terminal (its stdout is
 // inherited from the spawning host, so it prints into the chat terminal).
-// Add several renderers and they compose; replace the builtin by setting
-// `"render": "none"` in chat.json and listing your own here. The Console of
+// Add several renderers and they compose; there is no builtin one — the
+// terminal front end (`plugins/tty`) is a plugin like this. The Console of
 // architecture-v0.md §10 is, in these terms, just a bigger renderer.
 //
 // Serves no verbs; holds no capabilities; consumes `model::session::*` via a

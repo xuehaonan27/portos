@@ -1,9 +1,12 @@
 //! The walking skeleton, closed: the browser adapter over the plugin ABI,
-//! and `portos chat` driven end to end through the real CLI binary —
-//! user line → modeld → broker (key injection) → scripted provider →
-//! tool_use → capability-gated invoke → headless Chromium via the browser
-//! driver → tool_result → final streamed text. Hermetic; skips when node or
-//! the browser driver's node_modules are absent.
+//! and `portos run` driven end to end through the real CLI binary — the
+//! launcher starts what `portos.json` lists and nothing else; the terminal
+//! front end (a plugin, its stdin this test's pipe) sends the line →
+//! modeld → broker (key injection) → scripted provider → tool_use →
+//! capability-gated invoke → headless Chromium via the browser driver →
+//! tool_result → streamed text back out through the same front end.
+//! Hermetic; skips when node or the browser driver's node_modules are
+//! absent.
 
 use portos_kernel::Kernel;
 use portos_kernel::host::Host;
@@ -159,6 +162,26 @@ fn write_json(path: &Path, v: &Value) {
     std::fs::write(path, serde_json::to_string_pretty(v).unwrap()).unwrap();
 }
 
+/// The terminal front end, granted the model driver. Its stdin is whatever
+/// the launcher's is — here, the test's pipe.
+fn tty_plugin() -> Value {
+    json!({"bin": "portos-tty", "grants": [{"resource": "driver:model",
+           "verbs": ["start", "send", "cancel", "end", "sessions"]}]})
+}
+
+/// The set `portos init` writes, for a root under test: broker, model driver
+/// with the grants a test adds, and the front end.
+fn standard_plugins(root: &Path, modeld_grants: Vec<Value>) -> Vec<Value> {
+    let mut grants = vec![json!({"resource": "driver:egress", "verbs": ["http", "http_stream"]})];
+    grants.extend(modeld_grants);
+    vec![
+        json!({"bin": "portos-broker", "env": {"PORTOS_BROKER_DIR": root.join("broker")}}),
+        json!({"bin": "portos-modeld", "env": {"PORTOS_MODELD_DIR": root.join("modeld")},
+               "grants": grants}),
+        tty_plugin(),
+    ]
+}
+
 /// The adapter alone: browser::* verbs over the plugin ABI, the sink's
 /// kernel mode, screenshot-as-artifact, and origin taint labels.
 #[test]
@@ -241,7 +264,7 @@ fn browser_adapter_serves_verbs_and_data_plane() {
 /// Rendering as a plugin (D32): builtin off, a renderer driver subscribed to
 /// `model::session::*` owns the terminal output.
 #[test]
-fn portos_chat_with_renderer_plugin() {
+fn portos_run_with_renderer_plugin() {
     if std::process::Command::new("node")
         .arg("--version")
         .output()
@@ -253,14 +276,13 @@ fn portos_chat_with_renderer_plugin() {
     let renderer = repo_root().join("plugins/render-tty/render.mjs");
     assert!(renderer.exists());
     let cli = Path::new(CLI_BIN);
-    if !cli.with_file_name("portos-broker").exists()
-        || !cli.with_file_name("portos-modeld").exists()
-    {
+    let have = |n: &str| cli.with_file_name(n).exists();
+    if !have("portos-broker") || !have("portos-modeld") || !have("portos-tty") {
         eprintln!("skipping: sibling binaries not built");
         return;
     }
 
-    let root = std::env::temp_dir().join(format!("portos-chat-render-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("portos-run-render-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
 
@@ -302,16 +324,14 @@ fn portos_chat_with_renderer_plugin() {
             "max_tokens": 128,
         }),
     );
-    write_json(
-        &root.join("chat.json"),
-        &json!({
-            "render": "none",
-            "plugins": [{"bin": "node", "args": [renderer.to_str().unwrap()]}],
-        }),
-    );
+    // Two renderers on one session: the front end and the renderer plugin
+    // both subscribe, and both print.
+    let mut plugins = standard_plugins(&root, vec![]);
+    plugins.push(json!({"bin": "node", "args": [renderer.to_str().unwrap()]}));
+    write_json(&root.join("portos.json"), &json!({"plugins": plugins}));
 
     let mut child = std::process::Command::new(cli)
-        .args(["chat", root.to_str().unwrap()])
+        .args(["run", root.to_str().unwrap()])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -335,52 +355,48 @@ fn portos_chat_with_renderer_plugin() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         out.status.success(),
-        "chat exited badly.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "run exited badly.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 
     assert!(
         stdout.contains("Hello from the renderer"),
-        "renderer printed the deltas:\n{stdout}"
+        "renderer printed the deltas:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
         stdout.contains("turn done"),
         "renderer's own turn marker present:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("builtin rendering off"),
-        "builtin renderer was disabled:\n{stdout}"
     );
 
     let _ = std::fs::remove_dir_all(&root);
 }
 
 /// The guarantee a plugin author relies on, exercised on the most entangled
-/// plugin there is: `portos chat` driven by a *different* model driver,
-/// listed in `chat.json` with nothing else changed. The front end addresses
-/// the driver by verb, so it cannot tell — and the standard one is never
-/// started, because something already answers for its driver.
+/// plugin there is: a *different* model driver listed in `portos.json`, and
+/// nothing else changed. The front end addresses the driver by verb, so it
+/// cannot tell; the launcher starts the list and nothing else, so no
+/// standard driver appears beside it.
 #[test]
-fn portos_chat_with_another_model_driver() {
+fn portos_run_with_another_model_driver() {
     let cli = Path::new(CLI_BIN);
-    if !cli.with_file_name("portos-broker").exists()
-        || !cli.with_file_name("portos-model-echo").exists()
-    {
+    let have = |n: &str| cli.with_file_name(n).exists();
+    if !have("portos-model-echo") || !have("portos-tty") {
         eprintln!("skipping: sibling binaries not built");
         return;
     }
 
-    let root = std::env::temp_dir().join(format!("portos-chat-other-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("portos-run-other-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
 
-    // A bare name: found beside the CLI, the way the standard plugins are.
+    // Bare names: found beside the CLI, the way the standard plugins are.
+    // No broker: this driver needs no network, so nothing lists one.
     write_json(
-        &root.join("chat.json"),
-        &json!({"plugins": [{"bin": "portos-model-echo"}]}),
+        &root.join("portos.json"),
+        &json!({"plugins": [{"bin": "portos-model-echo"}, tty_plugin()]}),
     );
 
     let mut child = std::process::Command::new(cli)
-        .args(["chat", root.to_str().unwrap()])
+        .args(["run", root.to_str().unwrap()])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -404,7 +420,7 @@ fn portos_chat_with_another_model_driver() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         out.status.success(),
-        "chat exited badly.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "run exited badly.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 
     assert!(
@@ -412,8 +428,8 @@ fn portos_chat_with_another_model_driver() {
         "the listed driver was started:\n{stdout}"
     );
     assert!(
-        !stdout.contains("started portos-modeld"),
-        "and the standard one was not, because its driver was answered:\n{stdout}"
+        !stdout.contains("started portos-modeld") && !stdout.contains("started portos-broker"),
+        "and nothing beyond the list:\n{stdout}"
     );
     assert!(
         stdout.contains("say this back"),
@@ -425,18 +441,18 @@ fn portos_chat_with_another_model_driver() {
 
 /// The whole runtime through the real CLI binary and a scripted provider.
 #[test]
-fn portos_chat_end_to_end() {
+fn portos_run_end_to_end() {
     let Some((plugin, fixture)) = browser_ready() else {
         return;
     };
     let cli = Path::new(CLI_BIN);
     let have = |n: &str| cli.with_file_name(n).exists();
-    if !have("portos-broker") || !have("portos-modeld") {
+    if !have("portos-broker") || !have("portos-modeld") || !have("portos-tty") {
         eprintln!("skipping: sibling binaries not built (run under cargo test --workspace)");
         return;
     }
 
-    let root = std::env::temp_dir().join(format!("portos-chat-e2e-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("portos-run-e2e-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     let fixture_url = format!("file://{}", fixture.display());
@@ -503,7 +519,7 @@ fn portos_chat_end_to_end() {
     ]);
     let (port, captured) = mock_provider(vec![turn1, turn2]);
 
-    // Configs the chat command will pick up (templates only write if absent).
+    // What the plugins read.
     write_json(
         &root.join("broker/config.json"),
         &json!({"allow": [{"host": "127.0.0.1", "insecure_http": true,
@@ -529,21 +545,20 @@ fn portos_chat_end_to_end() {
             }],
         }),
     );
-    write_json(
-        &root.join("chat.json"),
-        &json!({
-            "plugins": [{
-                "bin": "node",
-                "args": [plugin.to_str().unwrap()],
-                "env": {"WORKSHOP_HEADLESS": "1",
-                         "WORKSHOP_PROFILE_DIR": root.join("profile").to_str().unwrap()},
-            }],
-            "grants": [{"resource": "driver:browser", "verbs": ["open"]}],
-        }),
+    let mut plugins = standard_plugins(
+        &root,
+        vec![json!({"resource": "driver:browser", "verbs": ["open"]})],
     );
+    plugins.push(json!({
+        "bin": "node",
+        "args": [plugin.to_str().unwrap()],
+        "env": {"WORKSHOP_HEADLESS": "1",
+                 "WORKSHOP_PROFILE_DIR": root.join("profile").to_str().unwrap()},
+    }));
+    write_json(&root.join("portos.json"), &json!({"plugins": plugins}));
 
     let mut child = std::process::Command::new(cli)
-        .args(["chat", root.to_str().unwrap()])
+        .args(["run", root.to_str().unwrap()])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -567,12 +582,12 @@ fn portos_chat_end_to_end() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         out.status.success(),
-        "chat exited badly.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "run exited badly.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 
     assert!(
         stdout.contains("Opening the page."),
-        "first-turn deltas streamed:\n{stdout}"
+        "first-turn deltas streamed:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
         stdout.contains("[tool→] browser::open"),

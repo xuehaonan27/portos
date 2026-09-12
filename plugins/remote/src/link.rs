@@ -82,7 +82,7 @@ impl Link {
     }
 
     /// What the peer's bridge may invoke — which is the peer's own decision
-    /// about what it exposes, written in its `chat.json` and read here
+    /// about what it exposes, written in its `portos.json` and read here
     /// rather than duplicated in ours.
     pub fn grants(&self) -> Result<Vec<Grant>, LinkError> {
         let body = self

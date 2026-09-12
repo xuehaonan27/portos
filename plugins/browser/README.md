@@ -1,6 +1,6 @@
 # PortOS browser driver
 
-一个**看得见、能接管、不碰你凭证**的浏览器,作为 PortOS 的第一个 driver:让模型替你在已登录的网站上做事。它已接上 PortOS 内核的 plugin 协议(`src/plugin.js`),由 `portos chat` 拉起使用。PortOS 不做任何人的 MCP server;将来通过 mcp-host **消费** MCP 生态,方向相反。
+一个**看得见、能接管、不碰你凭证**的浏览器,作为 PortOS 的第一个 driver:让模型替你在已登录的网站上做事。它已接上 PortOS 内核的 plugin 协议(`src/plugin.js`),由 `portos run` 拉起使用。PortOS 不做任何人的 MCP server;将来通过 mcp-host **消费** MCP 生态,方向相反。
 
 设计上游:`.dev/plans/workshopm1v0.md`(demo 优先)+ `.dev/plans/architecture-v0.md`(substrate 北极星)+ `.dev/plans/decisions-v1.md`(独立运行时方向修订)。
 
@@ -12,7 +12,7 @@ npm test                              # 冒烟:navigate → 蒸馏 → type → 
 node src/cli-demo.js https://example.com   # 独立 demo;Mac 上默认开真实可见 Chrome,无显示器机器自动无头
 ```
 
-作为 PortOS driver 运行:在 `<root>/chat.json` 里登记本插件后 `portos chat <root>`(见仓库 `.dev/gen/chat-status.md` 的配置样例);端到端测试在 `cli/tests/chat.rs`。
+作为 PortOS driver 运行:在 `<root>/portos.json` 里登记本插件后 `portos run <root>`(见仓库 `.dev/gen/chat-status.md` 的配置样例);端到端测试在 `cli/tests/run.rs`。
 
 ## 结构与三条缝
 

@@ -1,0 +1,15 @@
+[package]
+name = "portos-tty"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "portos-tty"
+path = "src/main.rs"
+
+[dependencies]
+nix = { workspace = true, features = ["process", "term", "fs"] }
+serde = { workspace = true }
+portos-abi = { path = "../../abi" }
+portos-sdk = { path = "../../sdk/rust" }
+portos-model-api = { path = "../../drivers/model" }

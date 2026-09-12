@@ -64,7 +64,7 @@ use std::sync::{Arc, Mutex};
 
 /// How to start a plugin, and what it may do once it is up.
 ///
-/// The same shape whether it comes from `chat.json` at boot or from a
+/// The same shape whether it comes from `portos.json` at boot or from a
 /// `kernel::spawn` call mid-session: starting a plugin is one operation with
 /// one description, not two code paths that drift.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

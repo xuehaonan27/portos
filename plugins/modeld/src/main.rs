@@ -237,6 +237,27 @@ fn main() -> std::io::Result<()> {
             // Opening a conversation and continuing one are the same act:
             // `resume` decides which. A resumed session already in memory is
             // handed back as it is, so reconnecting a front end costs no read.
+            .verb("model::sessions", {
+                let store = store.clone();
+                move |_args, _client| {
+                    let index = store
+                        .as_ref()
+                        .as_ref()
+                        .map(|s| s.load())
+                        .unwrap_or_default();
+                    let sessions = index
+                        .by_recency()
+                        .into_iter()
+                        .filter_map(|(id, record)| {
+                            Some(model::SessionEntry {
+                                id: model::SessionId::parse(id).ok()?,
+                                record: record.clone(),
+                            })
+                        })
+                        .collect();
+                    Ok(Payload::of(&model::SessionsReply { sessions })?)
+                }
+            })
             .verb("model::start", move |args, client| {
                 let a: model::StartArgs = args.parse()?;
                 let id = match a.resume {

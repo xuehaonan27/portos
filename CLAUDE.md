@@ -11,7 +11,7 @@ never run), `plugins/` holds everything that does, and `cli/` is the front
 door. **New components are written as plugins, and any plugin can be
 replaced by another implementation of its driver's interface with no change
 anywhere else.** Nothing outside a plugin may find it by name — only by what
-it answers. `cli/tests/chat.rs` proves it on the model driver.
+it answers. `cli/tests/run.rs` proves it on the model driver.
 
 ## Behavioral Guidelines
 
@@ -163,7 +163,7 @@ theoretical elegance is not. Current state and build order live in
 - **Capabilities double as the tool surface.** A granted verb joined with the
   metadata its driver advertised in `hello` is a tool definition; the model
   driver builds its tool list from `grants` introspection. Capabilities are a
-  routing and accounting mechanism here, not a security ceremony — `chat.json`
+  routing and accounting mechanism here, not a security ceremony — `portos.json`
   declares grants and that is the whole approval story.
 - **Teardown is enforced, not requested.** Shutdown escalates — `shutdown`
   frame, then SIGTERM to the process group, then SIGKILL — so a plugin that
@@ -248,22 +248,26 @@ theoretical elegance is not. Current state and build order live in
   startup), this node decides *who may use it* — and the two failures are
   distinguishable, since a verb the peer never exposed has no local route
   at all.
-- **Reload is re-plug.** `SIGHUP` to `portos chat` re-reads the config and
-  brings the running set back in line — whatever changed is stopped and
+- **The launcher is the one thing that is not a plugin, and it knows no
+  driver.** `portos run <root>` opens the kernel, starts what
+  `<root>/portos.json` lists, mints each entry's grants, and parks. A chat
+  is not a mode of it: a chat is a model driver plus a front end plus
+  whatever else is listed, and `portos init` is the only place the standard
+  set — broker, model driver, terminal front end — is spelled out, into the
+  file. The REPL that used to live in the CLI was a front end masquerading
+  as the launcher, with a renderer that was not a plugin and a launcher that
+  knew `model::start`; both are gone.
+- **Reload is re-plug.** `SIGHUP` to `portos run` re-reads `portos.json`
+  and brings the running set back in line — whatever changed is stopped and
   started again, whatever did not is left alone. There is no second
   mechanism: `kernel::stop` already collects a plugin's whole residue and
-  starting it again puts it back, so reload is a policy over the plugin
-  lifecycle rather than a per-setting "which of these are live?" matrix.
-  A plugin's config files count as part of what it is — listed under
-  `watch` in `chat.json`, built in for the broker and model driver — because
-  filling in an API key changes the broker without changing its command
-  line, and that is the case reload exists for. Whoever re-plugs a plugin
-  owes it its capabilities again, since stopping revokes what it *held*.
-  Two limits still standing: a grant removed from the file is not revoked
-  until restart, and listing a replacement for a standard plugin that is
-  already running takes a restart, because the standard one keeps running
-  beside it as a second instance and this REPL refuses to choose between
-  two model drivers.
+  starting it again puts it back, grants included, so reload is a policy
+  over the plugin lifecycle rather than a per-setting "which of these are
+  live?" matrix. An entry's grants and the files it lists under `watch`
+  count as part of what it is — filling in an API key changes the broker
+  without changing its command line, and that is the case reload exists
+  for — so editing a grant re-plugs exactly that plugin, and a grant removed
+  is a grant revoked.
 - **A conversation outlives the driver that held it.** The transcript is
   written to the CAS after every turn and `modeld/sessions.json` records
   where it went — handles and small facts only, so listing sessions never
@@ -286,7 +290,7 @@ theoretical elegance is not. Current state and build order live in
   naming.** `browser::open` is what the browser interface calls opening.
   Any number of instances may answer it — two browsers here, one on
   another node — and each is a plugin under its own name, given by the
-  launcher (`LaunchSpec.name`, `"name"` in `chat.json`) because only the
+  launcher (`LaunchSpec.name`, `"name"` in `portos.json`) because only the
   launcher knows there are two. With one instance the verb alone resolves;
   with several the caller names one (`invoke_at`, `Invoke.at`, the
   `instance` argument modeld puts on the tool exactly when there is a
@@ -327,9 +331,13 @@ theoretical elegance is not. Current state and build order live in
   starts against a peer that is down, answers nothing, and takes its verbs
   on when the peer appears, which is the same waiting state a dependency
   produces because it is the same state.
-- **Rendering is event subscription.** A renderer is an ordinary plugin with
-  zero verbs and zero capabilities that subscribes to `model::session::*`.
-  Several may compose. `plugins/render-tty` is the reference.
+- **Rendering is event subscription, and so is input.** A renderer is an
+  ordinary plugin with zero verbs that subscribes to `model::session::*`;
+  several may compose. A front end is the same plugin with a source of
+  input: `plugins/tty` reads a terminal and drives `model::send`, and
+  `bridge-http`'s presenter does the same for a browser. Either finds the
+  model driver by verb and cannot tell whose it is, which is what makes both
+  halves of a chat replaceable independently.
 - **Credentials stop at the broker.** Plugins get no direct network. Anything
   reaching the outside world invokes `egress::*`; the broker checks the
   allowlist and injects the key, which exists in no other process. That is
@@ -355,15 +363,16 @@ cargo fmt --all                 # (remote) is not rebuilt by `cargo test`
 
 The end-to-end tests are the ones that matter and they are hermetic:
 
-- `cli/tests/chat.rs` — the full chain through the real CLI
-  binary: user line → modeld → broker (key injection) → scripted provider →
-  tool_use → capability-gated invoke → headless Chromium → tool_result →
-  streamed text. Needs `node` and `npm install` in `plugins/browser`; skips
-  with a printed reason otherwise, so check for "skipping:" in the output
-  before believing a green run. Also the substitution: the same CLI with a
-  different model driver listed in `chat.json` and nothing else changed,
-  which is the guarantee a plugin author relies on, tested rather than
-  promised.
+- `cli/tests/run.rs` — the full chain through the real CLI binary: the
+  launcher starts the list, the terminal front end (its stdin the test's
+  pipe) sends the line → modeld → broker (key injection) → scripted
+  provider → tool_use → capability-gated invoke → headless Chromium →
+  tool_result → streamed text back out. Needs `node` and `npm install` in
+  `plugins/browser`; skips with a printed reason otherwise, so check for
+  "skipping:" in the output before believing a green run. Also the
+  substitution: a different model driver listed in `portos.json` and
+  nothing else changed, which is the guarantee a plugin author relies on,
+  tested rather than promised.
 - `plugins/echo/tests/abi_v2.rs` — plugin ABI conformance.
 - `plugins/broker/tests/egress.rs` — allowlist, injection, sanitizing.
 - `plugins/modeld/tests/modeld.rs` — the agentic loop, cancellation, and a
@@ -427,12 +436,12 @@ walking skeleton test is what proves the wiring.
   a child you can be sure of collecting: pipes, timeout, escalation,
   reclamation), `bulk` (how any verb answers when the result might be
   large). `sdk/js/client.js` is its JS twin.
-- `cli` (`portos-cli`): `portos init|put|bundle|meta|get|audit-verify|sessions|chat`.
-  Links the kernel as a library; daemonization is deferred to W4.
-  `chat --resume [id]` continues a stored conversation; `SIGHUP` reloads.
-  The standard broker and model driver are defaults, started only for a
-  driver nothing in `chat.json` answers; the front end finds the model
-  driver by asking who answers `model::start`, never by name.
+- `cli` (`portos-cli`): `portos init|put|bundle|meta|get|audit-verify|sessions|run`.
+  `run` is the launcher: it starts what `<root>/portos.json` lists, mints
+  each entry's grants, reloads on `SIGHUP`, and knows no driver. `init`
+  writes the standard set into that file. `sessions` lists stored
+  conversations offline from the model driver's index. Links the kernel as
+  a library; daemonization is deferred to W4.
 - `drivers`: interfaces that regulate a class of behaviour, depended on by
   implementations and callers alike so a shape is never written twice.
   `egress`, `model`, `router`. **These never run.** A new plugin that needs a
@@ -462,8 +471,12 @@ walking skeleton test is what proves the wiring.
       `model` the config names, and `base_url`/`model` have no defaults
       because guessing a vendor is worse than an error).
     - `model-echo`: the second model driver — it says the line back. What
-      `portos chat` runs against to prove a plugin is replaceable, and the
-      way to see the whole runtime work with no provider, key or network.
+      `portos run` is tested against to prove a plugin is replaceable, and
+      the way to see the whole runtime work with no provider, key or network.
+    - `tty`: the terminal front end — stdin to `model::send`, session events
+      to stdout, `resume` in its config. It takes the terminal's foreground
+      so Ctrl-C cancels a turn, and asks the launcher to stop with `SIGTERM`
+      when it quits, since a front end has no verb for that and should not.
     - `browser` (JS/Playwright), `fs`, `shell`, `remote` (another node's
       verbs, mirrored here), `bridge-http` (the event plane and the invoke
       path over HTTP/SSE; transport and presentation are separate files on
