@@ -1,8 +1,14 @@
-//! The runtime form: the same plugin, run inside a boundary it cannot leave.
+//! The two axes a plugin sits on: **what it is**, and **how it runs**.
 //!
-//! A plugin is one thing; how it runs is another, and the kernel implements
-//! exactly two of the second: a bare child process, and that child inside a
-//! cgroup. Containers and VMs are drivers' business, not the kernel's.
+//! *What it is* — an executable in the CAS, named by a content address, or
+//! (the escape hatch) a path on this host.
+//!
+//! *How it runs* — a bare child process, or that child inside a cgroup. The
+//! kernel implements exactly those two, because they are as far as it can go
+//! without learning a domain; containers and VMs belong to drivers.
+//!
+//! The point of separating them is that neither should leak into the other,
+//! and neither should leak into the plugin.
 //!
 //! What the cgroup form buys is measurable rather than theoretical, and
 //! these tests measure it: a grandchild that leaves the process group with
@@ -41,7 +47,6 @@ fn spawn_with_escaping_grandchild(
     form: Form,
 ) -> PluginName {
     host.spawn_spec(&LaunchSpec {
-        bin: ECHO_BIN.to_string(),
         env: [
             ("PORTOS_ECHO_FAMILY".to_string(), family.to_string()),
             (
@@ -56,7 +61,7 @@ fn spawn_with_escaping_grandchild(
         .into_iter()
         .collect(),
         form,
-        ..Default::default()
+        ..LaunchSpec::from_path(ECHO_BIN)
     })
     .unwrap()
 }
@@ -94,6 +99,165 @@ fn cgroups_or_skip() -> Option<CgroupRoot> {
             None
         }
     }
+}
+
+/// A plugin named by **what it is** rather than **where it is**.
+///
+/// A path is a claim about a file that may have changed since; a content
+/// address is a claim anyone can check, means the same thing on every
+/// machine, and can be carried in a spec without carrying any bytes. That
+/// last part is why it matters here specifically: a `kernel::spawn` spec is
+/// written by an agent and travels through the model's context, so it must
+/// name things rather than contain them.
+#[test]
+fn a_plugin_can_be_named_by_what_it_is_instead_of_where_it_is() {
+    let (kernel, host, root) = setup("artifact");
+
+    // The same thing `portos put` does.
+    let mut file = std::fs::File::open(ECHO_BIN).unwrap();
+    let meta = kernel
+        .cas
+        .put_stream(
+            &mut file,
+            "application/x-executable",
+            portos_proto::Label::default(),
+            "test",
+        )
+        .unwrap();
+
+    let plugin = host
+        .spawn_spec(&LaunchSpec::from_artifact(meta.id.clone()))
+        .expect("a plugin is startable from the CAS");
+    let made: serde_json::Value = host
+        .call(
+            &plugin,
+            &portos_proto::ids::Verb::parse("echo::make_ref").unwrap(),
+            portos_proto::wire::Payload::of(&serde_json::json!([])).unwrap(),
+        )
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(made["ref"].is_string(), "and it answers: {made}");
+
+    // Materialised once, byte for byte. Content addressing is what makes
+    // that cache correct without an invalidation rule.
+    let copy = root.join("exec").join(meta.id.replace(':', "-"));
+    assert!(copy.exists(), "the executable was materialised at {copy:?}");
+    assert_eq!(
+        std::fs::read(&copy).unwrap(),
+        std::fs::read(ECHO_BIN).unwrap(),
+        "what ran is what was stored"
+    );
+    let before = std::fs::metadata(&copy).unwrap().modified().unwrap();
+    let second = host
+        .spawn_spec(&LaunchSpec {
+            env: [("PORTOS_ECHO_FAMILY".to_string(), "echotwo".to_string())]
+                .into_iter()
+                .collect(),
+            ..LaunchSpec::from_artifact(meta.id.clone())
+        })
+        .unwrap();
+    assert_eq!(
+        std::fs::metadata(&copy).unwrap().modified().unwrap(),
+        before,
+        "a second spawn reuses it rather than writing it again"
+    );
+
+    // Exactly one of the two, and the refusal says which mistake was made.
+    let both = host.spawn_spec(&LaunchSpec {
+        bin: Some(ECHO_BIN.to_string()),
+        ..LaunchSpec::from_artifact(meta.id.clone())
+    });
+    assert!(
+        both.unwrap_err().to_string().contains("exactly one"),
+        "naming a plugin twice is a mistake worth a message"
+    );
+    let neither = host.spawn_spec(&LaunchSpec::default());
+    assert!(
+        neither
+            .unwrap_err()
+            .to_string()
+            .contains("neither `artifact` nor `bin`"),
+        "and so is naming it not at all"
+    );
+
+    host.shutdown(&second);
+    host.shutdown_all();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The property a plugin author is entitled to rely on: **the same artifact
+/// behaves the same under every form the kernel implements.**
+///
+/// A driver writes `serve(plugin, on_call, on_event)` and is never told which
+/// form it got — not by an argument, not by an environment variable, not by
+/// anything it can observe. This runs the identical binary under both and
+/// insists the results match, across all three things the ABI offers: a verb
+/// call, the chunked data plane in both directions, and the event bus. When a
+/// container form arrives it gains a case here rather than a new argument.
+#[test]
+fn the_same_plugin_behaves_identically_under_every_form() {
+    if cgroups_or_skip().is_none() {
+        return;
+    }
+    // Separate kernels so both can use the same plugin name and family, and
+    // the results are comparable down to the artifact ids.
+    let (_kb, bare_host, bare_root) = setup("same-bare");
+    let (_kc, cg_host, cg_root) = setup("same-cgroup");
+
+    let bare = exercise(&bare_host, Form::Bare);
+    let cgroup = exercise(&cg_host, Form::Cgroup);
+    assert_eq!(
+        bare, cgroup,
+        "the form is the runtime's business, not the plugin's"
+    );
+
+    bare_host.shutdown_all();
+    cg_host.shutdown_all();
+    let _ = std::fs::remove_dir_all(&bare_root);
+    let _ = std::fs::remove_dir_all(&cg_root);
+}
+
+/// Everything a plugin can do through the ABI, in one value: a verb call, an
+/// artifact streamed in and read back out, and an event published.
+fn exercise(host: &Host, form: Form) -> serde_json::Value {
+    let plugin = host
+        .spawn_spec(&LaunchSpec {
+            form,
+            ..LaunchSpec::from_path(ECHO_BIN)
+        })
+        .unwrap();
+    let call = |verb: &str, args: serde_json::Value| -> serde_json::Value {
+        host.call(
+            &plugin,
+            &portos_proto::ids::Verb::parse(verb).unwrap(),
+            portos_proto::wire::Payload::of(&args).unwrap(),
+        )
+        .unwrap()
+        .parse()
+        .unwrap()
+    };
+
+    let made = call("echo::make_ref", serde_json::json!([]));
+    let put = call("echo::put_pattern", serde_json::json!([4096]));
+    let id = put["meta"]["id"].as_str().unwrap().to_string();
+    let digest = call("echo::digest", serde_json::json!([id.clone()]));
+    let published = call(
+        "echo::publish",
+        serde_json::json!(["probe::hello", {"n": 1}]),
+    );
+
+    serde_json::json!({
+        "name": plugin.as_str(),
+        "ref": made["ref"],
+        // Content-addressed, so an identical stream is an identical id —
+        // which also proves the data plane went through unchanged.
+        "artifact": id,
+        "size": put["meta"]["size"],
+        "origin": put["meta"]["origin"],
+        "digest": digest,
+        "published": published,
+    })
 }
 
 /// The claim, and its control. A process group cannot reach a child that

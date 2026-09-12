@@ -65,7 +65,15 @@ struct ChatConfig {
 
 #[derive(Debug, Deserialize)]
 struct PluginSpec {
-    bin: String,
+    /// An executable stored in the CAS — `portos put <root> <file>` gives
+    /// you the id. A plugin named this way is a thing rather than a
+    /// location.
+    #[serde(default)]
+    artifact: Option<String>,
+    /// A path on this host. Fine for `node` and other things already
+    /// installed; not reproducible and not portable.
+    #[serde(default)]
+    bin: Option<String>,
     #[serde(default)]
     args: Vec<String>,
     #[serde(default)]
@@ -506,13 +514,24 @@ struct Desired {
 }
 
 impl Desired {
+    /// How to name it in a message: by what the spec actually said.
+    fn label(&self) -> String {
+        match (&self.spec.artifact, &self.spec.bin) {
+            (Some(id), _) => id.clone(),
+            (_, Some(bin)) => bin.clone(),
+            _ => "<no bin or artifact>".to_string(),
+        }
+    }
+
     /// What "the same plugin" means here.
     ///
     /// Hashed rather than kept: the secrets file goes through this, and the
     /// CLI has no business holding an API key in memory to compare it later.
     fn fingerprint(&self) -> String {
         let mut h = blake3::Hasher::new();
-        h.update(self.spec.bin.as_bytes());
+        h.update(self.spec.artifact.as_deref().unwrap_or("").as_bytes());
+        h.update(b"\0b");
+        h.update(self.spec.bin.as_deref().unwrap_or("").as_bytes());
         for a in &self.spec.args {
             h.update(b"\0a");
             h.update(a.as_bytes());
@@ -567,9 +586,8 @@ fn desired_set(root: &Path, exe: &Path) -> Result<Vec<Desired>, String> {
     let mut want = vec![
         Desired {
             spec: LaunchSpec {
-                bin: sibling("portos-broker")?,
                 env: env1("PORTOS_BROKER_DIR", &broker_dir),
-                ..Default::default()
+                ..LaunchSpec::from_path(sibling("portos-broker")?)
             },
             // The reason reload exists: the API key lands in secrets.json,
             // and only the broker ever reads it.
@@ -580,9 +598,8 @@ fn desired_set(root: &Path, exe: &Path) -> Result<Vec<Desired>, String> {
         },
         Desired {
             spec: LaunchSpec {
-                bin: sibling("portos-modeld")?,
                 env: env1("PORTOS_MODELD_DIR", &modeld_dir),
-                ..Default::default()
+                ..LaunchSpec::from_path(sibling("portos-modeld")?)
             },
             watch: vec![modeld_dir.join("config.json")],
         },
@@ -590,6 +607,7 @@ fn desired_set(root: &Path, exe: &Path) -> Result<Vec<Desired>, String> {
     for p in &load_chat_config(root).plugins {
         want.push(Desired {
             spec: LaunchSpec {
+                artifact: p.artifact.clone(),
                 bin: p.bin.clone(),
                 args: p.args.iter().map(|a| resolve_arg(root, a)).collect(),
                 env: p.env.clone(),
@@ -656,7 +674,7 @@ fn converge(
                 println!("[chat] started {name}");
                 state.running.insert(fp.clone(), name);
             }
-            Err(e) => failures.push(format!("{}: {e}", d.spec.bin)),
+            Err(e) => failures.push(format!("{}: {e}", d.label())),
         }
     }
 
@@ -767,10 +785,7 @@ mod tests {
 
     fn desired(watch: Vec<PathBuf>) -> Desired {
         Desired {
-            spec: LaunchSpec {
-                bin: "/bin/true".into(),
-                ..Default::default()
-            },
+            spec: LaunchSpec::from_path("/bin/true"),
             watch,
         }
     }

@@ -66,7 +66,25 @@ use std::sync::{Arc, Mutex};
 /// one description, not two code paths that drift.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct LaunchSpec {
-    pub bin: String,
+    /// An executable in the CAS.
+    ///
+    /// A plugin named this way is a **thing** rather than a location: the
+    /// same bytes get the same id on every machine, the spec carries the
+    /// name and never the bytes, and what ran is checkable afterwards. It
+    /// is also what lets a spec cross a boundary at all — a path means
+    /// nothing inside a container, on another node, or to the next run of
+    /// this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<String>,
+    /// A path on this host: the escape hatch, for things already installed
+    /// (`node`, a system tool) and for the bootstrap.
+    ///
+    /// **Not reproducible and not portable.** The file can change under a
+    /// spec that names it, and nothing that names one can be shipped
+    /// anywhere. Kept because pretending otherwise would be worse, and
+    /// labelled so it does not read as equivalent to the line above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bin: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
@@ -106,6 +124,44 @@ pub struct GrantSpec {
     pub resource: String,
     #[serde(default)]
     pub verbs: BTreeSet<String>,
+}
+
+/// Where a plugin's executable comes from. Two fields rather than one enum
+/// so that a spec reads as `{"artifact": …}` or `{"bin": …}` and a typo gets
+/// a message naming the field; "exactly one of them" is then checked here,
+/// once.
+enum Source<'a> {
+    Artifact(&'a str),
+    Path(&'a str),
+}
+
+impl LaunchSpec {
+    pub fn from_path(bin: impl Into<String>) -> LaunchSpec {
+        LaunchSpec {
+            bin: Some(bin.into()),
+            ..Default::default()
+        }
+    }
+
+    pub fn from_artifact(id: impl Into<String>) -> LaunchSpec {
+        LaunchSpec {
+            artifact: Some(id.into()),
+            ..Default::default()
+        }
+    }
+
+    fn source(&self) -> Result<Source<'_>, KernelError> {
+        match (&self.artifact, &self.bin) {
+            (Some(id), None) => Ok(Source::Artifact(id)),
+            (None, Some(path)) => Ok(Source::Path(path)),
+            (Some(_), Some(_)) => Err(KernelError::Denied(
+                "launch spec names both `artifact` and `bin`; it must name exactly one".into(),
+            )),
+            (None, None) => Err(KernelError::Denied(
+                "launch spec names neither `artifact` nor `bin`".into(),
+            )),
+        }
+    }
 }
 
 /// The family the kernel answers itself. Reserved: a plugin may not claim it.
@@ -222,14 +278,12 @@ impl Host {
         envs: &[(&str, &str)],
     ) -> Result<PluginName, KernelError> {
         self.spawn_spec(&LaunchSpec {
-            bin: bin.to_string_lossy().into_owned(),
             args: args.iter().map(|s| s.to_string()).collect(),
             env: envs
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
-            grants: Vec::new(),
-            form: Form::default(),
+            ..LaunchSpec::from_path(bin.to_string_lossy())
         })
     }
 
@@ -281,6 +335,42 @@ fn spawn_spec_on(
     Ok(name)
 }
 
+/// Put an artifact's bytes somewhere they can be executed, once.
+///
+/// Content addressing makes the cache trivially correct: the same id is the
+/// same bytes, forever, so a materialised copy never goes stale and there is
+/// nothing to invalidate. It is written under a temporary name and renamed,
+/// because two spawns of the same plugin can race and neither may ever see a
+/// half-written file.
+///
+/// The copy is deliberate rather than an exec straight out of the CAS: an
+/// artifact is not an executable, and making every stored object executable
+/// to suit the few that are would be the wrong trade.
+fn materialise(kernel: &Kernel, id: &str) -> Result<PathBuf, KernelError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = kernel.root.join("exec");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(id.replace(':', "-"));
+    if path.exists() {
+        return Ok(path);
+    }
+    let meta = kernel.cas.meta(&id.to_string())?;
+    let tmp = path.with_extension(format!("tmp-{}", rand_token()));
+    {
+        let mut src = kernel.cas.open_read(&id.to_string())?;
+        let mut dst = std::fs::File::create(&tmp)?;
+        std::io::copy(&mut src, &mut dst)?;
+        dst.set_permissions(std::fs::Permissions::from_mode(0o755))?;
+    }
+    std::fs::rename(&tmp, &path)?;
+    let _ = kernel.audit.lock().unwrap().append(json!({
+        "event": "plugin.materialised", "id": id, "size": meta.size,
+        "path": path.to_string_lossy(),
+    }));
+    Ok(path)
+}
+
 /// Start the process, complete every declared handshake, register its verbs.
 /// Free-standing because both the embedder (`Host::spawn_spec`) and the
 /// `kernel::spawn` verb reach it, and a second way to start a plugin is a
@@ -307,7 +397,12 @@ fn spawn_process(
         Form::Bare => None,
     };
 
-    let mut cmd = std::process::Command::new(&spec.bin);
+    let bin = match spec.source()? {
+        Source::Path(path) => PathBuf::from(path),
+        Source::Artifact(id) => materialise(kernel, id)?,
+    };
+
+    let mut cmd = std::process::Command::new(&bin);
     cmd.args(&spec.args)
         .env("PORTOS_PLUGIN_SOCK", &sock_path)
         .env("PORTOS_PLUGIN_TOKEN", &token)
@@ -473,6 +568,13 @@ fn spawn_process(
     let _ = kernel.audit.lock().unwrap().append(json!({
         "event": "plugin.spawned",
         "plugin": name.as_str(),
+        // What ran, by the name it is knowable under. For an artifact that
+        // is a claim anyone can check later; for a path it is only a claim
+        // about a file that may since have changed, which is the difference
+        // the two fields exist to record.
+        "artifact": spec.artifact,
+        "bin": spec.bin,
+        "form": spec.form,
         "verbs": verbs.iter().map(Verb::as_str).collect::<Vec<_>>(),
     }));
     Ok(name)
@@ -1012,14 +1114,21 @@ static BUILTIN_TOOLS: std::sync::LazyLock<BTreeMap<Verb, ToolMeta>> =
         BTreeMap::from([
             tool(
                 "kernel::spawn",
-                "Start a new plugin and grant it what it needs. The plugin's verbs \
+                "Start a new plugin and grant it what it needs. Name it with \
+                 either `artifact` (an executable in the CAS) or `bin` (a path \
+                 on this host) — exactly one. The plugin's verbs \
                  become available to anyone granted them — including, if the grants \
                  say so, you — from your next turn onward. Use this to add a \
                  capability the system does not currently have.",
                 serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "bin": {"type": "string", "description": "executable to run"},
+                        "artifact": {"type": "string", "description":
+                            "id of an executable stored in the CAS — the portable \
+                             way to name a plugin"},
+                        "bin": {"type": "string", "description":
+                            "path to an executable on this host; use it for things \
+                             already installed, such as `node`"},
                         "args": {"type": "array", "items": {"type": "string"}},
                         "env": {"type": "object"},
                         "grants": {
@@ -1037,7 +1146,9 @@ static BUILTIN_TOOLS: std::sync::LazyLock<BTreeMap<Verb, ToolMeta>> =
                             },
                         },
                     },
-                    "required": ["bin"],
+                    // Exactly one of `artifact` and `bin`, which a JSON
+                    // schema cannot say and the kernel checks instead.
+                    "required": [],
                 }),
             ),
             tool(

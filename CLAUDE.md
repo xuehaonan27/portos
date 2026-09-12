@@ -120,7 +120,19 @@ theoretical elegance is not. Current state and build order live in
   SIGINT/SIGTERM and waits for them on a dedicated thread rather than dying
   in a default handler, because a signal that skips teardown orphans the
   whole tree.
-- **What a plugin is and how it runs are two axes.** The second is
+- **What a plugin is and how it runs are two axes.** The first is
+  `LaunchSpec`'s `artifact` (an executable in the CAS) or `bin` (a path on
+  this host) — exactly one. A content address is a claim anyone can check
+  and means the same thing on every machine; a path is a claim about a file
+  that may since have changed, so it is kept as a labelled escape hatch for
+  what is already installed. It is also what makes `kernel::spawn` safe to
+  hand an agent: a spec travels through the model's context, so it must
+  *name* things rather than contain them. The kernel materialises an
+  artifact into `<root>/exec/<id>` once — content addressing makes that
+  cache correct with no invalidation rule — and the audit records which of
+  the two a plugin was started by. Only single executables so far; a
+  multi-file plugin needs a bundle or an image.
+- The second axis is
   `LaunchSpec.form`, and the kernel implements exactly the two it can
   without learning a domain: `bare` (a child process leading its own group)
   and `cgroup` (that child inside a cgroup of its own, the default).
@@ -217,7 +229,7 @@ MCP later is the opposite direction and is fine).
 
 ```sh
 cargo build --workspace
-cargo test --workspace          # 88 tests; all must pass, zero warnings
+cargo test --workspace          # 90 tests; all must pass, zero warnings
 cargo fmt --all
 ```
 
@@ -246,7 +258,9 @@ The end-to-end tests are the ones that matter and they are hermetic:
   its control: a grandchild that leaves the process group with `setsid`
   survives teardown in `bare` form and does not in `cgroup` form, a busy
   cgroup refuses `rmdir`, and a cgroup left by a dead run is collected by
-  the next one. Skips with a reason where cgroup v2 is not writable.
+  the next one. It also holds the property a driver author relies on — the
+  same binary behaves identically under every form — which is where a new
+  form gets added. Skips with a reason where cgroup v2 is not writable.
 - `crates/portos-echo/tests/remote.rs` — two nodes in one process, sharing
   nothing but a loopback socket: the far node's verbs arriving as ordinary
   local ones, the two grant tables that each get a say, and the fact that an
