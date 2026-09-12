@@ -6,7 +6,7 @@
 // family, chat, or any other domain — it re-exports the only two interaction
 // shapes PortOS has:
 //
-//   topics  → GET  /events        (Server-Sent Events)
+//   topics  → GET  /events        (Server-Sent Events; ?replay=0 for new only)
 //   verbs   → POST /invoke        {verb, args} → {ok} | {err}
 //
 // plus the two things a presenter needs to be useful:
@@ -98,14 +98,16 @@ async function readBody(req, limit = 1024 * 1024) {
   return Buffer.concat(parts).toString("utf8");
 }
 
-function openEventStream(res) {
+function openEventStream(res, replay) {
   res.writeHead(200, {
     "content-type": "text/event-stream",
     "cache-control": "no-store",
     connection: "keep-alive",
   });
-  // Anything already seen, so a reload does not lose the conversation.
-  for (const event of recent) res.write(`data: ${JSON.stringify(event)}\n\n`);
+  // Anything already seen, so a reload does not lose the conversation. A
+  // machine that reconnects wants the opposite — it has the backlog already
+  // and replaying would duplicate it — so it asks with `?replay=0`.
+  if (replay) for (const event of recent) res.write(`data: ${JSON.stringify(event)}\n\n`);
   listeners.add(res);
   res.on("close", () => listeners.delete(res));
 }
@@ -114,7 +116,9 @@ async function handle(req, res, client) {
   const url = new URL(req.url, "http://bridge");
   const route = `${req.method} ${url.pathname}`;
 
-  if (route === "GET /events") return openEventStream(res);
+  if (route === "GET /events") {
+    return openEventStream(res, url.searchParams.get("replay") !== "0");
+  }
 
   if (route === "GET /grants") {
     return sendJson(res, 200, { grants: await client.grants() });

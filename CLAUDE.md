@@ -141,6 +141,16 @@ theoretical elegance is not. Current state and build order live in
   about its family goes inert with the route and returns if it does.
   Artifacts and the audit log survive on purpose: immutable records are not
   state. `crates/portos-echo/tests/hotplug.rs` asserts the list.
+- **Another node is a driver, not a kernel feature.** `drivers/remote`
+  dials a peer's `bridge-http` and re-declares what it finds, renaming the
+  family: `browser::open` on node `mac` is `mac_browser::open` here, and
+  `model::session::s1` arrives as `mac_model::session::s1`. That keeps two
+  nodes' browsers from colliding in a flat route table and makes a grant
+  read honestly. Authority stays split, which is the part worth keeping:
+  the far node decides *what is exposed* (the grants on its bridge, read
+  once at startup), this node decides *who may use it* — and the two
+  failures are distinguishable, since a verb the peer never exposed has no
+  local route at all.
 - **Rendering is event subscription.** A renderer is an ordinary plugin with
   zero verbs and zero capabilities that subscribes to `model::session::*`.
   Several may compose. `drivers/render-tty` is the reference.
@@ -158,7 +168,7 @@ MCP later is the opposite direction and is fine).
 
 ```sh
 cargo build --workspace
-cargo test --workspace          # 59 tests; all must pass, zero warnings
+cargo test --workspace          # 63 tests; all must pass, zero warnings
 cargo fmt --all
 ```
 
@@ -174,6 +184,10 @@ The end-to-end tests are the ones that matter and they are hermetic:
 - `crates/portos-broker/tests/egress.rs` — allowlist, injection, sanitizing.
 - `crates/portos-echo/tests/hotplug.rs` — a running system gaining and losing
   a capability, and the residue list after it loses one.
+- `crates/portos-echo/tests/remote.rs` — two nodes in one process, sharing
+  nothing but a loopback socket: the far node's verbs arriving as ordinary
+  local ones, the two grant tables that each get a say, and the fact that an
+  ephemeral ref crosses untranslated while a handle cannot.
 - `crates/portos-echo/tests/bridge.rs` — the extensibility claim itself: a
   plugin carrying the event plane and the invoke path over HTTP, written
   against the published ABI with no kernel change. If a change here starts
@@ -218,7 +232,8 @@ walking skeleton test is what proves the wiring.
       providers under `backends/`), `browser` (JS/Playwright), `render-tty`
       (renderer reference), `bridge-http` (the event plane and the invoke
       path over HTTP/SSE, so a presenter can live off-box; transport and
-      presentation are separate files on purpose).
+      presentation are separate files on purpose), `remote` (the other end
+      of that socket: another node's verbs, mirrored here).
 - `docs`: does not exist yet. Solid documentation goes here only after human
   approval; until then everything lives in `.dev`.
 - `.dev` (gitignored): temporal development space, never added into git worktree.

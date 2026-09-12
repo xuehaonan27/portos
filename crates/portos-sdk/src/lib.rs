@@ -193,7 +193,11 @@ pub struct Plugin<'a> {
     /// Per-verb metadata the kernel joins into `grants` introspection, so a
     /// caller holding the capability gets a ready-made tool definition.
     pub tools: BTreeMap<&'a str, ToolMeta>,
+    on_ready: Option<ReadyHook<'a>>,
 }
+
+/// Run once, after every channel is up and before the first call is served.
+type ReadyHook<'a> = Box<dyn FnOnce(&Arc<KernelClient>) -> Result<(), PluginError> + 'a>;
 
 impl<'a> Plugin<'a> {
     pub fn new(name: &'a str, verbs: &'a [&'a str]) -> Plugin<'a> {
@@ -201,11 +205,25 @@ impl<'a> Plugin<'a> {
             name,
             verbs,
             tools: BTreeMap::new(),
+            on_ready: None,
         }
     }
 
     pub fn with_tools(mut self, tools: BTreeMap<&'a str, ToolMeta>) -> Plugin<'a> {
         self.tools = tools;
+        self
+    }
+
+    /// Work to start once the channels are up and before the first call is
+    /// served: subscribing, listening, pumping a link. A plugin whose job
+    /// begins on its own has no call to hang it off, and deferring it to
+    /// the first call means a plugin nobody calls never starts. The JS twin
+    /// has taken an `onReady` for exactly this reason.
+    pub fn on_ready(
+        mut self,
+        f: impl FnOnce(&Arc<KernelClient>) -> Result<(), PluginError> + 'a,
+    ) -> Plugin<'a> {
+        self.on_ready = Some(Box::new(f));
         self
     }
 
@@ -249,7 +267,7 @@ impl<'a> Plugin<'a> {
 /// thread** fed by the events channel, so events keep flowing while a call
 /// handler is blocked, which is what lets a handler await an event stream
 /// mid-call.
-pub fn serve<F, G>(plugin: Plugin<'_>, mut on_call: F, mut on_event: G) -> std::io::Result<()>
+pub fn serve<F, G>(mut plugin: Plugin<'_>, mut on_call: F, mut on_event: G) -> std::io::Result<()>
 where
     F: FnMut(&Verb, &Payload, &Arc<KernelClient>) -> CallResult,
     G: FnMut(&Topic, &Payload) + Send + 'static,
@@ -293,6 +311,10 @@ where
             }
         }
     });
+
+    if let Some(ready) = plugin.on_ready.take() {
+        ready(&client).map_err(std::io::Error::other)?;
+    }
 
     loop {
         let bytes = match frame::read_bytes(&mut rd) {

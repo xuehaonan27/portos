@@ -348,6 +348,14 @@ impl Turn {
         let topic = sid.topic();
         let client = &self.client;
         let emit = |ev: model::SessionEvent| {
+            // Free the session *before* the terminal event goes out, not
+            // after the loop returns: that event is exactly the cue a front
+            // end uses to send the next message, and a stop button followed
+            // immediately by a send would otherwise be told a turn is still
+            // running.
+            if ev.is_terminal() {
+                self.running.lock().unwrap().remove(sid.as_str());
+            }
             if let Ok(p) = Payload::of(&ev) {
                 let _ = client.emit(&topic, p);
             }
@@ -380,11 +388,10 @@ impl Turn {
                 &|| flag.load(Ordering::Relaxed),
             )
         };
-        self.running.lock().unwrap().remove(sid.as_str());
-
         // Exactly one terminal event per turn. `run_send` emits Done and
-        // Cancelled itself; a failure has no other way to be heard, and a
-        // front end waiting for a terminal event would wait forever.
+        // Cancelled itself — and with them, above, the deregistration. A
+        // failure has no other way to be heard, and a front end waiting for
+        // a terminal event would wait forever.
         if let Err(e) = result {
             if !matches!(e, ModelError::Cancelled) {
                 emit(model::SessionEvent::Failed {

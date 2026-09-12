@@ -381,7 +381,6 @@ mod tests {
         // Split every 7 bytes — guaranteed to cut mid-line and mid-JSON.
         let mut sse = SseParser::default();
         let mut acc = MsgAcc::default();
-        let started = std::time::Instant::now();
         let mut sink = NullSink(String::new());
         let bytes = wire.as_bytes();
         let mut i = 0;

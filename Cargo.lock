@@ -473,6 +473,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "portos-remote"
+version = "0.1.0"
+dependencies = [
+ "portos-proto",
+ "portos-sdk",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "ureq",
+]
+
+[[package]]
 name = "portos-sdk"
 version = "0.1.0"
 dependencies = [

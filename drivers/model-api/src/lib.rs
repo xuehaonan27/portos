@@ -131,6 +131,19 @@ pub enum SessionEvent {
     Unknown,
 }
 
+impl SessionEvent {
+    /// Whether this event ends the turn. Exactly one of these is owed to a
+    /// session's subscribers — it is the cue a front end acts on, so by the
+    /// time one goes out the session must already be free to take the next
+    /// turn.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            SessionEvent::Done { .. } | SessionEvent::Cancelled | SessionEvent::Failed { .. }
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
