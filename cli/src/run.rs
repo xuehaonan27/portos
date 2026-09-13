@@ -423,11 +423,12 @@ fn converge(host: &Host, root: &Path, exe: &Path, state: &mut RuntimeState) -> V
 
     // Reported once everything is up and granted, because until then
     // "waiting" is just "not yet" and saying so would be noise.
-    for (name, _, unmet) in host.plugins() {
-        if !unmet.is_empty() {
-            let what: Vec<String> = unmet.iter().map(|v| v.to_string()).collect();
+    for p in host.plugins() {
+        if !p.unmet.is_empty() {
+            let what: Vec<String> = p.unmet.iter().map(|v| v.to_string()).collect();
             println!(
-                "[run] {name} is not answering — it needs {}",
+                "[run] {} is not answering — it needs {}",
+                p.name,
                 what.join(", ")
             );
         }

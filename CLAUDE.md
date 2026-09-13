@@ -117,56 +117,40 @@ implementation rather than after mistakes.
 
 ## Core Concepts
 
-The goal is a usable AI workstation; "usable" is the only acceptance
-criterion. Build order: `.dev/plans/workstation-v1.md`, read before planning.
-Rationale for every rule below: `.dev/gen/architecture.md`. The rules:
+The goal is a usable AI workstation, and "usable" is the only acceptance
+criterion; build order is `.dev/plans/workstation-v1.md`, rationale is
+`.dev/gen/architecture.md`.
 
 - The kernel knows processes, `driver::verb`, capabilities, handles and
-  events. Domain vocabulary in `kernel/` is a violation.
-- A plugin is found by what it answers, never by name. `invoke_at` names an
-  instance only when several answer; an unnamed call with several answerers
-  is an error, never a default.
+  events; domain vocabulary in `kernel/` is a violation.
+- A plugin is found by what it answers, never by name; with several
+  answerers the caller names an instance or gets an error, never a default.
 - A driver interface lives in `drivers/`, never runs, and states verbs,
-  argument and reply types, and `tools()`. Implement with
-  `Plugin::implement(&VERB, &tools[&VERB], …)`. A new kind of plugin adds a
-  driver, never a kernel mechanism.
-- Control plane and data plane meet only through handles. A result that may
-  be large answers `portos_abi::bulk::Bulk` via `portos_sdk::bulk::Sink`.
-  The model sees handles, never paths.
-- CAS objects are named by content and stored 0444.
+  types and `tools()`; a new kind of plugin adds a driver, not a kernel
+  mechanism.
+- A driver has no version: a compatible change adds verbs, an incompatible
+  one is a new driver under a new name.
+- Nothing is reserved and nothing is intercepted before routing; `kernel::*`
+  are ordinary rows in the one route table.
+- Grants in `portos.json` are the tool surface and the whole approval
+  story; a grant is on the driver, which instance is routing.
+- A result that may be large answers `Bulk` via `Sink`; the model sees
+  handles, never paths.
+- `Payload` is opaque; `serde_json::Value` is for a provider's wire format,
+  the audit log and operator config only.
 - Plumbing (`config`, `scope`, `bulk`) lives in the SDK, not in plugins.
-- `Payload` is opaque. `serde_json::Value` only for a provider's wire
-  format, the audit log, and operator config.
-- Grants (`portos.json`) are the tool surface and the whole approval story.
-  A grant is on the driver (`driver:browser`); which instance is routing.
-- `LaunchSpec`: `artifact` xor `bin`, optional `bundle`, `form` (`bare` or
-  `cgroup`, default `cgroup`). A new form is a driver.
-- Teardown escalates: `shutdown` frame, SIGTERM to the group, SIGKILL,
-  cgroup. Never rely on `Child::kill`.
-- `kernel::*` are ordinary rows in the route table, answered by the instance
-  `kernel`; nothing is reserved and nothing is intercepted before routing.
-- A stopped plugin's residue is exactly: routes, subscriptions, socket file,
-  process group, capabilities. `kernel::stop` collects all five.
-- A long operation is accepted, not awaited, and owes its subscribers
-  exactly one terminal event.
-- Dependencies: `Plugin::needs(&driver::VERB)`. Unmet means running but not
-  routed. Readiness is reconciled by `settle` after spawn, grant, stop and
-  claim; nothing declares an order.
-- Subscriptions are declared in `hello` (`Plugin::subscribes`) and are live
-  before the spawn returns. There is no runtime subscribe. A renderer
-  declares `model::session::*`.
-- The launcher (`portos run`) is the only non-plugin. It knows no driver,
-  publishes `kernel::up` when its list is up, and `SIGHUP` re-plugs exactly
-  the entries whose spec changed.
-- The API key exists in no process but the broker; a plugin that needs it
-  invokes `egress::*`.
-- One routing mechanism, `drivers/router`. An `if` before dispatch is a
-  design defect.
-
-Deliberately absent, not to be reintroduced without a concrete pain sharp
-enough to write a spec from: effect plans and interpreters, consent
-ceremonies, taint egress gates, resource-class declarations, holdings
-ledgers and leases. PortOS is never anyone's MCP server.
+- Dependencies are `Plugin::needs`; unmet means running but not routed, and
+  nothing declares an order.
+- Subscriptions are declared in `hello` and live before the spawn returns;
+  there is no runtime subscribe.
+- A long operation is accepted, not awaited, and owes exactly one terminal
+  event.
+- Teardown escalates to SIGKILL and the cgroup; never rely on `Child::kill`.
+- The launcher (`portos run`) is the only non-plugin and knows no driver.
+- The API key exists in no process but the broker.
+- Deliberately absent, not to be reintroduced without a spec: effect plans,
+  consent ceremonies, taint gates, resource classes, ledgers and leases,
+  and PortOS as anyone's MCP server.
 
 ## Build and Validate
 

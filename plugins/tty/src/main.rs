@@ -16,6 +16,11 @@
 //! through anything less deliberate than a signal to the one process that
 //! is not a plugin.
 //!
+//! `/ps` is the operator's overview: `kernel::plugins`, grouped by driver,
+//! each instance with what it was started from, what it answers and what
+//! it is waiting for. Grouping is presentation: the kernel reports
+//! instances, and a driver is the first segment of what they answer.
+//!
 //! Config (from the launch spec), all optional:
 //!   `{"resume": "latest" | "<session id>", "system": "…"}`
 
@@ -27,7 +32,7 @@ use portos_kernel_api as kernel;
 use portos_model_api as model;
 use portos_sdk::{KernelClient, Plugin, PluginError};
 use serde::Deserialize;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, Write};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -149,11 +154,14 @@ fn front_end(
 
     let sid = open_session(client, cfg)?;
     let own = sid.topic();
-    println!("[tty] session {sid} — type a message; /cancel stops a turn, /exit quits\n");
+    println!(
+        "[tty] session {sid} — type a message; /cancel stops a turn, /ps lists plugins, /exit quits\n"
+    );
 
     // While a turn runs, what is typed waits for it — `/exit` included,
     // because quitting mid-turn would take the whole runtime down under a
-    // call still in flight. Only `/cancel` and an interrupt act at once.
+    // call still in flight. Only `/cancel`, `/ps` and an interrupt act at
+    // once: stopping, and looking.
     let mut busy = false;
     let mut interrupted = false;
     loop {
@@ -165,13 +173,11 @@ fn front_end(
                 .map_err(|_| PluginError::Refused("the front end lost its input".into()))?,
         };
         match msg {
-            Msg::Line(line) if busy => {
-                if line.trim() == "/cancel" {
-                    cancel(client, &sid);
-                } else {
-                    pending.push_back(Msg::Line(line));
-                }
-            }
+            Msg::Line(line) if busy => match line.trim() {
+                "/cancel" => cancel(client, &sid),
+                "/ps" => ps(client),
+                _ => pending.push_back(Msg::Line(line)),
+            },
             Msg::Eof if busy => pending.push_back(Msg::Eof),
             Msg::Event(topic, data) => {
                 if topic == own && render(&data) {
@@ -196,6 +202,7 @@ fn front_end(
                     "" => {}
                     "/exit" | "/quit" => break,
                     "/cancel" => println!("[tty] nothing is running"),
+                    "/ps" => ps(client),
                     text => {
                         let args = Payload::of(&model::SendArgs {
                             session: sid.clone(),
@@ -266,6 +273,67 @@ fn cancel(client: &KernelClient, sid: &model::SessionId) {
         session: sid.clone(),
     }) {
         let _ = client.invoke(&model::CANCEL, args);
+    }
+}
+
+/// What is running, by driver. An instance answering verbs of several
+/// drivers is listed under each; one answering none is listed last, with
+/// what it is waiting for if anything.
+fn ps(client: &KernelClient) {
+    let listed: Result<kernel::PluginsReply, PluginError> = (|| {
+        let args = Payload::of(&kernel::PluginsArgs {})?;
+        Ok(client.invoke(&kernel::PLUGINS, args)?.parse()?)
+    })();
+    let listed = match listed {
+        Ok(l) => l,
+        Err(e) => {
+            println!("[tty] ps: {e}");
+            return;
+        }
+    };
+    let mut by_driver: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut idle: Vec<String> = Vec::new();
+    for p in &listed.plugins {
+        let from = match (&p.artifact, &p.bin) {
+            (Some(id), _) => format!("artifact {id}"),
+            (None, Some(path)) => format!("bin {path}"),
+            (None, None) => String::new(),
+        };
+        let waiting = if p.unmet.is_empty() {
+            String::new()
+        } else {
+            let what: Vec<String> = p.unmet.iter().map(|v| v.to_string()).collect();
+            format!("  waiting: {}", what.join(", "))
+        };
+        let mut drivers: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for v in &p.verbs {
+            drivers.entry(v.driver()).or_default().push(v.short());
+        }
+        if drivers.is_empty() {
+            idle.push(format!("  {}  {from}{waiting}", p.name));
+        }
+        for (driver, shorts) in drivers {
+            by_driver
+                .entry(driver.to_string())
+                .or_default()
+                .push(format!(
+                    "  {}  {from}  {}{waiting}",
+                    p.name,
+                    shorts.join(" ")
+                ));
+        }
+    }
+    for (driver, lines) in by_driver {
+        println!("[tty] {driver}");
+        for l in lines {
+            println!("{l}");
+        }
+    }
+    if !idle.is_empty() {
+        println!("[tty] (no verbs)");
+        for l in idle {
+            println!("{l}");
+        }
     }
 }
 

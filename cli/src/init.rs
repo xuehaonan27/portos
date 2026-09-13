@@ -12,6 +12,7 @@
 
 use portos_egress_api as egress;
 use portos_kernel::Kernel;
+use portos_kernel_api as kernel;
 use portos_model_api as model;
 use serde_json::json;
 use std::path::Path;
@@ -52,14 +53,21 @@ pub fn init(root: &str) -> Result<(), Box<dyn std::error::Error>> {
                 },
                 {
                     "bin": "portos-tty",
-                    "grants": [{
-                        "resource": model::START.resource(),
-                        "verbs": [
-                            model::START.short(), model::SEND.short(),
-                            model::CANCEL.short(), model::END.short(),
-                            model::SESSIONS.short(),
-                        ],
-                    }],
+                    "grants": [
+                        {
+                            "resource": model::START.resource(),
+                            "verbs": [
+                                model::START.short(), model::SEND.short(),
+                                model::CANCEL.short(), model::END.short(),
+                                model::SESSIONS.short(),
+                            ],
+                        },
+                        // `/ps`: the operator's view of what is running.
+                        {
+                            "resource": kernel::PLUGINS.resource(),
+                            "verbs": [kernel::PLUGINS.short()],
+                        },
+                    ],
                 },
             ],
         }),

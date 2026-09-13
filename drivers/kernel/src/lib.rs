@@ -190,6 +190,15 @@ pub struct PluginsReply {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PluginInfo {
     pub name: PluginName,
+    /// What it was started from: exactly one of these, as in `LaunchSpec`.
+    /// This is the implementation, reported so an operator can tell two
+    /// instances of one driver apart by more than their names. It is never
+    /// a routing key: a caller that chose an implementation would be finding
+    /// a plugin by name, which is what replaceability forbids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bin: Option<String>,
     pub verbs: Vec<Verb>,
     /// What it is still waiting for. Empty means it is answering.
     ///
@@ -266,7 +275,8 @@ pub fn tools() -> BTreeMap<Verb, ToolMeta> {
         ),
         tool(
             &PLUGINS,
-            "List the plugins currently running and the verbs each answers.",
+            "List the plugins currently running: what each was started from, \
+             the verbs each answers, and what each is still waiting for.",
             serde_json::json!({"type": "object", "properties": {}}),
         ),
     ])

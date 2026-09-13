@@ -165,8 +165,10 @@ fn write_json(path: &Path, v: &Value) {
 /// The terminal front end, granted the model driver. Its stdin is whatever
 /// the launcher's is — here, the test's pipe.
 fn tty_plugin() -> Value {
-    json!({"bin": "portos-tty", "grants": [{"resource": "driver:model",
-           "verbs": ["start", "send", "cancel", "end", "sessions"]}]})
+    json!({"bin": "portos-tty", "grants": [
+        {"resource": "driver:model", "verbs": ["start", "send", "cancel", "end", "sessions"]},
+        {"resource": "driver:kernel", "verbs": ["plugins"]},
+    ]})
 }
 
 /// The set `portos init` writes, for a root under test: broker, model driver
@@ -447,7 +449,7 @@ fn portos_run_with_another_model_driver() {
         .stdin
         .take()
         .unwrap()
-        .write_all(b"say this back\n/exit\n")
+        .write_all(b"/ps\nsay this back\n/exit\n")
         .unwrap();
     let out = child.wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -468,6 +470,18 @@ fn portos_run_with_another_model_driver() {
     assert!(
         stdout.contains("say this back"),
         "the turn went through the other driver and came back:\n{stdout}"
+    );
+    // The overview: the driver, the instance under it, what it was started
+    // from, and what it answers — and the front end itself, answering
+    // nothing.
+    assert!(
+        stdout.contains("[tty] model\n  portos-model-echo  bin ")
+            && stdout.contains("  cancel end send sessions start"),
+        "/ps lists the driver's instance with its source and verbs:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("[tty] (no verbs)\n  portos-tty  bin "),
+        "/ps lists a plugin with no verbs too:\n{stdout}"
     );
 
     let _ = std::fs::remove_dir_all(&root);

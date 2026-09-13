@@ -110,6 +110,10 @@ fn kernel_verbs_are_capability_gated_like_any_other() {
         .filter_map(|p| p["name"].as_str())
         .collect();
     assert_eq!(names, vec!["portos-echoa"]);
+    // And what it was started from — the implementation, reported for the
+    // operator, never routed on.
+    assert_eq!(listed["plugins"][0]["bin"], ECHO_BIN);
+    assert!(listed["plugins"][0].get("artifact").is_none());
 
     host.shutdown_all();
     let _ = std::fs::remove_dir_all(&root);
@@ -389,14 +393,18 @@ fn a_plugin_waits_for_what_it_needs_and_nobody_declares_an_order() {
         routed(&host, "waiter::make_ref").is_err(),
         "running, but not answered"
     );
-    let (_, verbs, unmet) = host
+    let info = host
         .plugins()
         .into_iter()
-        .find(|(n, _, _)| n == &waiting)
+        .find(|p| p.name == waiting)
         .expect("it is up");
-    assert!(verbs.is_empty(), "nothing routed to it: {verbs:?}");
+    assert!(
+        info.verbs.is_empty(),
+        "nothing routed to it: {:?}",
+        info.verbs
+    );
     assert_eq!(
-        unmet.iter().map(|v| v.to_string()).collect::<Vec<_>>(),
+        info.unmet.iter().map(|v| v.to_string()).collect::<Vec<_>>(),
         vec!["provider::make_ref"],
         "and it says what it is waiting for"
     );

@@ -107,6 +107,9 @@ struct Declared {
 
 struct PluginHandle {
     declared: Mutex<Declared>,
+    /// What it was started from, as the spec named it; one of the two.
+    artifact: Option<String>,
+    bin: Option<String>,
     /// Present when this plugin was started in [`Form::Cgroup`]. Teardown
     /// ends with emptying it, and removing it is the proof that it worked —
     /// `rmdir` only succeeds on an empty cgroup.
@@ -233,8 +236,9 @@ impl Host {
         settle(&self.kernel, &self.inner);
     }
 
-    /// Which plugins are up, what each answers, and what each is waiting for.
-    pub fn plugins(&self) -> Vec<(PluginName, Vec<Verb>, Vec<Verb>)> {
+    /// Which plugins are up, what each was started from, what each answers,
+    /// and what each is waiting for.
+    pub fn plugins(&self) -> Vec<PluginInfo> {
         list_plugins(&self.kernel, &self.inner)
     }
 
@@ -286,11 +290,9 @@ fn route(
     }
 }
 
-/// Which plugins are up, what each answers, and what each is waiting for.
-fn list_plugins(
-    kernel: &Arc<Kernel>,
-    inner: &Arc<HostInner>,
-) -> Vec<(PluginName, Vec<Verb>, Vec<Verb>)> {
+/// Which plugins are up, what each was started from, what each answers,
+/// and what each is waiting for.
+fn list_plugins(kernel: &Arc<Kernel>, inner: &Arc<HostInner>) -> Vec<PluginInfo> {
     let entries: Vec<(PluginName, Arc<PluginHandle>)> = inner
         .plugins
         .lock()
@@ -302,8 +304,14 @@ fn list_plugins(
         .into_iter()
         .map(|(name, handle)| {
             let verbs = inner.routes.lock().unwrap().verbs_of(&name);
-            let waiting = unmet(kernel, inner, &handle, &name);
-            (name, verbs, waiting)
+            let unmet = unmet(kernel, inner, &handle, &name);
+            PluginInfo {
+                artifact: handle.artifact.clone(),
+                bin: handle.bin.clone(),
+                name,
+                verbs,
+                unmet,
+            }
         })
         .collect()
 }
@@ -645,6 +653,8 @@ fn spawn_process(
                 tools: tools_meta.clone(),
                 needs: hello.needs.clone(),
             }),
+            artifact: spec.artifact.clone(),
+            bin: spec.bin.clone(),
             cgroup,
             child: Mutex::new(child),
             serve: Mutex::new(serve_stream),
@@ -1316,8 +1326,8 @@ fn builtin_verb(
             let name = spawn_spec_on(kernel, inner, &spec)?;
             let (verbs, unmet) = list_plugins(kernel, inner)
                 .into_iter()
-                .find(|(n, _, _)| n == &name)
-                .map(|(_, v, u)| (v, u))
+                .find(|p| p.name == name)
+                .map(|p| (p.verbs, p.unmet))
                 .unwrap_or_default();
             ok(&SpawnReply { name, verbs, unmet })
         }
@@ -1330,10 +1340,7 @@ fn builtin_verb(
             })
         }
         "plugins" => ok(&PluginsReply {
-            plugins: list_plugins(kernel, inner)
-                .into_iter()
-                .map(|(name, verbs, unmet)| PluginInfo { name, verbs, unmet })
-                .collect(),
+            plugins: list_plugins(kernel, inner),
         }),
         // Routed here, so the table says the kernel answers it; a verb it
         // does not know is the table and this list having drifted.
