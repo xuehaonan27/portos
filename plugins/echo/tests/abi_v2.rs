@@ -56,6 +56,20 @@ fn spawn_echo(host: &Host, driver: &str) -> portos_abi::ids::PluginName {
         .unwrap()
 }
 
+/// An echo that declares what it listens to in its hello — the only way a
+/// plugin subscribes.
+fn spawn_listening(host: &Host, driver: &str, topics: &str) -> portos_abi::ids::PluginName {
+    host.spawn(
+        Path::new(ECHO_BIN),
+        &[],
+        &[
+            ("PORTOS_ECHO_DRIVER", driver),
+            ("PORTOS_ECHO_SUBSCRIBES", topics),
+        ],
+    )
+    .unwrap()
+}
+
 fn pattern(n: usize) -> Vec<u8> {
     (0..n).map(|i| (i % 251) as u8).collect()
 }
@@ -194,11 +208,9 @@ fn invoke_is_capability_gated_routed_and_audited() {
 fn events_flow_to_local_and_plugin_subscribers() {
     let (_kernel, host, root) = setup("events");
     let a = spawn_echo(&host, "echoa");
-    let b = spawn_echo(&host, "echob");
-
     // A local (in-process) subscriber and a plugin subscriber on one topic.
+    let b = spawn_listening(&host, "echob", "echoa::ping");
     let (_sub, rx) = host.subscribe_local(&tp("echoa::ping"));
-    call(&host, &b, "echob::subscribe", json!(["echoa::ping"])).unwrap();
 
     let out = call(
         &host,
@@ -235,6 +247,38 @@ fn events_flow_to_local_and_plugin_subscribers() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 
+    host.shutdown_all();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// What a spawn has made true by the time it returns includes the plugin's
+/// subscriptions: whoever started it may publish the moment it has, and
+/// a subscription declared in `hello` is there for that. `emit` reports how
+/// many it reached, so this is asserted rather than raced.
+#[test]
+fn a_subscription_declared_in_hello_is_live_when_spawn_returns() {
+    let (_kernel, host, root) = setup("hello-subscribes");
+    let b = spawn_listening(&host, "echob", "launcher::up");
+    assert_eq!(
+        host.emit(&tp("launcher::up"), pl(&json!({"listed": 1}))),
+        1,
+        "published the moment spawn returned, and reached the plugin"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let evs = call(&host, &b, "echob::events", json!([])).unwrap();
+        if evs
+            .as_array()
+            .is_some_and(|l| l.iter().any(|e| e["topic"] == "launcher::up"))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the plugin never saw the event it was counted for"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
     host.shutdown_all();
     let _ = std::fs::remove_dir_all(&root);
 }

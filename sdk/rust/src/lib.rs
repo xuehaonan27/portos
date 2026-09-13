@@ -20,10 +20,10 @@ pub mod bulk;
 pub mod config;
 pub mod scope;
 
-use portos_abi::ids::{IdError, PluginName, SubId, Topic, Verb};
+use portos_abi::ids::{IdError, PluginName, Topic, Verb};
 use portos_abi::wire::{
     self, ChannelRole, ClientOp, EmitReply, Grant, GrantsReply, Hello, HelloFrame, LocateReply,
-    Payload, PutReply, ReadReply, Reply, ServeMsg, SubscribeReply, ToolMeta, UnsubscribeReply,
+    Payload, PutReply, ReadReply, Reply, ServeMsg, ToolMeta,
 };
 use portos_abi::{ABI_VERSION, ArtifactMeta, Label, chunk, frame};
 use portos_router::Router as _;
@@ -135,22 +135,6 @@ impl KernelClient {
             data,
         }))?;
         Ok(r.delivered)
-    }
-
-    /// Subscribe to a topic pattern. Matching events later arrive on the
-    /// events channel and are handed to the plugin's event handler.
-    pub fn subscribe(&self, pattern: &Topic) -> Result<SubId, PluginError> {
-        let r: SubscribeReply = self.request(&ClientOp::Subscribe(wire::Subscribe {
-            topic: pattern.clone(),
-        }))?;
-        Ok(r.sub)
-    }
-
-    /// Drop one of this plugin's subscriptions.
-    pub fn unsubscribe(&self, sub: SubId) -> Result<bool, PluginError> {
-        let r: UnsubscribeReply =
-            self.request(&ClientOp::Unsubscribe(wire::Unsubscribe { sub }))?;
-        Ok(r.removed)
     }
 
     /// What this plugin may invoke right now: live grants joined with the
@@ -493,19 +477,19 @@ impl<'a> Plugin<'a> {
     }
 
     /// A topic this plugin listens to, subscribed by the kernel before the
-    /// spawn that starts it returns. Declare here what you must not miss —
-    /// `kernel::up`, a session's events — and subscribe from `on_ready` only
-    /// for what you learn you want at runtime.
+    /// spawn that starts it returns. It is the only way to listen: there is
+    /// no runtime subscribe, so nothing published between a spawn and a
+    /// plugin's own first move can be missed. A plugin that wants one
+    /// session's events declares the pattern and filters, as `tty` does.
     pub fn subscribes(mut self, topic: &Topic) -> Plugin<'a> {
         self.subscribes.push(topic.clone());
         self
     }
 
     /// Work to start once the channels are up and before the first call is
-    /// served: listening, pumping a link, subscribing to what was only
-    /// learned at runtime. A plugin whose job
-    /// begins on its own has no call to hang it off, and deferring it to the
-    /// first call means a plugin nobody calls never starts.
+    /// served: listening, pumping a link. A plugin whose job begins on its
+    /// own has no call to hang it off, and deferring it to the first call
+    /// means a plugin nobody calls never starts.
     pub fn on_ready(
         mut self,
         f: impl FnOnce(&Registrar<'a>, &Arc<KernelClient>) -> Result<(), PluginError> + 'a,

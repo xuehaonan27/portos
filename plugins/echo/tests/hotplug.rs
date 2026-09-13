@@ -75,7 +75,9 @@ fn grant(kernel: &Kernel, subject: &str, resource: &str, verbs: &[&str]) {
 fn echo_spec(driver: &str, caller: &PluginName) -> Value {
     json!({
         "bin": ECHO_BIN,
-        "env": {"PORTOS_ECHO_DRIVER": driver},
+        // It listens to something, so that stopping it has a subscription
+        // to collect.
+        "env": {"PORTOS_ECHO_DRIVER": driver, "PORTOS_ECHO_SUBSCRIBES": format!("{driver}::gone")},
         "grants": [
             // subject defaults to the plugin being started
             {"resource": "driver:noop", "verbs": ["nothing"]},
@@ -173,7 +175,7 @@ fn stopping_a_plugin_collects_every_item_of_the_residue() {
     let echob = PluginName::parse("portos-echob").unwrap();
     let now = 0;
 
-    // It is up, it holds something, and it answers.
+    // It is up, it holds something, it answers, and it listens.
     assert!(
         !kernel
             .caps
@@ -182,6 +184,13 @@ fn stopping_a_plugin_collects_every_item_of_the_residue() {
             .is_empty()
     );
     assert!(relay(&host, &echoa, "echob::make_ref", json!([])).is_ok());
+    assert_eq!(
+        host.emit(
+            &Topic::parse("echob::gone").unwrap(),
+            Payload::of(&json!({})).unwrap()
+        ),
+        1
+    );
 
     let stopped = relay(
         &host,

@@ -21,7 +21,7 @@
 
 use nix::sys::signal::{self, SigHandler, SigSet, Signal};
 use nix::unistd::{getpgid, getpgrp, getppid, isatty, tcsetpgrp};
-use portos_abi::ids::Verb;
+use portos_abi::ids::Topic;
 use portos_abi::wire::Payload;
 use portos_kernel_api as kernel;
 use portos_model_api as model;
@@ -47,8 +47,10 @@ enum Msg {
     Line(String),
     /// stdin closed.
     Eof,
-    /// The turn is over, one way or another.
-    TurnOver,
+    /// A session event. Every session's arrive, because the subscription is
+    /// declared before this plugin knows which session is its own; the
+    /// front end keeps the ones on its session's topic.
+    Event(Topic, Payload),
     Interrupt,
     /// The launcher says everything it listed is running.
     Up,
@@ -73,10 +75,11 @@ fn main() -> std::io::Result<()> {
         Plugin::new("portos-tty")
             // Said here because this plugin is the only thing that knows it.
             .needs(&model::START)
-            // Declared rather than subscribed from `on_ready`: the launcher
-            // publishes it the moment its list is up, which can be before a
-            // subscription made after this hello would land.
+            // The launcher publishes this the moment its list is up.
             .subscribes(&kernel::UP)
+            // Its own session's events, once it has one: a subscription is
+            // declared, and the session id is not known until later.
+            .subscribes(&model::ALL_SESSIONS)
             .on_ready(move |_registrar, client| {
                 let client = client.clone();
                 std::thread::spawn(move || {
@@ -88,11 +91,12 @@ fn main() -> std::io::Result<()> {
                 Ok(())
             }),
         move |topic, data| {
-            if topic == &*kernel::UP {
-                let _ = events_tx.send(Msg::Up);
+            let msg = if topic == &*kernel::UP {
+                Msg::Up
             } else {
-                render(data, &events_tx);
-            }
+                Msg::Event(topic.clone(), data.clone())
+            };
+            let _ = events_tx.send(msg);
         },
     )
 }
@@ -144,7 +148,7 @@ fn front_end(
     }
 
     let sid = open_session(client, cfg)?;
-    client.subscribe(&sid.topic())?;
+    let own = sid.topic();
     println!("[tty] session {sid} — type a message; /cancel stops a turn, /exit quits\n");
 
     // While a turn runs, what is typed waits for it — `/exit` included,
@@ -169,9 +173,11 @@ fn front_end(
                 }
             }
             Msg::Eof if busy => pending.push_back(Msg::Eof),
-            Msg::TurnOver => {
-                busy = false;
-                interrupted = false;
+            Msg::Event(topic, data) => {
+                if topic == own && render(&data) {
+                    busy = false;
+                    interrupted = false;
+                }
             }
             // A reload finished; nothing to do mid-session.
             Msg::Up => {}
@@ -215,32 +221,16 @@ fn front_end(
 
 /// Open the conversation the config asks for.
 ///
-/// The model driver may be up and not yet usable — waiting on its own grant,
-/// or on its gateway — and a front end that gave up at the first "no route"
-/// would be racing the launcher that started them both. So this waits,
-/// saying why once.
+/// Once, not retried: by the time the launcher has said its list is up, a
+/// model driver that does not answer is a configuration error to report,
+/// not a race to wait through.
 fn open_session(client: &Arc<KernelClient>, cfg: &Config) -> Result<model::SessionId, PluginError> {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let told = std::cell::Cell::new(false);
-    let call = |verb: &Verb, args: Payload| -> Result<Payload, PluginError> {
-        loop {
-            match client.invoke(verb, args.clone()) {
-                Ok(reply) => return Ok(reply),
-                Err(e) if Instant::now() < deadline => {
-                    if !told.replace(true) {
-                        eprintln!("[tty] waiting for a model driver ({e})");
-                    }
-                    std::thread::sleep(Duration::from_millis(200));
-                }
-                Err(e) => return Err(e),
-            }
-        }
-    };
     let resume = match cfg.resume.as_deref() {
         None => None,
         Some("latest") => {
-            let listed: model::SessionsReply =
-                call(&model::SESSIONS, Payload::of(&model::SessionsArgs {})?)?.parse()?;
+            let listed: model::SessionsReply = client
+                .invoke(&model::SESSIONS, Payload::of(&model::SessionsArgs {})?)?
+                .parse()?;
             match listed.sessions.first() {
                 Some(entry) => {
                     println!("[tty] resuming {} ({} turns)", entry.id, entry.record.turns);
@@ -259,14 +249,15 @@ fn open_session(client: &Arc<KernelClient>, cfg: &Config) -> Result<model::Sessi
             Some(id)
         }
     };
-    let started: model::StartReply = call(
-        &model::START,
-        Payload::of(&model::StartArgs {
-            system: cfg.system.clone(),
-            resume,
-        })?,
-    )?
-    .parse()?;
+    let started: model::StartReply = client
+        .invoke(
+            &model::START,
+            Payload::of(&model::StartArgs {
+                system: cfg.system.clone(),
+                resume,
+            })?,
+        )?
+        .parse()?;
     Ok(started.session)
 }
 
@@ -278,35 +269,41 @@ fn cancel(client: &KernelClient, sid: &model::SessionId) {
     }
 }
 
-/// The session's events, as they arrive. Exactly one terminal event ends a
-/// turn, and that is what lets the prompt come back.
-fn render(data: &Payload, tx: &Sender<Msg>) {
+/// One of the session's events, as it arrives. Returns whether it ended the
+/// turn: exactly one terminal event does, and that is what lets the prompt
+/// come back.
+fn render(data: &Payload) -> bool {
     let Ok(event) = data.parse::<model::SessionEvent>() else {
-        return;
+        return false;
     };
     let mut out = std::io::stdout();
     match event {
         model::SessionEvent::Delta { text } => {
             print!("{text}");
             let _ = out.flush();
+            false
         }
-        model::SessionEvent::ToolCall { verb } => println!("\n[tool→] {verb}"),
+        model::SessionEvent::ToolCall { verb } => {
+            println!("\n[tool→] {verb}");
+            false
+        }
         model::SessionEvent::ToolResult { verb, ok } => {
             println!("[tool{}] {verb}", if ok { "✓" } else { "✗" });
+            false
         }
         model::SessionEvent::Done { .. } => {
             println!();
-            let _ = tx.send(Msg::TurnOver);
+            true
         }
         model::SessionEvent::Cancelled => {
             println!("\n[tty] cancelled");
-            let _ = tx.send(Msg::TurnOver);
+            true
         }
         model::SessionEvent::Failed { error } => {
             println!("\n[tty] failed: {error}");
-            let _ = tx.send(Msg::TurnOver);
+            true
         }
-        model::SessionEvent::Unknown => {}
+        model::SessionEvent::Unknown => false,
     }
 }
 

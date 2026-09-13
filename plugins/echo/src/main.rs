@@ -77,6 +77,15 @@ fn main() -> std::io::Result<()> {
     for need in &needs {
         plugin = plugin.needs(need);
     }
+    // Likewise for listening: what a plugin hears is declared in its hello,
+    // the way a renderer declares `model::session::*`.
+    for topic in std::env::var("PORTOS_ECHO_SUBSCRIBES")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|s| !s.trim().is_empty())
+    {
+        plugin = plugin.subscribes(&Topic::parse(topic.trim()).expect("test topic"));
+    }
 
     portos_sdk::serve(
         plugin
@@ -125,11 +134,6 @@ fn main() -> std::io::Result<()> {
                 let (topic, data): (String, Payload) = args.parse()?;
                 let delivered = client.emit(&Topic::parse(&topic)?, data)?;
                 payload(&json!({ "delivered": delivered }))
-            })
-            .verb(&v("subscribe"), |args, client| {
-                let (topic,): (String,) = args.parse()?;
-                let sub = client.subscribe(&Topic::parse(&topic)?)?;
-                payload(&json!({ "sub": sub }))
             })
             .verb(&v("events"), move |_args, _client| {
                 payload(&seen.lock().unwrap().clone())

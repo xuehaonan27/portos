@@ -156,22 +156,6 @@ export class KernelClient {
     });
   }
 
-  /** Subscribe to a topic; events arrive via servePlugin's onEvent. */
-  subscribe(topic) {
-    return this._serial(async () => {
-      this.chan.writeFrame({ op: "subscribe", topic });
-      return unwrapOk(await this.chan.readFrame()).sub;
-    });
-  }
-
-  /** Drop one of this plugin's subscriptions. */
-  unsubscribe(sub) {
-    return this._serial(async () => {
-      this.chan.writeFrame({ op: "unsubscribe", sub });
-      return unwrapOk(await this.chan.readFrame()).removed ?? false;
-    });
-  }
-
   /** Where an artifact's bytes are on disk, for handing to something that
    *  only speaks in paths. The file is read-only. Prefer this over `read`
    *  whenever the consumer is a program rather than this process. */
@@ -219,12 +203,12 @@ export class KernelClient {
  * tools (optional): per-verb metadata {"family::verb": {description, schema}}
  *   advertised to the kernel and joined into grants introspection.
  * onReady (optional): async hook run with the client once connected, before
- *   serving — where a passive plugin (e.g. a renderer) subscribes.
+ *   serving — where a plugin whose job begins on its own starts it.
  * needs (optional): verbs this plugin cannot work without; until somebody
  *   answers them it runs but is not routed.
  * subscribes (optional): topics to listen to, registered by the kernel before
- *   the spawn returns — so nothing published "once everything is up" is
- *   missed. Subscribe from onReady only for what is learned at runtime.
+ *   the spawn returns. It is the only way to listen — there is no runtime
+ *   subscribe — so nothing published "once everything is up" can be missed.
  */
 export async function servePlugin({ name, verbs, tools, needs, subscribes, onCall, onEvent, onReady }) {
   const sock = process.env.PORTOS_PLUGIN_SOCK;

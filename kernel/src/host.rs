@@ -46,8 +46,7 @@ use portos_abi::boundary::{Cgroup, CgroupRoot};
 use portos_abi::ids::{PluginName, SubId, Topic, Verb};
 use portos_abi::wire::{
     Call, ChannelRole, ClaimReply, ClientOp, EmitReply, Event, GrantsReply, Hello, HelloFrame,
-    LocalEvent, LocateReply, Payload, PutReply, ReadReply, Reply, ServeMsg, SubscribeReply,
-    ToolMeta, UnsubscribeReply,
+    LocalEvent, LocateReply, Payload, PutReply, ReadReply, Reply, ServeMsg, ToolMeta,
 };
 use portos_abi::{ABI_VERSION, chunk, frame};
 use portos_router::{Miss, Router as _};
@@ -625,8 +624,9 @@ fn spawn_process(
         }
 
         // What it listens to, in place before this spawn returns: whoever
-        // started it may publish the moment it has, and a subscription made
-        // after the fact would miss that.
+        // started it may publish the moment it has. This is the only way a
+        // plugin subscribes — there is no runtime op — so a subscription
+        // cannot land after the event it was for.
         {
             let mut subs = inner.subs.lock().unwrap();
             for pattern in &hello.subscribes {
@@ -1210,31 +1210,6 @@ fn handle_client_op(
         ClientOp::Emit(req) => {
             let delivered = dispatch_event(kernel, inner, &req.topic, &req.data);
             ok(&EmitReply { delivered })
-        }
-        ClientOp::Subscribe(req) => {
-            let id = SubId::new(inner.next_sub.fetch_add(1, Ordering::SeqCst));
-            inner.subs.lock().unwrap().push(Sub {
-                id,
-                pattern: req.topic.clone(),
-                target: SubTarget::Plugin(name.clone()),
-            });
-            let _ = kernel.audit.lock().unwrap().append(json!({
-                "event": "events.subscribed", "plugin": name.as_str(),
-                "topic": req.topic.as_str(), "sub": id.get(),
-            }));
-            ok(&SubscribeReply { sub: id })
-        }
-        ClientOp::Unsubscribe(req) => {
-            // A plugin can only drop its own subscriptions.
-            let removed = {
-                let mut subs = inner.subs.lock().unwrap();
-                let before = subs.len();
-                subs.retain(|s| {
-                    !(s.id == req.sub && matches!(&s.target, SubTarget::Plugin(n) if n == name))
-                });
-                before != subs.len()
-            };
-            ok(&UnsubscribeReply { removed })
         }
 
         // ---- artifact ingest: frame, then chunk stream ----

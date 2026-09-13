@@ -212,15 +212,14 @@ fn main() -> std::io::Result<()> {
     // Start numbering above whatever is already stored: a restarted driver
     // that handed out `s1` again would be writing over a conversation it
     // knows nothing about.
-    // `next_session` and `subscribed` are owned by the one closure that
-    // touches them — which the single `match` made impossible to see, and
-    // which is the useful half of splitting the verbs apart.
+    // `next_session` is owned by the one closure that touches it — which
+    // the single `match` made impossible to see, and which is the useful
+    // half of splitting the verbs apart.
     let mut next_session = store
         .as_ref()
         .as_ref()
         .map(|s| s.load().highest_id())
         .unwrap_or(0);
-    let mut subscribed = false;
 
     let (s_start, st_start, ds) = (sessions.clone(), store.clone(), default_system);
     let (s_send, st_send, r_send) = (sessions.clone(), store.clone(), running.clone());
@@ -229,6 +228,7 @@ fn main() -> std::io::Result<()> {
 
     portos_sdk::serve(
         Plugin::new("portos-modeld")
+            .subscribes(&STREAM_TOPIC)
             // Its LLM calls go through the gateway; without one it can take a
             // session and answer nothing. Said here because this driver is
             // the only thing that knows it.
@@ -307,11 +307,6 @@ fn main() -> std::io::Result<()> {
                     }
                     r.insert(sid.as_str().to_string(), flag.clone());
                 }
-                if !subscribed {
-                    client.subscribe(&STREAM_TOPIC)?;
-                    subscribed = true;
-                }
-
                 let turn = Turn {
                     backend: backend.clone(),
                     client: client.clone(),

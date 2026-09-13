@@ -215,16 +215,6 @@ pub struct EmitReply {
     pub delivered: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct SubscribeReply {
-    pub sub: SubId,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct UnsubscribeReply {
-    pub removed: bool,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PutReply {
     pub meta: ArtifactMeta,
@@ -253,16 +243,6 @@ pub struct Emit {
     pub topic: Topic,
     #[serde(default)]
     pub data: Payload,
-}
-
-#[derive(Clone, Debug, PartialEq, Deserialize)]
-pub struct Subscribe {
-    pub topic: Topic,
-}
-
-#[derive(Clone, Debug, PartialEq, Deserialize)]
-pub struct Unsubscribe {
-    pub sub: SubId,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -325,8 +305,6 @@ pub enum ClientOp {
     Invoke(Invoke),
     Grants,
     Emit(Emit),
-    Subscribe(Subscribe),
-    Unsubscribe(Unsubscribe),
     Put(Put),
     Read(Read),
     Locate(Locate),
@@ -339,8 +317,6 @@ impl ClientOp {
             "invoke" => ClientOp::Invoke(serde_json::from_slice(bytes)?),
             "grants" => ClientOp::Grants,
             "emit" => ClientOp::Emit(serde_json::from_slice(bytes)?),
-            "subscribe" => ClientOp::Subscribe(serde_json::from_slice(bytes)?),
-            "unsubscribe" => ClientOp::Unsubscribe(serde_json::from_slice(bytes)?),
             "put" => ClientOp::Put(serde_json::from_slice(bytes)?),
             "read" => ClientOp::Read(serde_json::from_slice(bytes)?),
             "locate" => ClientOp::Locate(serde_json::from_slice(bytes)?),
@@ -355,8 +331,6 @@ impl ClientOp {
             ClientOp::Invoke(_) => "invoke",
             ClientOp::Grants => "grants",
             ClientOp::Emit(_) => "emit",
-            ClientOp::Subscribe(_) => "subscribe",
-            ClientOp::Unsubscribe(_) => "unsubscribe",
             ClientOp::Put(_) => "put",
             ClientOp::Read(_) => "read",
             ClientOp::Locate(_) => "locate",
@@ -382,8 +356,6 @@ impl Serialize for ClientOp {
                 m.serialize_entry("topic", &v.topic)?;
                 m.serialize_entry("data", &v.data)?;
             }
-            ClientOp::Subscribe(v) => m.serialize_entry("topic", &v.topic)?,
-            ClientOp::Unsubscribe(v) => m.serialize_entry("sub", &v.sub)?,
             ClientOp::Put(v) => {
                 m.serialize_entry("type", &v.content_type)?;
                 m.serialize_entry("labels", &v.labels)?;
@@ -514,10 +486,6 @@ mod tests {
                 topic: topic("model::session::s1"),
                 data: Payload::of(&serde_json::json!({"kind": "delta"})).unwrap(),
             }),
-            ClientOp::Subscribe(Subscribe {
-                topic: topic("model::session::*"),
-            }),
-            ClientOp::Unsubscribe(Unsubscribe { sub: SubId::new(7) }),
             ClientOp::Put(Put {
                 content_type: "image/png".to_string(),
                 labels: Some(Label::with_integ("web:https://example.com")),
