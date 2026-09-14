@@ -20,6 +20,7 @@ pub mod bulk;
 pub mod config;
 pub mod scope;
 
+use portos_abi::driver::{AcceptedSpec, Driver, VerbSpec};
 use portos_abi::ids::{IdError, PluginName, Topic, Verb};
 use portos_abi::wire::{
     self, ChannelRole, ClientOp, EmitReply, Grant, GrantsReply, Hello, HelloFrame, LocateReply,
@@ -27,10 +28,12 @@ use portos_abi::wire::{
 };
 use portos_abi::{ABI_VERSION, ArtifactMeta, Label, chunk, frame};
 use portos_router::Router as _;
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// What can go wrong talking to the kernel. Callers can tell a refusal
@@ -293,6 +296,69 @@ impl<'a> Registrar<'a> {
 
 type Handler<'a> = Box<dyn FnMut(&Payload, &Arc<KernelClient>) -> CallResult + Send + 'a>;
 
+/// What an implementation advertises: the document's words, never its own.
+fn meta_of(spec: &VerbSpec) -> ToolMeta {
+    ToolMeta {
+        description: spec.description.clone(),
+        schema: Some(spec.args.clone()),
+    }
+}
+
+/// The work an accepted verb admitted, to run on its own thread.
+pub type Job = Box<dyn FnOnce(Accepted) + Send + 'static>;
+
+/// Accepted work's line to its subscribers.
+///
+/// Everything the work has to say goes through [`Accepted::emit`], on the
+/// topic the driver named for this call. The SDK watches for the terminal
+/// event the driver described, and if the work is dropped without having
+/// sent one — it returned early, or it panicked — publishes the driver's
+/// failure event in its place. The debt a long operation owes its
+/// subscribers is paid by construction rather than remembered.
+pub struct Accepted {
+    topic: Topic,
+    client: Arc<KernelClient>,
+    spec: AcceptedSpec,
+    done: AtomicBool,
+}
+
+impl Accepted {
+    /// Where this call's work reports.
+    pub fn topic(&self) -> &Topic {
+        &self.topic
+    }
+
+    /// Publish one event of the work. Returns how many subscribers it
+    /// reached.
+    pub fn emit<E: Serialize>(&self, event: &E) -> Result<u64, PluginError> {
+        let data = Payload::of(event)?;
+        if self.spec.is_terminal(&data) {
+            self.done.store(true, Ordering::SeqCst);
+        }
+        self.client.emit(&self.topic, data)
+    }
+}
+
+impl Drop for Accepted {
+    fn drop(&mut self) {
+        if self.done.load(Ordering::SeqCst) {
+            return;
+        }
+        let why = if std::thread::panicking() {
+            "the work panicked before it ended"
+        } else {
+            "the work ended without a terminal event"
+        };
+        let event = self.spec.failed_event(why);
+        // While unwinding, the client's lock may be the very thing that was
+        // held when the panic hit; a second panic here would abort the
+        // process, and a lost failure event is the lesser cost.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.client.emit(&self.topic, event)
+        }));
+    }
+}
+
 /// Run once, after every channel is up and before the first call is served.
 type ReadyHook<'a> =
     Box<dyn FnOnce(&Registrar<'a>, &Arc<KernelClient>) -> Result<(), PluginError> + 'a>;
@@ -390,68 +456,117 @@ impl<'a> Plugin<'a> {
         }
     }
 
-    /// A verb this plugin answers, described so the model can use it.
+    /// The one way to answer a verb: as an implementation of a driver's.
     ///
-    /// The description and schema are what a caller holding the capability
-    /// is handed by `grants` introspection — so this one call is the whole
-    /// of what the verb is: how to run it, and what to tell someone about
-    /// it.
-    pub fn tool(
+    /// The driver document supplies what the kernel will show callers — the
+    /// description and the argument schema — so a plugin cannot describe
+    /// itself, and two implementations advertise the same words. The types
+    /// supply the checking: the arguments are parsed into `A` before the
+    /// handler runs and the reply is serialised from `R` after it, so a
+    /// handler never sees a payload it did not ask for and never answers in
+    /// a shape the interface did not name. A verb the driver does not
+    /// declare is a programming mistake, and fails here rather than as a
+    /// hello the kernel refuses for reasons the author has to look up.
+    pub fn implement<A, R>(
         self,
-        verb: &str,
-        description: &str,
-        schema: serde_json::Value,
-        handler: impl FnMut(&Payload, &Arc<KernelClient>) -> CallResult + Send + 'a,
-    ) -> Plugin<'a> {
-        self.declare(
-            verb,
-            ToolMeta {
-                description: description.to_string(),
-                schema: Payload::of(&schema).ok(),
-            },
-            handler,
-        )
-    }
-
-    /// A verb of a driver interface, described by that interface.
-    ///
-    /// The description and schema come from the driver crate — `fs::tools()`
-    /// — so what this plugin advertises *is* what the interface says, not a
-    /// second copy of it that can drift.
-    pub fn implement(
-        self,
+        driver: &Driver,
         verb: &Verb,
-        meta: &ToolMeta,
-        handler: impl FnMut(&Payload, &Arc<KernelClient>) -> CallResult + Send + 'a,
-    ) -> Plugin<'a> {
-        self.declare(verb.as_str(), meta.clone(), handler)
+        mut handler: impl FnMut(A, &Arc<KernelClient>) -> Result<R, CallError> + Send + 'a,
+    ) -> Plugin<'a>
+    where
+        A: DeserializeOwned,
+        R: Serialize,
+    {
+        let spec = self.spec_of(driver, verb);
+        if spec.accepted.is_some() {
+            panic!(
+                "plugin {}: {verb} is accepted, not awaited; implement it with implement_accepted",
+                self.name
+            );
+        }
+        let meta = meta_of(spec);
+        let name = verb.clone();
+        let bulk = spec.bulk.clone();
+        self.declare(verb, meta, move |args, client| {
+            let a: A = args
+                .parse()
+                .map_err(|e| CallError::from(format!("{name}: arguments: {e}")))?;
+            let r = handler(a, client)?;
+            let reply =
+                Payload::of(&r).map_err(|e| CallError::from(format!("{name}: reply: {e}")))?;
+            match &bulk {
+                Some(spec) => bulk::spill(client, spec, &name, args, reply),
+                None => Ok(reply),
+            }
+        })
     }
 
-    /// A verb with nothing to say for itself: reachable, but not something a
-    /// model is meant to discover. Test fixtures and internal plumbing.
-    pub fn verb(
+    /// An accepted verb: the handler admits the work and hands back what to
+    /// run; the call returns with `R` and the work runs on its own thread,
+    /// reporting on the topic the driver declared, through the [`Accepted`]
+    /// it is given. Exactly one terminal event ends it — the driver says
+    /// which events those are — and if the work ends without one, by
+    /// returning or by panicking, the SDK publishes the driver's failure
+    /// event, so a subscriber never waits for an ending that is not coming.
+    pub fn implement_accepted<A, R>(
         self,
-        verb: &str,
-        handler: impl FnMut(&Payload, &Arc<KernelClient>) -> CallResult + Send + 'a,
-    ) -> Plugin<'a> {
-        self.declare(verb, ToolMeta::default(), handler)
+        driver: &Driver,
+        verb: &Verb,
+        mut handler: impl FnMut(A, &Arc<KernelClient>) -> Result<(R, Job), CallError> + Send + 'a,
+    ) -> Plugin<'a>
+    where
+        A: DeserializeOwned,
+        R: Serialize,
+    {
+        let spec = self.spec_of(driver, verb);
+        let Some(accepted) = spec.accepted.clone() else {
+            panic!(
+                "plugin {}: {verb} is not declared accepted; implement it with implement",
+                self.name
+            );
+        };
+        let meta = meta_of(spec);
+        let name = verb.clone();
+        self.declare(verb, meta, move |args, client| {
+            let topic = accepted
+                .topic_for(args)
+                .map_err(|e| CallError::from(format!("{name}: {e}")))?;
+            let a: A = args
+                .parse()
+                .map_err(|e| CallError::from(format!("{name}: arguments: {e}")))?;
+            let (r, job) = handler(a, client)?;
+            let guard = Accepted {
+                topic,
+                client: client.clone(),
+                spec: accepted.clone(),
+                done: AtomicBool::new(false),
+            };
+            std::thread::spawn(move || job(guard));
+            Payload::of(&r).map_err(|e| CallError::from(format!("{name}: reply: {e}")))
+        })
+    }
+
+    fn spec_of<'d>(&self, driver: &'d Driver, verb: &Verb) -> &'d VerbSpec {
+        driver.spec(verb).unwrap_or_else(|| {
+            panic!(
+                "plugin {}: {verb} is not a verb of driver {}",
+                self.name, driver.driver
+            )
+        })
     }
 
     fn declare(
         self,
-        verb: &str,
+        verb: &Verb,
         meta: ToolMeta,
         handler: impl FnMut(&Payload, &Arc<KernelClient>) -> CallResult + Send + 'a,
     ) -> Plugin<'a> {
-        // Both failures here are programming mistakes, caught before the
-        // plugin ever connects: a malformed verb would otherwise surface as a
-        // hello the kernel refuses for reasons the author has to look up, and
-        // a name claimed twice used to leave the second handler silently
+        // A name claimed twice is a programming mistake, caught before the
+        // plugin ever connects: it used to leave the second handler silently
         // unreachable.
-        let verb = Verb::parse(verb).unwrap_or_else(|e| panic!("plugin {}: {e}", self.name));
         let mut inner = self.inner.lock().unwrap();
         let id = HandlerId(inner.handlers.len());
-        if let Err(conflict) = inner.table.add(verb, id, meta) {
+        if let Err(conflict) = inner.table.add(verb.clone(), id, meta) {
             panic!("plugin {}: {conflict}", self.name);
         }
         inner.handlers.push(Box::new(handler));
@@ -657,4 +772,50 @@ fn handshake<W: Write, R: Read>(wr: &mut W, rd: &mut R, h: &HelloFrame) -> std::
     ack.into_result()
         .map_err(|e| std::io::Error::other(format!("hello rejected: {e}")))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The one door is the driver's: a verb the document does not declare
+    /// cannot be implemented, and the mistake is reported where it is made.
+    const ACCEPTED: &str = r#"{"driver": "x", "verbs": {
+        "go": {"description": "Go.", "args": {}, "accepted": {"topic": "x::t",
+               "terminal": {"field": "kind", "values": ["done"]}, "failed": {"kind": "failed"}}},
+        "look": {"description": "Look.", "args": {}}
+    }}"#;
+
+    /// The document says how a verb is answered, and a handler of the other
+    /// kind is a mistake reported where it is made.
+    #[test]
+    #[should_panic(expected = "x::go is accepted, not awaited")]
+    fn an_accepted_verb_is_not_implemented_as_awaited() {
+        let d = Driver::parse(ACCEPTED).unwrap();
+        let _ = Plugin::new("p").implement(&d, &Verb::parse("x::go").unwrap(), |_: Payload, _| {
+            Ok::<_, CallError>(Payload::null())
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "x::look is not declared accepted")]
+    fn an_awaited_verb_is_not_implemented_as_accepted() {
+        let d = Driver::parse(ACCEPTED).unwrap();
+        let _ = Plugin::new("p").implement_accepted(
+            &d,
+            &Verb::parse("x::look").unwrap(),
+            |_: Payload, _| Ok::<_, CallError>((Payload::null(), Box::new(|_| {}) as Job)),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "x::b is not a verb of driver x")]
+    fn a_verb_the_driver_does_not_declare_is_a_mistake() {
+        let d =
+            Driver::parse(r#"{"driver": "x", "verbs": {"a": {"description": "A.", "args": {}}}}"#)
+                .unwrap();
+        let _ = Plugin::new("p").implement(&d, &Verb::parse("x::b").unwrap(), |_: Payload, _| {
+            Ok::<_, CallError>(Payload::null())
+        });
+    }
 }

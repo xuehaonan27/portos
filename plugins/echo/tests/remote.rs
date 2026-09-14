@@ -270,7 +270,7 @@ fn another_nodes_verbs_arrive_as_ordinary_local_verbs() {
         "and the model is told where it runs: {description:?}"
     );
     assert_eq!(
-        emit["schema"]["properties"]["text"]["type"], "string",
+        emit["schema"]["items"]["type"], "string",
         "the schema crossed too, so the call can be formed: {emit}"
     );
 

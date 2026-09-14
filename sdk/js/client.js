@@ -10,6 +10,7 @@
 // became the second JS driver alongside the browser.
 
 import net from "node:net";
+import { readFile } from "node:fs/promises";
 
 export const ABI_VERSION = "0.2";
 const MAX_FRAME = 8 * 1024 * 1024;
@@ -197,11 +198,136 @@ export class KernelClient {
 }
 
 /**
- * Connect both channels, declare verbs, and serve until shutdown.
- * onCall(verb, args, client) → result (thrown errors become {"err"}).
+ * A driver interface, as data: `drivers/<name>/driver.json`. The same
+ * document the Rust interface crate reads, so an implementation here and a
+ * caller there cannot disagree about what a verb is.
+ */
+export async function loadDriver(file) {
+  const doc = JSON.parse(await readFile(file, "utf8"));
+  if (typeof doc.driver !== "string" || typeof doc.verbs !== "object") {
+    throw new Error(`${file}: not a driver document`);
+  }
+  return doc;
+}
+
+/**
+ * Hold a value to a JSON Schema — the subset the drivers write: type,
+ * properties, required, additionalProperties, items, prefixItems, min/max
+ * items, enum, anyOf/oneOf. Returns the first problem as a string, or null.
+ * This is the JS side of what serde does for a Rust plugin: a handler never
+ * sees arguments the interface did not describe, and never answers in a
+ * shape it did not name.
+ */
+export function check(value, schema, at = "$") {
+  if (!schema || typeof schema !== "object") return null;
+  const kind = (v) =>
+    v === null ? "null" : Array.isArray(v) ? "array" : Number.isInteger(v) ? "integer" : typeof v;
+  if (schema.type !== undefined) {
+    const want = Array.isArray(schema.type) ? schema.type : [schema.type];
+    const k = kind(value);
+    const ok = want.some((t) => t === k || (t === "number" && k === "integer"));
+    if (!ok) return `${at}: expected ${want.join("|")}, got ${k}`;
+  }
+  if (schema.enum && !schema.enum.some((e) => e === value)) {
+    return `${at}: expected one of ${JSON.stringify(schema.enum)}`;
+  }
+  const alts = schema.anyOf ?? schema.oneOf;
+  if (alts) {
+    const problems = alts.map((s) => check(value, s, at));
+    if (!problems.some((p) => p === null)) return problems.join("; or ");
+  }
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    for (const key of schema.required ?? []) {
+      if (!(key in value)) return `${at}: missing ${key}`;
+    }
+    for (const [key, v] of Object.entries(value)) {
+      const sub = schema.properties?.[key];
+      if (sub) {
+        const p = check(v, sub, `${at}.${key}`);
+        if (p) return p;
+      } else if (schema.additionalProperties === false) {
+        return `${at}: unexpected ${key}`;
+      } else if (typeof schema.additionalProperties === "object") {
+        const p = check(v, schema.additionalProperties, `${at}.${key}`);
+        if (p) return p;
+      }
+    }
+  }
+  if (Array.isArray(value)) {
+    if (schema.minItems !== undefined && value.length < schema.minItems) {
+      return `${at}: expected at least ${schema.minItems} items`;
+    }
+    if (schema.maxItems !== undefined && value.length > schema.maxItems) {
+      return `${at}: expected at most ${schema.maxItems} items`;
+    }
+    for (let i = 0; i < value.length; i++) {
+      const sub = schema.prefixItems?.[i] ?? schema.items;
+      if (sub) {
+        const p = check(value[i], sub, `${at}[${i}]`);
+        if (p) return p;
+      }
+    }
+  }
+  return null;
+}
+
+// Where the line between context and data is drawn: the constants of
+// `portos_abi::bulk`, because the model was told one shape.
+const INLINE_MAX = 16 * 1024;
+const PREVIEW_CHARS = 2048;
+const ARGS_LABEL_CHARS = 256;
+
+function takeChars(s, n) {
+  let out = "";
+  let i = 0;
+  for (const ch of s) {
+    if (i++ >= n) break;
+    out += ch;
+  }
+  return out;
+}
+
+/**
+ * Apply a verb's bulk declaration to its reply: a value that is exactly
+ * `{text}` is text and its bytes are the text; anything else is a document
+ * and its bytes are its JSON. Over the line, it is stored under the driver's
+ * content type with the verb and its arguments as provenance, and
+ * `{handle, size, preview}` is left behind. The JS twin of
+ * `portos_sdk::bulk`.
+ */
+async function spill(client, spec, verb, args, reply) {
+  const provenance = { integ: [verb, `args:${takeChars(JSON.stringify(args), ARGS_LABEL_CHARS)}`] };
+  const one = async (value) => {
+    const isObject = value !== null && typeof value === "object" && !Array.isArray(value);
+    if (isObject && "handle" in value && "size" in value && "preview" in value) return value;
+    const inline = isObject && Object.keys(value).length === 1 && typeof value.text === "string";
+    const bytes = inline ? value.text : JSON.stringify(value);
+    if (Buffer.byteLength(bytes, "utf8") <= INLINE_MAX) return value;
+    const meta = await client.put(Buffer.from(bytes, "utf8"), spec.type, provenance);
+    return { handle: meta.id, size: meta.size, preview: takeChars(bytes, PREVIEW_CHARS) };
+  };
+  if (!spec.fields?.length) return one(reply);
+  const out = { ...reply };
+  for (const field of spec.fields) {
+    if (field in out) out[field] = await one(out[field]);
+  }
+  return out;
+}
+
+/**
+ * Connect both channels, declare what this plugin answers, and serve until
+ * shutdown.
+ *
+ * driver + implement: the one way to answer verbs. `driver` is a document
+ *   from loadDriver; `implement` maps each short verb name to an async
+ *   handler (args, client) → reply. What the kernel is told about each verb
+ *   is the driver's wording, never this plugin's; arguments are checked
+ *   against the driver's schema before a handler runs, the reply against
+ *   its reply schema where the driver states one, and a reply the driver
+ *   marks bulky is stored when it is over the line. A name the driver does
+ *   not declare fails here, at startup. Omit both for a plugin with no
+ *   verbs. Accepted verbs are not offered here yet: no JS driver has one.
  * onEvent(topic, data) receives subscribed events.
- * tools (optional): per-verb metadata {"family::verb": {description, schema}}
- *   advertised to the kernel and joined into grants introspection.
  * onReady (optional): async hook run with the client once connected, before
  *   serving — where a plugin whose job begins on its own starts it.
  * needs (optional): verbs this plugin cannot work without; until somebody
@@ -210,16 +336,28 @@ export class KernelClient {
  *   the spawn returns. It is the only way to listen — there is no runtime
  *   subscribe — so nothing published "once everything is up" can be missed.
  */
-export async function servePlugin({ name, verbs, tools, needs, subscribes, onCall, onEvent, onReady }) {
+export async function servePlugin({ name, driver, implement, needs, subscribes, onEvent, onReady }) {
   const sock = process.env.PORTOS_PLUGIN_SOCK;
   if (!sock) throw new Error("PORTOS_PLUGIN_SOCK unset");
   const token = process.env.PORTOS_PLUGIN_TOKEN ?? "";
+
+  const handlers = {};
+  const tools = {};
+  for (const [short, handler] of Object.entries(implement ?? {})) {
+    const spec = driver?.verbs?.[short];
+    if (!spec) throw new Error(`${name}: ${short} is not a verb of driver ${driver?.driver}`);
+    if (spec.accepted) throw new Error(`${name}: ${short} is accepted, which this SDK does not offer yet`);
+    const verb = `${driver.driver}::${short}`;
+    handlers[verb] = { spec, handler };
+    tools[verb] = { description: spec.description, schema: spec.args };
+  }
+  const verbs = Object.keys(handlers);
 
   // JS declares only the client channel: the async event loop interleaves
   // event frames with in-flight calls on one connection, so the dedicated
   // events channel (which sync-threaded plugins need) is unnecessary here.
   const serveHello = { name, abi: ABI_VERSION, role: "serve", token, verbs, channels: ["client"] };
-  if (tools) serveHello.tools = tools;
+  if (verbs.length) serveHello.tools = tools;
   if (needs?.length) serveHello.needs = needs;
   if (subscribes?.length) serveHello.subscribes = subscribes;
   const serveChan = await connectChannel(sock, { hello: serveHello });
@@ -239,8 +377,17 @@ export async function servePlugin({ name, verbs, tools, needs, subscribes, onCal
     if (!msg.op || msg.op === "shutdown") return;
     if (msg.op === "call") {
       try {
-        const v = await onCall(msg.verb, msg.args ?? null, client);
-        serveChan.writeFrame({ ok: v === undefined ? null : v });
+        const h = handlers[msg.verb];
+        if (!h) throw new Error(`not a verb of this plugin: ${msg.verb}`);
+        const args = msg.args ?? {};
+        const bad = check(args, h.spec.args);
+        if (bad) throw new Error(`${msg.verb}: arguments: ${bad}`);
+        const v = await h.handler(args, client);
+        let reply = v === undefined ? null : v;
+        if (h.spec.bulk) reply = await spill(client, h.spec.bulk, msg.verb, args, reply);
+        const off = h.spec.reply ? check(reply, h.spec.reply) : null;
+        if (off) throw new Error(`${msg.verb}: reply: ${off}`);
+        serveChan.writeFrame({ ok: reply });
       } catch (e) {
         serveChan.writeFrame({ err: String(e?.message ?? e) });
       }

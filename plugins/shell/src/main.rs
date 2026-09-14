@@ -29,11 +29,9 @@
 //! Config (from the launch spec): `{"cwd": "/path"}`, the default working
 //! directory — the process's own if unset.
 
-use portos_abi::Label;
-use portos_abi::wire::Payload;
-use portos_sdk::bulk::Sink;
+use portos_sdk::bulk::Bulk;
 use portos_sdk::scope::Scope;
-use portos_sdk::{CallError, CallResult, KernelClient, Plugin};
+use portos_sdk::{CallError, KernelClient, Plugin};
 use portos_shell_api::{self as shell, DEFAULT_TIMEOUT_MS, RunArgs, RunReply};
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -41,7 +39,6 @@ use std::process::Command;
 use std::time::Duration;
 
 /// Provenance labels carry the command; a whole script would not be a label.
-const LABEL_CMD_CHARS: usize = 80;
 
 /// What this driver needs to know, which is one thing — and it is a default,
 /// not a fence: `cd /` leaves it.
@@ -58,20 +55,18 @@ fn main() -> std::io::Result<()> {
         None => std::env::current_dir()?,
     };
     eprintln!("[shell] cwd {}", cwd.display());
-    let sink = Sink::default();
 
-    let tools = shell::tools();
     portos_sdk::serve(
         Plugin::new("portos-shell").implement(
+            &shell::DRIVER,
             &shell::RUN,
-            &tools[&shell::RUN],
-            move |args, client| run(&cwd, &sink, client, args.parse()?),
+            move |a: shell::RunArgs, client| run(&cwd, client, a),
         ),
         |_topic, _data| {},
     )
 }
 
-fn run(base: &PathBuf, sink: &Sink, client: &KernelClient, a: RunArgs) -> CallResult {
+fn run(base: &PathBuf, client: &KernelClient, a: RunArgs) -> Result<RunReply, CallError> {
     let cwd = match &a.cwd {
         Some(rel) => base.join(rel),
         None => base.clone(),
@@ -97,21 +92,15 @@ fn run(base: &PathBuf, sink: &Sink, client: &KernelClient, a: RunArgs) -> CallRe
         )
         .map_err(|e| CallError::from(format!("spawn: {e}")))?;
 
-    let label = Label::with_integ(&format!("shell:{}", truncate(&a.cmd, LABEL_CMD_CHARS)));
-    Ok(Payload::of(&RunReply {
+    // Both outputs are text; `drivers/shell` says they are bulky, and the
+    // SDK stores whichever does not fit.
+    Ok(RunReply {
         status: done.status,
         signal: done.signal,
-        stdout: sink.deliver(client, &done.stdout, "text/plain", Some(label.clone()))?,
-        stderr: sink.deliver(client, &done.stderr, "text/plain", Some(label))?,
+        stdout: Bulk::Inline { text: done.stdout },
+        stderr: Bulk::Inline { text: done.stderr },
         timed_out: done.timed_out,
         output_truncated: done.output_truncated,
         duration_ms: done.duration.as_millis() as u64,
-    })?)
-}
-
-fn truncate(s: &str, n: usize) -> String {
-    match s.char_indices().nth(n) {
-        Some((end, _)) => format!("{}…", &s[..end]),
-        None => s.to_string(),
-    }
+    })
 }

@@ -6,7 +6,9 @@
 //! or any other vendor, because a provider is an implementation detail one
 //! level further down.
 
+use portos_abi::driver::Driver;
 use portos_abi::ids::{IdError, Topic, Verb};
+use portos_abi::wire::ToolMeta;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -255,6 +257,16 @@ impl SessionIndex {
     }
 }
 
+/// The interface itself; the crate's constants and types are a typed view.
+pub const DRIVER_JSON: &str = include_str!("../driver.json");
+pub static DRIVER: LazyLock<Driver> =
+    LazyLock::new(|| Driver::parse(DRIVER_JSON).expect("drivers/model/driver.json is well-formed"));
+
+/// What each verb says about itself, as an implementation advertises it.
+pub fn tools() -> BTreeMap<Verb, ToolMeta> {
+    DRIVER.tools()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,5 +315,22 @@ mod tests {
         assert_eq!(s.as_str(), "s3");
         assert_eq!(s.topic().as_str(), "model::session::s3");
         assert!(ALL_SESSIONS.matches(&s.topic()));
+    }
+}
+
+#[cfg(test)]
+mod driver_document {
+    use super::*;
+
+    /// The document is this interface: exactly the verbs named here, all of
+    /// this driver, described.
+    #[test]
+    fn names_exactly_these_verbs() {
+        let named: Vec<&Verb> = vec![&START, &SEND, &CANCEL, &END, &SESSIONS];
+        assert_eq!(DRIVER.driver, "model");
+        assert_eq!(tools().len(), named.len());
+        for v in named {
+            assert!(DRIVER.spec(v).is_some(), "{v} is in driver.json");
+        }
     }
 }

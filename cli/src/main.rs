@@ -7,10 +7,12 @@
 //!   portos get <root> <artifact-id> <out-file>
 //!   portos audit-verify <root>
 //!   portos bundle <root> <base-dir> [paths…]
+//!   portos driver <root> <driver.json>
 //!   portos plugin <root> <spec.json>
 //!   portos sessions <root>
 //!   portos run <root>
 
+mod driver;
 mod init;
 mod plugin;
 mod run;
@@ -106,12 +108,15 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let entries = portos_kernel::audit::AuditLog::verify(&path)?;
             println!("audit chain OK: {} entries", entries.len());
         }
+        "driver" => driver::driver(&need(args, 2, "root")?, &need(args, 3, "driver.json")?)?,
         "plugin" => plugin::plugin(&need(args, 2, "root")?, &need(args, 3, "spec.json")?)?,
         "sessions" => sessions::sessions(&need(args, 2, "root")?)?,
         "run" => run::run(&need(args, 2, "root")?)?,
         _ => {
             println!("portos — AgentOS M0 CLI");
-            println!("  init | put | bundle | plugin | meta | get | audit-verify | sessions | run");
+            println!(
+                "  init | put | bundle | driver | plugin | meta | get | audit-verify | sessions | run"
+            );
         }
     }
     Ok(())

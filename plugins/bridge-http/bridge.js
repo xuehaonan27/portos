@@ -177,9 +177,8 @@ async function handle(req, res, client) {
 
 await servePlugin({
   name: "portos-bridge-http",
-  // Zero verbs: this plugin serves nobody inside PortOS. It is a consumer of
+  // No verbs: this plugin serves nobody inside PortOS. It is a consumer of
   // the event plane and a caller of the invoke path, like any renderer.
-  verbs: [],
   subscribes: TOPICS,
   onReady: async (client) => {
     server = http.createServer((req, res) => {
@@ -207,9 +206,6 @@ await servePlugin({
       const { writeFile } = await import("node:fs/promises");
       await writeFile(process.env.PORTOS_BRIDGE_PORT_FILE, String(bound.port));
     }
-  },
-  onCall: async () => {
-    throw new Error("portos-bridge-http serves no verbs");
   },
   onEvent: (topic, data) => publish({ topic, data }),
 });

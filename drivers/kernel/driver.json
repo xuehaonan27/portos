@@ -1,0 +1,77 @@
+{
+  "driver": "kernel",
+  "verbs": {
+    "plugins": {
+      "args": {
+        "properties": {},
+        "type": "object"
+      },
+      "description": "List the plugins currently running: what each was started from, the verbs each answers, and what each is still waiting for."
+    },
+    "spawn": {
+      "args": {
+        "properties": {
+          "args": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "artifact": {
+            "description": "id of an executable stored in the CAS — the portable way to name a plugin",
+            "type": "string"
+          },
+          "bin": {
+            "description": "path to an executable on this host; use it for things already installed, such as `node`",
+            "type": "string"
+          },
+          "env": {
+            "type": "object"
+          },
+          "grants": {
+            "description": "capabilities to mint once it is up; `subject` defaults to the new plugin",
+            "items": {
+              "properties": {
+                "resource": {
+                  "type": "string"
+                },
+                "subject": {
+                  "type": "string"
+                },
+                "verbs": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "resource",
+                "verbs"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "description": "Start a new plugin and grant it what it needs. Name it with either `artifact` (an executable in the CAS) or `bin` (a path on this host) — exactly one. The plugin's verbs become available to anyone granted them — including, if the grants say so, you — from your next turn onward. Use this to add a capability the system does not currently have."
+    },
+    "stop": {
+      "args": {
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "description": "Stop a running plugin. Its verbs stop being routed and everything it was granted is revoked; anything it started is collected too."
+    }
+  }
+}

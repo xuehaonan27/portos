@@ -14,15 +14,25 @@
 //! every driver takes: the kernel moved bytes it could not read, and the
 //! plugin that owns the meaning is the one that names the types.
 
+use portos_abi::driver::Driver;
 use portos_abi::ids::{PluginName, Topic, Verb};
 use portos_abi::wire::Payload;
-use portos_sdk::{CallError, CallResult, Plugin};
-use serde::Serialize;
+use portos_sdk::{CallError, CallResult, Job, Plugin};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::sync::{Arc, Mutex};
+
+/// Work to start, and how it should end: with the terminal event, without
+/// one, or in a panic. What the SDK owes on the last two is the test.
+#[derive(Deserialize)]
+struct BeginArgs {
+    #[allow(dead_code)]
+    turn: String,
+    outcome: String,
+}
 
 /// One event this plugin received, kept so a test can ask for them back.
 #[derive(Clone, Serialize)]
@@ -49,8 +59,12 @@ fn main() -> std::io::Result<()> {
         std::fs::write(path, child.id().to_string())?;
     }
 
-    let driver = std::env::var("PORTOS_ECHO_DRIVER").unwrap_or_else(|_| "echo".into());
-    let name = format!("portos-{driver}");
+    let role = std::env::var("PORTOS_ECHO_DRIVER").unwrap_or_else(|_| "echo".into());
+    let name = format!("portos-{role}");
+    // Its interface is a document like any driver's. Which driver it plays
+    // is a launch-time choice, so the document's name is overwritten.
+    let mut driver = Driver::parse(include_str!("../driver.json")).expect("echo driver.json");
+    driver.driver = role;
 
     // Shared because the verbs are separate closures now. That is not a
     // cost of the new shape so much as the old shape hiding the fact: two
@@ -62,7 +76,7 @@ fn main() -> std::io::Result<()> {
     let seen = received.clone();
 
     let (make, used) = (refs.clone(), refs);
-    let v = |short: &str| format!("{driver}::{short}");
+    let v = |short: &str| driver.verb(short).expect("a verb of echo's document");
 
     // A fixture for dependency readiness: whatever is listed here is
     // something this echo cannot work without, the way modeld cannot work
@@ -91,65 +105,83 @@ fn main() -> std::io::Result<()> {
         plugin
             // The one verb with anything to say for itself, so grants
             // introspection has something to join against in tests.
-            .tool(
-                &v("emit"),
-                "Print a line to the echo driver's stdout.",
-                json!({"type": "object", "properties": {"text": {"type": "string"}}}),
-                |args, _client| {
-                    let (text,): (String,) = args.parse()?;
-                    println!("emit: {text}");
-                    Ok(Payload::null())
-                },
-            )
+            .implement(&driver, &v("emit"), |(text,): (String,), _client| {
+                println!("emit: {text}");
+                Ok(Payload::null())
+            })
             // Observation over the data plane: the payload streams in as
             // chunks through the client channel, never inside a JSON frame.
             // Returns a bounded digest — control-plane preview discipline,
             // not a payload copy.
-            .verb(&v("digest"), |args, client| {
-                let (id,): (String,) = args.parse()?;
+            .implement(&driver, &v("digest"), |(id,): (String,), client| {
                 let mut sink = DigestSink::default();
                 let n = client.read_to(&id, 0, None, &mut sink)?;
                 payload(&json!({ "bytes": n, "head_hex": hex_of(&sink.head) }))
             })
             // Data-plane ingest from the plugin side: generate n pattern
             // bytes and stream them into the CAS.
-            .verb(&v("put_pattern"), |args, client| {
-                let (n,): (u64,) = args.parse()?;
+            .implement(&driver, &v("put_pattern"), |(n,): (u64,), client| {
                 let meta = client.put(PatternReader { left: n, pos: 0 }, "test/pattern", None)?;
                 payload(&json!({ "meta": meta }))
             })
             // Invoke another plugin's verb through the kernel (cap-gated
             // there; this plugin holds no authority of its own).
-            .verb(&v("relay"), |args, client| {
-                let (target, inner): (String, Payload) = args.parse()?;
-                Ok(client.invoke(&Verb::parse(&target)?, inner)?)
-            })
+            .implement(
+                &driver,
+                &v("relay"),
+                |(target, inner): (String, Payload), client| {
+                    Ok(client.invoke(&Verb::parse(&target)?, inner)?)
+                },
+            )
             // The same, naming the instance: what a caller does when more
             // than one answers the verb.
-            .verb(&v("relay_at"), |args, client| {
-                let (at, target, inner): (String, String, Payload) = args.parse()?;
-                Ok(client.invoke_at(&PluginName::parse(&at)?, &Verb::parse(&target)?, inner)?)
-            })
-            .verb(&v("publish"), |args, client| {
-                let (topic, data): (String, Payload) = args.parse()?;
-                let delivered = client.emit(&Topic::parse(&topic)?, data)?;
-                payload(&json!({ "delivered": delivered }))
-            })
-            .verb(&v("events"), move |_args, _client| {
+            .implement(
+                &driver,
+                &v("relay_at"),
+                |(at, target, inner): (String, String, Payload), client| {
+                    Ok(
+                        client.invoke_at(
+                            &PluginName::parse(&at)?,
+                            &Verb::parse(&target)?,
+                            inner,
+                        )?,
+                    )
+                },
+            )
+            .implement(
+                &driver,
+                &v("publish"),
+                |(topic, data): (String, Payload), client| {
+                    let delivered = client.emit(&Topic::parse(&topic)?, data)?;
+                    payload(&json!({ "delivered": delivered }))
+                },
+            )
+            .implement(&driver, &v("events"), move |_: Payload, _client| {
                 payload(&seen.lock().unwrap().clone())
             })
-            .verb(&v("grants"), |_args, client| payload(&client.grants()?))
+            .implement(&driver, &v("grants"), |_: Payload, client| {
+                payload(&client.grants()?)
+            })
             // Two-layer naming demo: refs are driver-session-local, volatile,
             // and never enter the kernel handle table.
-            .verb(&v("make_ref"), move |_args, _client| {
+            .implement(&driver, &v("make_ref"), move |_: Payload, _client| {
                 let mut n = next_ref.lock().unwrap();
                 *n += 1;
                 let r = format!("e{n}");
                 make.lock().unwrap().insert(r.clone());
                 payload(&json!({ "ref": r }))
             })
-            .verb(&v("use_ref"), move |args, _client| {
-                let (r,): (String,) = args.parse()?;
+            .implement_accepted(&driver, &v("begin"), |a: BeginArgs, _client| {
+                let job: Job = Box::new(move |accepted| match a.outcome.as_str() {
+                    "done" => {
+                        let _ = accepted.emit(&json!({"kind": "done"}));
+                    }
+                    "panic" => panic!("the toy was told to"),
+                    _ => {}
+                });
+                Ok((json!({"accepted": true}), job))
+            })
+            .implement(&driver, &v("use_ref"), move |(r,): (String,), _client| {
                 if used.lock().unwrap().contains(&r) {
                     payload(&json!({ "used": r }))
                 } else {

@@ -4,12 +4,12 @@
 
 ## 结构
 
-- `src/plugin.js` — 插件本体：读启动配置，把 `drivers/browser/tools.json` 里的 verbs 挂到 ABI 上，套用两条数据面规则——模型可能不读的结果进 CAS 只留 preview（`portos_abi::bulk` 的 JS 双胞胎），截图永远是 artifact 不是字节。
+- `src/plugin.js` — 插件本体：读启动配置，实现 `drivers/browser/driver.json` 里的 verbs，套用两条数据面规则——模型可能不读的结果进 CAS 只留 preview（`portos_abi::bulk` 的 JS 双胞胎），截图永远是 artifact 不是字节。
 - `src/driver/playwright-driver.js` — 真正干活的：专用 profile、蒸馏元素表、按 ref 行动。
 - `src/distill.js` — 注入页面的元素蒸馏脚本。
 - `test/smoke.mjs` — 驱动的冒烟测试；端到端在 `cli/tests/run.rs`，其中一条把这个插件 hello 里报的工具和 Rust 接口对齐。
 
-工具的描述和 schema 只有一份：`drivers/browser/tools.json`，Rust 用 `include_str!`，JS 用 `readFile`。
+接口只有一份：`drivers/browser/driver.json`，Rust 用 `include_str!`，JS 用 `loadDriver`。SDK 按它的 schema 检查每次调用的参数和回复。
 
 ## 配置
 

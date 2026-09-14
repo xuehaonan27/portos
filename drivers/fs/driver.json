@@ -1,0 +1,108 @@
+{
+  "driver": "fs",
+  "verbs": {
+    "glob": {
+      "args": {
+        "properties": {
+          "max": {
+            "type": "integer"
+          },
+          "pattern": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "pattern"
+        ],
+        "type": "object"
+      },
+      "description": "Find files by glob pattern, e.g. `**/*.rs` or `src/**/mod.rs`. Matched against paths relative to the root."
+    },
+    "grep": {
+      "args": {
+        "properties": {
+          "glob": {
+            "description": "restrict to matching paths",
+            "type": "string"
+          },
+          "max": {
+            "type": "integer"
+          },
+          "pattern": {
+            "description": "regular expression",
+            "type": "string"
+          }
+        },
+        "required": [
+          "pattern"
+        ],
+        "type": "object"
+      },
+      "description": "Search file contents by regular expression, returning {path, line, text} for each match. Narrow it with a glob. Ignored files and binary files are skipped."
+    },
+    "list": {
+      "args": {
+        "properties": {
+          "depth": {
+            "type": "integer"
+          },
+          "path": {
+            "description": "defaults to the root",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "description": "List a directory. depth 1 is the directory itself; raise it to descend. Ignored files (.gitignore) are not listed."
+    },
+    "read": {
+      "args": {
+        "properties": {
+          "len": {
+            "description": "byte count",
+            "type": "integer"
+          },
+          "offset": {
+            "description": "byte offset",
+            "type": "integer"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "description": "Read a text file. Paths are relative to the driver's root. A large file comes back as {handle, size, preview} instead of {text}: pass the handle to artifact::read for the rest, or use offset/len here.",
+      "bulk": {
+        "type": "text/plain"
+      }
+    },
+    "write": {
+      "args": {
+        "properties": {
+          "artifact": {
+            "description": "a handle to write out",
+            "type": "string"
+          },
+          "content": {
+            "type": "string"
+          },
+          "create_dirs": {
+            "type": "boolean"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "description": "Write a file, replacing it if it exists. Give either `content` (text) or `artifact` (a stored handle, copied out without passing through the conversation). Set create_dirs to make missing parent directories."
+    }
+  }
+}

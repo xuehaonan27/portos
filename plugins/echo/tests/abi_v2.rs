@@ -3,6 +3,7 @@
 //! the event bus, ephemeral refs, and the JS protocol client.
 
 use portos_abi::cap::Constraints;
+use portos_abi::driver::Driver;
 use portos_kernel::Kernel;
 use portos_kernel::host::Host;
 use serde_json::{Value, json};
@@ -307,6 +308,71 @@ fn slow_local_subscriber_is_dropped_not_wedged() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A handler never sees arguments the driver did not describe: the SDK
+/// parses them into the handler's type first, and a call that does not fit
+/// is refused with the verb and the reason, before any plugin code runs.
+#[test]
+fn arguments_are_held_to_the_driver() {
+    let (_kernel, host, root) = setup("typed");
+    let a = spawn_echo(&host, "echoa");
+    let refused = call(&host, &a, "echoa::use_ref", json!({"ref": "e1"})).unwrap_err();
+    assert!(
+        refused.to_string().contains("echoa::use_ref: arguments:"),
+        "an object where the interface says [ref]: {refused}"
+    );
+    assert!(
+        call(&host, &a, "echoa::use_ref", json!(["e1"])).is_err(),
+        "the right shape reaches the handler, which has its own answer"
+    );
+    host.shutdown_all();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// An accepted verb owes its subscribers exactly one terminal event. The
+/// work pays it when it ends properly; when it returns without one, or
+/// panics, the SDK pays it with the failure event the driver declared — so
+/// a front end waiting for an ending is never waiting for nothing.
+#[test]
+fn accepted_work_always_ends() {
+    let (_kernel, host, root) = setup("accepted");
+    let a = spawn_echo(&host, "echoa");
+    let (_sub, rx) = host.subscribe_local(&tp("echo::turn::*"));
+    let next = || {
+        let ev = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a terminal event");
+        (ev.topic.as_str().to_string(), js(&ev.data))
+    };
+
+    for (turn, outcome, kind, reason) in [
+        ("t1", "done", "done", ""),
+        ("t2", "silent", "failed", "without a terminal event"),
+        ("t3", "panic", "failed", "panicked"),
+    ] {
+        let admitted = call(
+            &host,
+            &a,
+            "echoa::begin",
+            json!({"turn": turn, "outcome": outcome}),
+        )
+        .unwrap();
+        assert_eq!(admitted["accepted"], true, "the call returns at once");
+        let (topic, ev) = next();
+        assert_eq!(topic, format!("echo::turn::{turn}"), "on this call's topic");
+        assert_eq!(ev["kind"], kind, "{outcome}: {ev}");
+        assert!(
+            ev["error"].as_str().unwrap_or_default().contains(reason),
+            "{outcome}: the failure says why: {ev}"
+        );
+    }
+    // A call that cannot name its topic is refused before any work starts.
+    let refused = call(&host, &a, "echoa::begin", json!({"outcome": "done"})).unwrap_err();
+    assert!(refused.to_string().contains("`turn`"), "{refused}");
+
+    host.shutdown_all();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn wildcard_topics_and_grants_introspection() {
     let (kernel, host, root) = setup("grants");
@@ -328,7 +394,13 @@ fn wildcard_topics_and_grants_introspection() {
     assert_eq!(ev.topic.as_str(), "echoa::anything");
 
     // Grants introspection: A's live caps joined with B's advertised verb
-    // metadata — a ready-made tool definition, no config duplication.
+    // metadata — a ready-made tool definition, no config duplication. What
+    // B advertised is its driver document and nothing of its own, so the
+    // join hands out the document.
+    let document = Driver::parse(include_str!("../driver.json")).unwrap();
+    let args_of = |short: &str| -> Value {
+        serde_json::from_str(document.verbs[short].args.as_raw()).unwrap()
+    };
     let mut counts = BTreeMap::new();
     counts.insert("emit".to_string(), 5u64);
     kernel
@@ -350,20 +422,17 @@ fn wildcard_topics_and_grants_introspection() {
         .iter()
         .find(|g| g["verb"] == "echob::emit")
         .expect("granted verb introspected");
-    assert!(
-        emit["description"]
-            .as_str()
-            .unwrap()
-            .contains("Print a line"),
-        "driver-advertised description joined in"
+    assert_eq!(
+        emit["description"], document.verbs["emit"].description,
+        "the driver's wording joined in"
     );
-    assert!(emit["schema"]["properties"]["text"].is_object());
+    assert_eq!(emit["schema"], args_of("emit"), "and the driver's schema");
     assert_eq!(emit["counts_left"].as_u64(), Some(5));
     let digest = list
         .iter()
         .find(|g| g["verb"] == "echob::digest")
-        .expect("verb without advertised metadata still listed");
-    assert_eq!(digest["schema"], json!({"type": "object"}));
+        .expect("the other granted verb is listed too");
+    assert_eq!(digest["schema"], args_of("digest"));
     assert!(
         digest.get("counts_left").is_none(),
         "uncounted grant is unlimited"
@@ -395,6 +464,13 @@ fn js_plugin_speaks_abi_v2() {
     // call
     let out = call(&host, &name, "jse::ping", json!(["hi", 2])).unwrap();
     assert_eq!(out["pong"], json!(["hi", 2]));
+    // The JS SDK holds arguments to the driver's schema the way serde holds
+    // them to a Rust handler's type.
+    let refused = call(&host, &name, "jse::store", json!([7])).unwrap_err();
+    assert!(
+        refused.to_string().contains("jse::store: arguments:"),
+        "an integer where the interface says a string: {refused}"
+    );
 
     // plugin put → kernel-side readback
     let stored = call(&host, &name, "jse::store", json!(["chunked hello from js"])).unwrap();

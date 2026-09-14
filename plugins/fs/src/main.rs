@@ -22,13 +22,12 @@
 mod scope;
 
 use ignore::WalkBuilder;
-use portos_abi::Label;
 use portos_abi::wire::Payload;
 use portos_fs_api::{
     self as fs, Entry, GlobArgs, GrepArgs, Kind, ListArgs, Listing, Match, Matches, Paths,
     ReadArgs, WriteArgs, WriteReply,
 };
-use portos_sdk::bulk::Sink;
+use portos_sdk::bulk::Bulk;
 use portos_sdk::{CallError, CallResult, KernelClient, Plugin};
 use scope::Scope;
 use serde::Deserialize;
@@ -58,7 +57,6 @@ fn main() -> std::io::Result<()> {
     eprintln!("[fs] serving {}", root.display());
 
     let scope = Arc::new(Scope::new(root));
-    let sink = Sink::default();
     let (s1, s2, s3, s4, s5) = (
         scope.clone(),
         scope.clone(),
@@ -69,23 +67,22 @@ fn main() -> std::io::Result<()> {
 
     // What each verb says about itself comes from the interface, so this
     // plugin advertises `drivers/fs` rather than its own wording of it.
-    let tools = fs::tools();
     portos_sdk::serve(
         Plugin::new("portos-fs")
-            .implement(&fs::READ, &tools[&fs::READ], move |args, client| {
-                read(&s1, &sink, client, args.parse()?)
+            .implement(&fs::DRIVER, &fs::READ, move |a: fs::ReadArgs, _client| {
+                read(&s1, a)
             })
-            .implement(&fs::WRITE, &tools[&fs::WRITE], move |args, client| {
-                write(&s2, client, args.parse()?)
+            .implement(&fs::DRIVER, &fs::WRITE, move |a: fs::WriteArgs, client| {
+                write(&s2, client, a)
             })
-            .implement(&fs::LIST, &tools[&fs::LIST], move |args, _client| {
-                list(&s3, args.parse()?)
+            .implement(&fs::DRIVER, &fs::LIST, move |a: fs::ListArgs, _client| {
+                list(&s3, a)
             })
-            .implement(&fs::GLOB, &tools[&fs::GLOB], move |args, _client| {
-                glob(&s4, args.parse()?)
+            .implement(&fs::DRIVER, &fs::GLOB, move |a: fs::GlobArgs, _client| {
+                glob(&s4, a)
             })
-            .implement(&fs::GREP, &tools[&fs::GREP], move |args, _client| {
-                grep(&s5, args.parse()?)
+            .implement(&fs::DRIVER, &fs::GREP, move |a: fs::GrepArgs, _client| {
+                grep(&s5, a)
             }),
         |_topic, _data| {},
     )
@@ -93,7 +90,7 @@ fn main() -> std::io::Result<()> {
 
 // ------------------------------------------------------------------ read ----
 
-fn read(scope: &Scope, sink: &Sink, client: &KernelClient, a: ReadArgs) -> CallResult {
+fn read(scope: &Scope, a: ReadArgs) -> Result<Bulk, CallError> {
     let full = scope.resolve(&a.path).map_err(CallError::from)?;
     let bytes = std::fs::read(&full).map_err(|e| CallError::from(format!("{}: {e}", a.path)))?;
     let start = (a.offset as usize).min(bytes.len());
@@ -103,15 +100,11 @@ fn read(scope: &Scope, sink: &Sink, client: &KernelClient, a: ReadArgs) -> CallR
     };
     // Lossy on purpose: a driver that refuses to show a file because one byte
     // is not UTF-8 is less useful than one that shows it with a replacement
-    // character. The bytes themselves are intact in the CAS when it spills.
-    let text = String::from_utf8_lossy(&bytes[start..end]).into_owned();
-    let labels = Label::with_integ(&format!("file:{}", a.path));
-    Ok(Payload::of(&sink.deliver(
-        client,
-        &text,
-        "text/plain",
-        Some(labels),
-    )?)?)
+    // character. The bytes themselves are intact in the CAS when it spills —
+    // which the SDK decides, because `drivers/fs` says this reply is bulky.
+    Ok(Bulk::Inline {
+        text: String::from_utf8_lossy(&bytes[start..end]).into_owned(),
+    })
 }
 
 // ----------------------------------------------------------------- write ----

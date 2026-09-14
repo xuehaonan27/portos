@@ -20,10 +20,12 @@
 //! Skips, with a reason, where there is no writable cgroup v2.
 
 use portos_abi::boundary::CgroupRoot;
+use portos_abi::driver::Driver;
 use portos_abi::ids::PluginName;
 use portos_kernel::Kernel;
 use portos_kernel::host::{Form, Host, LaunchSpec};
-use portos_kernel_api::{MANIFEST_TYPE, Manifest};
+use portos_kernel_api::{DRIVER_TYPE, MANIFEST_TYPE, Manifest};
+use std::collections::BTreeMap;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -220,11 +222,31 @@ fn a_plugin_is_data_named_by_one_id() {
         )
         .unwrap();
 
-    // What `portos plugin` does: run it once, take its hello, store both.
+    // What `portos plugin` does: run it once, take its hello, hold it to
+    // the driver document, store the two together naming the document.
     let launch = LaunchSpec::from_artifact(executable.id.clone());
     let first = host.spawn_spec(&launch).unwrap();
     let hello = host.hello(&first).expect("what it declared is kept");
-    let manifest = Manifest::of(&launch, &hello);
+    let text = include_str!("../driver.json");
+    let document = kernel
+        .cas
+        .put_bytes(
+            text.as_bytes(),
+            DRIVER_TYPE,
+            portos_abi::Label::default(),
+            "test",
+        )
+        .unwrap();
+    let problems = Driver::parse(text)
+        .unwrap()
+        .conformance(&hello.verbs, &hello.tools.clone().unwrap_or_default());
+    assert!(
+        problems.is_empty(),
+        "it declares its document, word for word: {problems:?}"
+    );
+    let conforms = BTreeMap::from([("echo".to_string(), document.id.clone())]);
+    let manifest = Manifest::of(&launch, &hello, conforms);
+    assert_eq!(manifest.conforms["echo"], document.id);
     assert_eq!(manifest.artifact.as_deref(), Some(executable.id.as_str()));
     assert!(
         manifest

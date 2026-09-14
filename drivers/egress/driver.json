@@ -1,0 +1,80 @@
+{
+  "driver": "egress",
+  "verbs": {
+    "http": {
+      "description": "An HTTP request to the outside world, made by the broker: the host must be on its allowlist, and the credential it is configured with is injected there and exists in no other process. Returns the status, headers and body.",
+      "args": {
+        "type": "object",
+        "required": [
+          "url"
+        ],
+        "properties": {
+          "url": {
+            "type": "string"
+          },
+          "method": {
+            "type": "string",
+            "enum": [
+              "GET",
+              "POST",
+              "PUT",
+              "DELETE",
+              "PATCH",
+              "HEAD"
+            ],
+            "description": "defaults to GET"
+          },
+          "headers": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "body": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "http_stream": {
+      "description": "The same request with a streamed body: the reply carries the response head, and the body arrives on `topic` as events until the stream ends. Subscribe to the topic before invoking.",
+      "args": {
+        "type": "object",
+        "required": [
+          "url",
+          "topic"
+        ],
+        "properties": {
+          "url": {
+            "type": "string"
+          },
+          "method": {
+            "type": "string",
+            "enum": [
+              "GET",
+              "POST",
+              "PUT",
+              "DELETE",
+              "PATCH",
+              "HEAD"
+            ],
+            "description": "defaults to GET"
+          },
+          "headers": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "body": {
+            "type": "string"
+          },
+          "topic": {
+            "type": "string",
+            "description": "the topic the body is published on"
+          }
+        }
+      }
+    }
+  }
+}

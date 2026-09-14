@@ -217,12 +217,18 @@ fn main() -> std::io::Result<()> {
         // gateway. It reaches the outside world by asking a driver that asks
         // us, and `tool_drivers_exclude` keeps `egress` off its surface.
         Plugin::new("portos-broker")
-            .verb("egress::http", move |args, client| {
-                buffered(&agent_http, &cfg_http, client, args.parse()?)
-            })
-            .verb("egress::http_stream", move |args, client| {
-                streaming(&agent_stream, &cfg_stream, client, args.parse()?)
-            }),
+            .implement(
+                &portos_egress_api::DRIVER,
+                &portos_egress_api::HTTP,
+                move |req: EgressRequest, client| buffered(&agent_http, &cfg_http, client, req),
+            )
+            .implement(
+                &portos_egress_api::DRIVER,
+                &portos_egress_api::HTTP_STREAM,
+                move |req: EgressRequest, client| {
+                    streaming(&agent_stream, &cfg_stream, client, req)
+                },
+            ),
         |_topic, _data| {},
     )
 }

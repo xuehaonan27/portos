@@ -1,0 +1,42 @@
+{
+  "driver": "shell",
+  "verbs": {
+    "run": {
+      "args": {
+        "properties": {
+          "artifacts": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "handles to expose to the command as environment variables holding file paths, e.g. {\"LOG\": \"blake3:…\"} then `grep error \"$LOG\"`",
+            "type": "object"
+          },
+          "cmd": {
+            "description": "passed to sh -c",
+            "type": "string"
+          },
+          "cwd": {
+            "description": "relative to the driver's working directory",
+            "type": "string"
+          },
+          "timeout_ms": {
+            "description": "default 120000",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "cmd"
+        ],
+        "type": "object"
+      },
+      "description": "Run a shell command and return its exit status and output. The command is passed to `sh -c`, so pipes and redirection work — use them: `… 2>&1 | tail -40` keeps a long log out of the conversation. Output over ~16KB comes back as {handle, size, preview} — and you can feed such a handle straight back in through `artifacts` instead of reading it, which is almost always the cheaper move. The call blocks until the command ends or times out.",
+      "bulk": {
+        "type": "text/plain",
+        "fields": [
+          "stdout",
+          "stderr"
+        ]
+      }
+    }
+  }
+}

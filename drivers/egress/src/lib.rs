@@ -11,7 +11,9 @@
 //! names a URL and headers, and the implementation attaches whatever secret
 //! its rules say. There is no field here through which a key could travel.
 
+use portos_abi::driver::Driver;
 use portos_abi::ids::{Topic, Verb};
+use portos_abi::wire::ToolMeta;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
@@ -152,6 +154,17 @@ pub struct EgressLog {
     pub injected: Vec<String>,
 }
 
+/// The interface itself; the crate's constants and types are a typed view.
+pub const DRIVER_JSON: &str = include_str!("../driver.json");
+pub static DRIVER: LazyLock<Driver> = LazyLock::new(|| {
+    Driver::parse(DRIVER_JSON).expect("drivers/egress/driver.json is well-formed")
+});
+
+/// What each verb says about itself, as an implementation advertises it.
+pub fn tools() -> BTreeMap<Verb, ToolMeta> {
+    DRIVER.tools()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,5 +207,22 @@ mod tests {
             Method::Post
         );
         assert!(serde_json::from_str::<Method>(r#""TRACE""#).is_err());
+    }
+}
+
+#[cfg(test)]
+mod driver_document {
+    use super::*;
+
+    /// The document is this interface: exactly the verbs named here, all of
+    /// this driver, described.
+    #[test]
+    fn names_exactly_these_verbs() {
+        let named: Vec<&Verb> = vec![&HTTP, &HTTP_STREAM];
+        assert_eq!(DRIVER.driver, "egress");
+        assert_eq!(tools().len(), named.len());
+        for v in named {
+            assert!(DRIVER.spec(v).is_some(), "{v} is in driver.json");
+        }
     }
 }

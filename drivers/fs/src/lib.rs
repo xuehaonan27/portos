@@ -7,8 +7,9 @@
 //! when they were cut. `plugins/fs` is the first implementation.
 
 use portos_abi::bulk::Bulk;
+use portos_abi::driver::Driver;
 use portos_abi::ids::Verb;
-use portos_abi::wire::{Payload, ToolMeta};
+use portos_abi::wire::ToolMeta;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
@@ -129,88 +130,29 @@ pub struct Matches {
 /// What each verb says about itself: the tool the model is shown. Stated
 /// here so an implementation advertises the interface rather than its own
 /// wording of it.
+/// The interface itself; the crate's constants and types are a typed view.
+pub const DRIVER_JSON: &str = include_str!("../driver.json");
+pub static DRIVER: LazyLock<Driver> =
+    LazyLock::new(|| Driver::parse(DRIVER_JSON).expect("drivers/fs/driver.json is well-formed"));
+
+/// What each verb says about itself, as an implementation advertises it.
 pub fn tools() -> BTreeMap<Verb, ToolMeta> {
-    let tool = |verb: &Verb, description: &str, schema: serde_json::Value| {
-        (
-            verb.clone(),
-            ToolMeta {
-                description: description.to_string(),
-                schema: Payload::of(&schema).ok(),
-            },
-        )
-    };
-    BTreeMap::from([
-        tool(
-            &READ,
-            "Read a text file. Paths are relative to the driver's root. A large \
-             file comes back as {handle, size, preview} instead of {text}: pass \
-             the handle to artifact::read for the rest, or use offset/len here.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "offset": {"type": "integer", "description": "byte offset"},
-                    "len": {"type": "integer", "description": "byte count"},
-                },
-                "required": ["path"],
-            }),
-        ),
-        tool(
-            &WRITE,
-            "Write a file, replacing it if it exists. Give either `content` \
-             (text) or `artifact` (a stored handle, copied out without passing \
-             through the conversation). Set create_dirs to make missing parent \
-             directories.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "content": {"type": "string"},
-                    "artifact": {"type": "string", "description": "a handle to write out"},
-                    "create_dirs": {"type": "boolean"},
-                },
-                "required": ["path"],
-            }),
-        ),
-        tool(
-            &LIST,
-            "List a directory. depth 1 is the directory itself; raise it to \
-             descend. Ignored files (.gitignore) are not listed.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "defaults to the root"},
-                    "depth": {"type": "integer"},
-                },
-            }),
-        ),
-        tool(
-            &GLOB,
-            "Find files by glob pattern, e.g. `**/*.rs` or `src/**/mod.rs`. \
-             Matched against paths relative to the root.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string"},
-                    "max": {"type": "integer"},
-                },
-                "required": ["pattern"],
-            }),
-        ),
-        tool(
-            &GREP,
-            "Search file contents by regular expression, returning {path, line, \
-             text} for each match. Narrow it with a glob. Ignored files and \
-             binary files are skipped.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string", "description": "regular expression"},
-                    "glob": {"type": "string", "description": "restrict to matching paths"},
-                    "max": {"type": "integer"},
-                },
-                "required": ["pattern"],
-            }),
-        ),
-    ])
+    DRIVER.tools()
+}
+
+#[cfg(test)]
+mod driver_document {
+    use super::*;
+
+    /// The document is this interface: exactly the verbs named here, all of
+    /// this driver, described.
+    #[test]
+    fn names_exactly_these_verbs() {
+        let named: Vec<&Verb> = vec![&READ, &WRITE, &LIST, &GLOB, &GREP];
+        assert_eq!(DRIVER.driver, "fs");
+        assert_eq!(tools().len(), named.len());
+        for v in named {
+            assert!(DRIVER.spec(v).is_some(), "{v} is in driver.json");
+        }
+    }
 }

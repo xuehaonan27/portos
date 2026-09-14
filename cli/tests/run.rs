@@ -286,9 +286,19 @@ fn browser_plugin_implements_the_interface() {
         .unwrap_or_else(|| panic!("an oversized table becomes a handle: {out}"));
     assert!(!out["preview"].as_str().unwrap().is_empty());
     let meta = kernel.cas.meta(&handle.to_string()).unwrap();
-    assert_eq!(meta.r#type, "web/page-snapshot");
+    assert_eq!(
+        meta.r#type, "web/page-snapshot",
+        "the type the driver declared"
+    );
+    // Stored by the SDK, not the plugin, so the provenance is the SDK's
+    // convention: the verb and the arguments it was given.
     assert!(
-        meta.labels.integ.contains(&format!("web:{origin}")),
+        meta.labels.integ.contains("browser::open")
+            && meta
+                .labels
+                .integ
+                .iter()
+                .any(|l| l.starts_with("args:") && l.contains(&origin)),
         "a page-derived artifact says where it came from: {:?}",
         meta.labels
     );
@@ -520,9 +530,66 @@ fn portos_run_with_a_plugin_named_by_one_id() {
     let executable = put["id"].as_str().unwrap().to_string();
     let spec = root.join("model-echo.json");
     write_json(&spec, &json!({"artifact": executable}));
+    let plugin_fails = |why: &str| -> String {
+        let out = std::process::Command::new(cli)
+            .args(["plugin", root.to_str().unwrap(), spec.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "no manifest {why}");
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+
+    // A declaration is held to a document, so without one there is no
+    // manifest — and the message says what to run.
+    let err = plugin_fails("without a driver document");
+    assert!(err.contains("portos driver"), "{err}");
+
+    // A document that says something else: the plugin does not conform,
+    // the departure is named, and there is no manifest.
+    let model_doc = repo_root().join("drivers/model/driver.json");
+    let mut wrong: Value =
+        serde_json::from_str(&std::fs::read_to_string(&model_doc).unwrap()).unwrap();
+    wrong["verbs"]["send"]["description"] = json!("Something else entirely.");
+    write_json(&root.join("wrong.json"), &wrong);
+    cli_json(&[
+        "driver",
+        root.to_str().unwrap(),
+        root.join("wrong.json").to_str().unwrap(),
+    ]);
+    let err = plugin_fails("against a document it departs from");
+    assert!(
+        err.contains("does not conform to driver model")
+            && err.contains("model::send: description"),
+        "{err}"
+    );
+
+    // The document itself: registered under its name, the manifest names it.
+    let registered = cli_json(&[
+        "driver",
+        root.to_str().unwrap(),
+        model_doc.to_str().unwrap(),
+    ]);
+    assert_eq!(registered["type"], "portos/driver");
     let stored = cli_json(&["plugin", root.to_str().unwrap(), spec.to_str().unwrap()]);
     assert_eq!(stored["type"], "portos/plugin");
     let manifest = stored["id"].as_str().unwrap().to_string();
+    let out = root.join("manifest.json");
+    let got = std::process::Command::new(cli)
+        .args([
+            "get",
+            root.to_str().unwrap(),
+            &manifest,
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(got.status.success());
+    let manifest_doc: Value =
+        serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+    assert_eq!(
+        manifest_doc["conforms"]["model"], registered["id"],
+        "the manifest names the document it was held to, by content"
+    );
 
     write_json(
         &root.join("portos.json"),

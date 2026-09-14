@@ -10,8 +10,9 @@
 //! implementation.
 
 use portos_abi::bulk::Bulk;
+use portos_abi::driver::Driver;
 use portos_abi::ids::Verb;
-use portos_abi::wire::{Payload, ToolMeta};
+use portos_abi::wire::ToolMeta;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
@@ -61,35 +62,29 @@ pub struct RunReply {
 }
 
 /// What the verb says about itself: the tool the model is shown.
+/// The interface itself; the crate's constants and types are a typed view.
+pub const DRIVER_JSON: &str = include_str!("../driver.json");
+pub static DRIVER: LazyLock<Driver> =
+    LazyLock::new(|| Driver::parse(DRIVER_JSON).expect("drivers/shell/driver.json is well-formed"));
+
+/// What each verb says about itself, as an implementation advertises it.
 pub fn tools() -> BTreeMap<Verb, ToolMeta> {
-    BTreeMap::from([(
-        RUN.clone(),
-        ToolMeta {
-            description: "Run a shell command and return its exit status and output. The \
-             command is passed to `sh -c`, so pipes and redirection work — use \
-             them: `… 2>&1 | tail -40` keeps a long log out of the conversation. \
-             Output over ~16KB comes back as {handle, size, preview} — and you can \
-             feed such a handle straight back in through `artifacts` instead of \
-             reading it, which is almost always the cheaper move. The call blocks \
-             until the command ends or times out."
-                .to_string(),
-            schema: Payload::of(&serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "cmd": {"type": "string", "description": "passed to sh -c"},
-                    "artifacts": {
-                        "type": "object",
-                        "description": "handles to expose to the command as environment \
-                                        variables holding file paths, e.g. {\"LOG\": \"blake3:…\"} \
-                                        then `grep error \"$LOG\"`",
-                        "additionalProperties": {"type": "string"},
-                    },
-                    "cwd": {"type": "string", "description": "relative to the driver's working directory"},
-                    "timeout_ms": {"type": "integer", "description": "default 120000"},
-                },
-                "required": ["cmd"],
-            }))
-            .ok(),
-        },
-    )])
+    DRIVER.tools()
+}
+
+#[cfg(test)]
+mod driver_document {
+    use super::*;
+
+    /// The document is this interface: exactly the verbs named here, all of
+    /// this driver, described.
+    #[test]
+    fn names_exactly_these_verbs() {
+        let named: Vec<&Verb> = vec![&RUN];
+        assert_eq!(DRIVER.driver, "shell");
+        assert_eq!(tools().len(), named.len());
+        for v in named {
+            assert!(DRIVER.spec(v).is_some(), "{v} is in driver.json");
+        }
+    }
 }

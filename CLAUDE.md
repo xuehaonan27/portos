@@ -125,22 +125,30 @@ criterion; build order is `.dev/plans/workstation-v1.md`, rationale is
   events; domain vocabulary in `kernel/` is a violation.
 - A plugin is found by what it answers, never by name; with several
   answerers the caller names an instance or gets an error, never a default.
-- A driver interface lives in `drivers/`, never runs, and states verbs,
-  types and `tools()`; a new kind of plugin adds a driver, not a kernel
-  mechanism.
+- A driver is a document, `drivers/<x>/driver.json`: its verbs, their
+  wording and argument schemas, and reply schemas where an implementation
+  is untyped; the Rust crate is a typed view of it, held to it by a test.
+  A new kind of plugin adds a driver, not a kernel mechanism.
+- The only way to answer a verb is `implement(&DRIVER, &VERB, handler)`
+  (`driver` + `implement` in JS): the wording comes from the document, the
+  arguments and reply are typed in Rust and schema-checked in JS, and a
+  plugin cannot describe itself.
 - A driver has no version: a compatible change adds verbs, an incompatible
   one is a new driver under a new name.
 - A plugin is data: `portos plugin` captures a launch's hello into a
   manifest in the CAS, and a spec names the plugin by that one id; a
-  manifest is generated from a run, never written by hand.
+  manifest is generated from a run, never written by hand, and only for a
+  plugin whose declaration is its driver's document (`portos driver`
+  registers one in a root), which the manifest then names (`conforms`).
 - What ran is recorded by content (`ran`) whatever the spec named it by;
   `bin` is the development path and costs the record nothing.
 - Nothing is reserved and nothing is intercepted before routing; `kernel::*`
   are ordinary rows in the one route table.
 - Grants in `portos.json` are the tool surface and the whole approval
   story; a grant is on the driver, which instance is routing.
-- A result that may be large answers `Bulk` via `Sink`; the model sees
-  handles, never paths.
+- A verb whose result may be large says so in its driver (`bulk`); the
+  SDK stores what is over the line and the handler never sees the line.
+  The model sees handles, never paths.
 - `Payload` is opaque; `serde_json::Value` is for a provider's wire format,
   the audit log and operator config only.
 - Plumbing (`config`, `scope`, `bulk`) lives in the SDK, not in plugins.
@@ -148,8 +156,10 @@ criterion; build order is `.dev/plans/workstation-v1.md`, rationale is
   nothing declares an order.
 - Subscriptions are declared in `hello` and live before the spawn returns;
   there is no runtime subscribe.
-- A long operation is accepted, not awaited, and owes exactly one terminal
-  event.
+- A long operation is accepted, not awaited: declared `accepted` in its
+  driver, implemented with `implement_accepted`, reporting through the
+  `Accepted` it is given; the SDK pays the one terminal event it owes when
+  the work does not.
 - Teardown escalates to SIGKILL and the cgroup; never rely on `Child::kill`.
 - The launcher (`portos run`) is the only non-plugin and knows no driver.
 - The API key exists in no process but the broker.
@@ -165,7 +175,7 @@ cargo test --workspace    # rebuilt by `cargo test`, and tests find plugin
 cargo fmt --all           # binaries beside their own
 ```
 
-102 tests; all pass, zero warnings. Grep the output for `skipping:` before
+117 tests; all pass, zero warnings. Grep the output for `skipping:` before
 believing a green run: `cli/tests/run.rs` skips without `node` and
 `npm install` in `plugins/browser`, `plugins/echo/tests/form.rs` without
 writable cgroup v2. Run the narrowest relevant test first, then the whole
@@ -187,9 +197,10 @@ asserts: `.dev/gen/tests.md`.
 - `kernel/` (`portos-kernel`): `caps`, `cas`, `host`, `routes`, `audit`.
 - `sdk/rust/` (`portos-sdk`): `Plugin`, `KernelClient`, `config`, `scope`,
   `bulk`. `sdk/js/client.js` is its JS twin.
-- `cli/` (`portos-cli`): `init|put|bundle|plugin|meta|get|audit-verify|sessions|run`.
-- `drivers/`: interfaces only. `kernel`, `egress`, `model`, `fs`, `shell`,
-  `browser` (with `tools.json`), `link`, `router`.
+- `cli/` (`portos-cli`):
+  `init|put|bundle|driver|plugin|meta|get|audit-verify|sessions|run`.
+- `drivers/`: interfaces only, each a `driver.json` with a Rust view.
+  `kernel`, `egress`, `model`, `fs`, `shell`, `browser`, `link`, `router`.
 - `plugins/`: `broker`, `echo` (the kernel's end-to-end tests live in its
   `tests/`), `model`, `model-echo`, `tty`, `browser` (JS), `fs`, `shell`,
   `remote`, `bridge-http`, `render-tty`.

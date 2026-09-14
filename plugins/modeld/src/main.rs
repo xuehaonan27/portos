@@ -34,7 +34,7 @@ use portos_abi::wire::Payload;
 use portos_egress_api::{self as egress, EgressRequest, StreamEvent};
 use portos_model_api as model;
 use portos_router::Router as _;
-use portos_sdk::{CallError, KernelClient, Plugin};
+use portos_sdk::{Accepted, CallError, Job, KernelClient, Plugin};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -237,9 +237,9 @@ fn main() -> std::io::Result<()> {
             // Opening a conversation and continuing one are the same act:
             // `resume` decides which. A resumed session already in memory is
             // handed back as it is, so reconnecting a front end costs no read.
-            .verb("model::sessions", {
+            .implement(&model::DRIVER, &model::SESSIONS, {
                 let store = store.clone();
-                move |_args, _client| {
+                move |_: model::SessionsArgs, _client| {
                     let index = store
                         .as_ref()
                         .as_ref()
@@ -255,97 +255,110 @@ fn main() -> std::io::Result<()> {
                             })
                         })
                         .collect();
-                    Ok(Payload::of(&model::SessionsReply { sessions })?)
+                    Ok(model::SessionsReply { sessions })
                 }
             })
-            .verb("model::start", move |args, client| {
-                let a: model::StartArgs = args.parse()?;
-                let id = match a.resume {
-                    Some(id) => {
-                        session_of(&s_start, &st_start, client, &id)?;
-                        id
-                    }
-                    None => {
-                        next_session += 1;
-                        let id = model::SessionId::new(next_session);
-                        let session = Session {
-                            system: a.system.unwrap_or_else(|| ds.clone()),
-                            messages: Vec::new(),
-                        };
-                        if let Some(store) = st_start.as_ref() {
-                            // Recorded before a word is said, so an abandoned
-                            // session is still listable rather than invisible.
-                            store.save(client, id.as_str(), &session)?;
+            .implement(
+                &model::DRIVER,
+                &model::START,
+                move |a: model::StartArgs, client| {
+                    let id = match a.resume {
+                        Some(id) => {
+                            session_of(&s_start, &st_start, client, &id)?;
+                            id
                         }
-                        s_start
-                            .lock()
-                            .unwrap()
-                            .insert(id.as_str().to_string(), Arc::new(Mutex::new(session)));
-                        id
-                    }
-                };
-                Ok(Payload::of(&model::StartReply { session: id })?)
-            })
+                        None => {
+                            next_session += 1;
+                            let id = model::SessionId::new(next_session);
+                            let session = Session {
+                                system: a.system.unwrap_or_else(|| ds.clone()),
+                                messages: Vec::new(),
+                            };
+                            if let Some(store) = st_start.as_ref() {
+                                // Recorded before a word is said, so an abandoned
+                                // session is still listable rather than invisible.
+                                store.save(client, id.as_str(), &session)?;
+                            }
+                            s_start
+                                .lock()
+                                .unwrap()
+                                .insert(id.as_str().to_string(), Arc::new(Mutex::new(session)));
+                            id
+                        }
+                    };
+                    Ok(model::StartReply { session: id })
+                },
+            )
             // Accept the turn and return. Everything it produces arrives on
             // the session topic, so the caller is free to cancel it, serve
             // another front end, or simply not be blocked.
-            .verb("model::send", move |args, client| {
-                let a: model::SendArgs = args.parse()?;
-                let sid = a.session;
-                let session = session_of(&s_send, &st_send, client, &sid)?;
+            .implement_accepted(
+                &model::DRIVER,
+                &model::SEND,
+                move |a: model::SendArgs, client| {
+                    let sid = a.session;
+                    let session = session_of(&s_send, &st_send, client, &sid)?;
 
-                let flag = Arc::new(AtomicBool::new(false));
-                {
-                    // One turn at a time, because the egress stream lands on a
-                    // single topic. Per-turn topics are what lifts this, and
-                    // nothing needs them yet.
-                    let mut r = r_send.lock().unwrap();
-                    if let Some(busy) = r.keys().next() {
-                        return Err(CallError::from(format!(
-                            "a turn is already running on session {busy}"
-                        )));
+                    let flag = Arc::new(AtomicBool::new(false));
+                    {
+                        // One turn at a time, because the egress stream lands on a
+                        // single topic. Per-turn topics are what lifts this, and
+                        // nothing needs them yet.
+                        let mut r = r_send.lock().unwrap();
+                        if let Some(busy) = r.keys().next() {
+                            return Err(CallError::from(format!(
+                                "a turn is already running on session {busy}"
+                            )));
+                        }
+                        r.insert(sid.as_str().to_string(), flag.clone());
                     }
-                    r.insert(sid.as_str().to_string(), flag.clone());
-                }
-                let turn = Turn {
-                    backend: backend.clone(),
-                    client: client.clone(),
-                    slot: slot.clone(),
-                    running: r_send.clone(),
-                    store: st_send.clone(),
-                    config_tools: config_tools.clone(),
-                    exclude: exclude.clone(),
-                    introspect,
-                    read_max,
-                    max_turns,
-                };
-                std::thread::spawn(move || turn.run(sid, session, a.text, flag));
-                Ok(Payload::of(&model::SendReply::default())?)
-            })
-            .verb("model::cancel", move |args, _client| {
-                let a: model::CancelArgs = args.parse()?;
-                let cancelled = match r_cancel.lock().unwrap().get(a.session.as_str()) {
-                    Some(flag) => {
-                        flag.store(true, Ordering::Relaxed);
-                        true
-                    }
-                    None => false,
-                };
-                Ok(Payload::of(&model::CancelReply { cancelled })?)
-            })
+                    let turn = Turn {
+                        backend: backend.clone(),
+                        client: client.clone(),
+                        slot: slot.clone(),
+                        running: r_send.clone(),
+                        store: st_send.clone(),
+                        config_tools: config_tools.clone(),
+                        exclude: exclude.clone(),
+                        introspect,
+                        read_max,
+                        max_turns,
+                    };
+                    let job: Job =
+                        Box::new(move |accepted| turn.run(sid, session, a.text, flag, accepted));
+                    Ok((model::SendReply::default(), job))
+                },
+            )
+            .implement(
+                &model::DRIVER,
+                &model::CANCEL,
+                move |a: model::CancelArgs, _client| {
+                    let cancelled = match r_cancel.lock().unwrap().get(a.session.as_str()) {
+                        Some(flag) => {
+                            flag.store(true, Ordering::Relaxed);
+                            true
+                        }
+                        None => false,
+                    };
+                    Ok(model::CancelReply { cancelled })
+                },
+            )
             // Ending a session closes it, it does not delete it: the
             // transcript stays on disk and `start {resume}` brings it back.
             // Closing a conversation and throwing it away are different
             // intentions and should not share a verb.
-            .verb("model::end", move |args, _client| {
-                let a: model::EndArgs = args.parse()?;
-                if let Some(flag) = r_end.lock().unwrap().get(a.session.as_str()) {
-                    flag.store(true, Ordering::Relaxed);
-                }
-                Ok(Payload::of(&model::EndReply {
-                    ended: s_end.lock().unwrap().remove(a.session.as_str()).is_some(),
-                })?)
-            }),
+            .implement(
+                &model::DRIVER,
+                &model::END,
+                move |a: model::EndArgs, _client| {
+                    if let Some(flag) = r_end.lock().unwrap().get(a.session.as_str()) {
+                        flag.store(true, Ordering::Relaxed);
+                    }
+                    Ok(model::EndReply {
+                        ended: s_end.lock().unwrap().remove(a.session.as_str()).is_some(),
+                    })
+                },
+            ),
         move |topic, data| {
             if topic == &*STREAM_TOPIC {
                 if let Ok(ev) = data.parse::<StreamEvent>() {
@@ -413,8 +426,8 @@ impl Turn {
         session: Arc<Mutex<Session>>,
         text: String,
         flag: Arc<AtomicBool>,
+        accepted: Accepted,
     ) {
-        let topic = sid.topic();
         let client = &self.client;
         let emit = |ev: model::SessionEvent| {
             // Free the session *before* the terminal event goes out, not
@@ -425,9 +438,7 @@ impl Turn {
             if ev.is_terminal() {
                 self.running.lock().unwrap().remove(sid.as_str());
             }
-            if let Ok(p) = Payload::of(&ev) {
-                let _ = client.emit(&topic, p);
-            }
+            let _ = accepted.emit(&ev);
         };
         // One table, shared by the two closures below: the list the model is
         // shown and the decision about where each call goes are the same

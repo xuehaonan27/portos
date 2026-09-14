@@ -1,0 +1,92 @@
+{
+  "driver": "model",
+  "verbs": {
+    "start": {
+      "description": "Open a conversation, or continue a stored one when `resume` names it. Returns the session id; everything the session produces arrives on the topic model::session::<id>.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "system": {
+            "type": "string",
+            "description": "overrides the driver's configured system prompt for this session"
+          },
+          "resume": {
+            "type": "string",
+            "description": "continue the stored conversation with this id instead of opening a new one"
+          }
+        }
+      }
+    },
+    "send": {
+      "description": "Send a message on a session. Returns as soon as the turn is accepted, not when it finishes: text, tool activity and the turn's ending arrive on the session topic, and exactly one terminal event (done, cancelled or failed) ends the turn.",
+      "args": {
+        "type": "object",
+        "required": [
+          "session",
+          "text"
+        ],
+        "properties": {
+          "session": {
+            "type": "string",
+            "description": "a session id, e.g. s1"
+          },
+          "text": {
+            "type": "string"
+          }
+        }
+      },
+      "accepted": {
+        "topic": "model::session::{session}",
+        "terminal": {
+          "field": "kind",
+          "values": [
+            "done",
+            "cancelled",
+            "failed"
+          ]
+        },
+        "failed": {
+          "kind": "failed",
+          "error": "{error}"
+        }
+      }
+    },
+    "cancel": {
+      "description": "Stop the turn running on a session. The session survives, rewound to before the abandoned message.",
+      "args": {
+        "type": "object",
+        "required": [
+          "session"
+        ],
+        "properties": {
+          "session": {
+            "type": "string",
+            "description": "a session id, e.g. s1"
+          }
+        }
+      }
+    },
+    "end": {
+      "description": "Close a session. Its transcript stays stored; `start` with `resume` brings it back.",
+      "args": {
+        "type": "object",
+        "required": [
+          "session"
+        ],
+        "properties": {
+          "session": {
+            "type": "string",
+            "description": "a session id, e.g. s1"
+          }
+        }
+      }
+    },
+    "sessions": {
+      "description": "List stored conversations, newest first: ids and small facts, never a transcript.",
+      "args": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  }
+}

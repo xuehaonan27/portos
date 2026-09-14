@@ -9,6 +9,7 @@
 //! same types, so the file and the verb cannot disagree about what starting
 //! a plugin means.
 
+use portos_abi::driver::Driver;
 use portos_abi::ids::{PluginName, Topic, Verb};
 use portos_abi::wire::{Hello, Payload, ToolMeta};
 use serde::{Deserialize, Serialize};
@@ -195,6 +196,13 @@ pub struct StopReply {
 /// The CAS content type of a plugin manifest.
 pub const MANIFEST_TYPE: &str = "portos/plugin";
 
+/// The CAS content type of a driver document, and the ref a root keeps for
+/// the one currently registered under a driver's name.
+pub const DRIVER_TYPE: &str = "portos/driver";
+pub fn driver_ref(driver: &str) -> String {
+    format!("driver:{driver}")
+}
+
 /// A plugin as data: what runs, and what it declared when it ran.
 ///
 /// Generated, never written by hand: `portos plugin` starts a launch spec
@@ -229,11 +237,17 @@ pub struct Manifest {
     pub needs: Vec<Verb>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subscribes: Vec<Topic>,
+    /// The driver documents this declaration was held to when the manifest
+    /// was made, by driver name and by the document's content id. Content
+    /// addressing is what makes this a claim anyone can check later.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub conforms: BTreeMap<String, String>,
 }
 
 impl Manifest {
-    /// What a launch declared, joined with how it was launched.
-    pub fn of(spec: &LaunchSpec, hello: &Hello) -> Manifest {
+    /// What a launch declared, joined with how it was launched and what the
+    /// declaration was held to.
+    pub fn of(spec: &LaunchSpec, hello: &Hello, conforms: BTreeMap<String, String>) -> Manifest {
         Manifest {
             abi: hello.abi.clone(),
             name: hello.name.clone(),
@@ -245,6 +259,7 @@ impl Manifest {
             tools: hello.tools.clone().unwrap_or_default(),
             needs: hello.needs.clone(),
             subscribes: hello.subscribes.clone(),
+            conforms,
         }
     }
 
@@ -317,71 +332,30 @@ pub struct PluginInfo {
 /// A driver describes its verbs in its hello; the kernel has no hello, so
 /// the description is here — and a second implementation says the same
 /// thing by construction.
+/// The interface itself; the crate's constants and types are a typed view.
+pub const DRIVER_JSON: &str = include_str!("../driver.json");
+pub static DRIVER: LazyLock<Driver> = LazyLock::new(|| {
+    Driver::parse(DRIVER_JSON).expect("drivers/kernel/driver.json is well-formed")
+});
+
+/// What each verb says about itself, as an implementation advertises it.
 pub fn tools() -> BTreeMap<Verb, ToolMeta> {
-    let tool = |verb: &Verb, description: &str, schema: serde_json::Value| {
-        (
-            verb.clone(),
-            ToolMeta {
-                description: description.to_string(),
-                schema: Payload::of(&schema).ok(),
-            },
-        )
-    };
-    BTreeMap::from([
-        tool(
-            &SPAWN,
-            "Start a new plugin and grant it what it needs. Name it with \
-             either `artifact` (an executable in the CAS) or `bin` (a path \
-             on this host) — exactly one. The plugin's verbs \
-             become available to anyone granted them — including, if the grants \
-             say so, you — from your next turn onward. Use this to add a \
-             capability the system does not currently have.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "artifact": {"type": "string", "description":
-                        "id of an executable stored in the CAS — the portable \
-                         way to name a plugin"},
-                    "bin": {"type": "string", "description":
-                        "path to an executable on this host; use it for things \
-                         already installed, such as `node`"},
-                    "args": {"type": "array", "items": {"type": "string"}},
-                    "env": {"type": "object"},
-                    "grants": {
-                        "type": "array",
-                        "description": "capabilities to mint once it is up; \
-                                        `subject` defaults to the new plugin",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "subject": {"type": "string"},
-                                "resource": {"type": "string"},
-                                "verbs": {"type": "array", "items": {"type": "string"}},
-                            },
-                            "required": ["resource", "verbs"],
-                        },
-                    },
-                },
-                // Exactly one of `artifact` and `bin`, which a JSON
-                // schema cannot say and the kernel checks instead.
-                "required": [],
-            }),
-        ),
-        tool(
-            &STOP,
-            "Stop a running plugin. Its verbs stop being routed and everything \
-             it was granted is revoked; anything it started is collected too.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {"name": {"type": "string"}},
-                "required": ["name"],
-            }),
-        ),
-        tool(
-            &PLUGINS,
-            "List the plugins currently running: what each was started from, \
-             the verbs each answers, and what each is still waiting for.",
-            serde_json::json!({"type": "object", "properties": {}}),
-        ),
-    ])
+    DRIVER.tools()
+}
+
+#[cfg(test)]
+mod driver_document {
+    use super::*;
+
+    /// The document is this interface: exactly the verbs named here, all of
+    /// this driver, described.
+    #[test]
+    fn names_exactly_these_verbs() {
+        let named: Vec<&Verb> = vec![&SPAWN, &STOP, &PLUGINS];
+        assert_eq!(DRIVER.driver, "kernel");
+        assert_eq!(tools().len(), named.len());
+        for v in named {
+            assert!(DRIVER.spec(v).is_some(), "{v} is in driver.json");
+        }
+    }
 }

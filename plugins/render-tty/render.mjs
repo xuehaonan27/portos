@@ -20,11 +20,7 @@ const RESET = "\x1b[0m";
 
 await servePlugin({
   name: "portos-render-tty",
-  verbs: [],
   subscribes: ["model::session::*"],
-  onCall: async () => {
-    throw new Error("render-tty serves no verbs");
-  },
   onEvent: (_topic, data) => {
     switch (data?.kind) {
       case "delta":

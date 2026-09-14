@@ -1,0 +1,152 @@
+{
+  "driver": "echo",
+  "verbs": {
+    "emit": {
+      "description": "Print a line to the echo driver's stdout.",
+      "args": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "minItems": 1,
+        "maxItems": 1
+      }
+    },
+    "digest": {
+      "description": "Stream an artifact in and answer with its size and the first bytes.",
+      "args": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "minItems": 1,
+        "maxItems": 1
+      }
+    },
+    "put_pattern": {
+      "description": "Stream n pattern bytes into the CAS.",
+      "args": {
+        "type": "array",
+        "items": {
+          "type": "integer"
+        },
+        "minItems": 1,
+        "maxItems": 1
+      }
+    },
+    "relay": {
+      "description": "Invoke another verb through the kernel: [verb, args].",
+      "args": {
+        "type": "array",
+        "minItems": 2,
+        "maxItems": 2,
+        "prefixItems": [
+          {
+            "type": "string"
+          },
+          {}
+        ]
+      }
+    },
+    "relay_at": {
+      "description": "Invoke another verb at a named instance: [instance, verb, args].",
+      "args": {
+        "type": "array",
+        "minItems": 3,
+        "maxItems": 3,
+        "prefixItems": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "string"
+          },
+          {}
+        ]
+      }
+    },
+    "publish": {
+      "description": "Emit an event: [topic, data].",
+      "args": {
+        "type": "array",
+        "minItems": 2,
+        "maxItems": 2,
+        "prefixItems": [
+          {
+            "type": "string"
+          },
+          {}
+        ]
+      }
+    },
+    "events": {
+      "description": "The events this plugin has received.",
+      "args": {
+        "type": "array",
+        "maxItems": 0
+      }
+    },
+    "grants": {
+      "description": "What this plugin may invoke.",
+      "args": {
+        "type": "array",
+        "maxItems": 0
+      }
+    },
+    "make_ref": {
+      "description": "Mint an ephemeral ref, local to this plugin.",
+      "args": {
+        "type": "array",
+        "maxItems": 0
+      }
+    },
+    "use_ref": {
+      "description": "Use an ephemeral ref: [ref].",
+      "args": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "minItems": 1,
+        "maxItems": 1
+      }
+    },
+    "begin": {
+      "description": "Start work that reports on echo::turn::<turn>. The outcome ends it with done, ends it silently, or panics.",
+      "args": {
+        "type": "object",
+        "required": [
+          "turn",
+          "outcome"
+        ],
+        "properties": {
+          "turn": {
+            "type": "string"
+          },
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "done",
+              "silent",
+              "panic"
+            ]
+          }
+        }
+      },
+      "accepted": {
+        "topic": "echo::turn::{turn}",
+        "terminal": {
+          "field": "kind",
+          "values": [
+            "done",
+            "failed"
+          ]
+        },
+        "failed": {
+          "kind": "failed",
+          "error": "{error}"
+        }
+      }
+    }
+  }
+}

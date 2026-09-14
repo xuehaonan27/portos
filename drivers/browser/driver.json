@@ -1,0 +1,750 @@
+{
+  "driver": "browser",
+  "verbs": {
+    "open": {
+      "description": "Open the browser (it has a profile of its own) and, if `url` is given, go there. Returns the page's element table: every interactive element, each with a short-lived `ref` to act on.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string"
+          }
+        }
+      },
+      "reply": {
+        "anyOf": [
+          {
+            "type": "object",
+            "required": [
+              "handle",
+              "size",
+              "preview"
+            ],
+            "properties": {
+              "handle": {
+                "type": "string"
+              },
+              "size": {
+                "type": "integer"
+              },
+              "preview": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "snapshot_id",
+              "url",
+              "title",
+              "element_count",
+              "elements"
+            ],
+            "properties": {
+              "snapshot_id": {
+                "type": "integer"
+              },
+              "url": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              },
+              "element_count": {
+                "type": "integer"
+              },
+              "elements": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "ref",
+                    "role",
+                    "name",
+                    "editable"
+                  ],
+                  "properties": {
+                    "ref": {
+                      "type": "string"
+                    },
+                    "role": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "editable": {
+                      "type": "boolean"
+                    },
+                    "tag": {
+                      "type": "string"
+                    },
+                    "visible": {
+                      "type": "boolean"
+                    },
+                    "bbox": {
+                      "type": "object",
+                      "required": [
+                        "x",
+                        "y",
+                        "w",
+                        "h"
+                      ],
+                      "properties": {
+                        "x": {
+                          "type": "number"
+                        },
+                        "y": {
+                          "type": "number"
+                        },
+                        "w": {
+                          "type": "number"
+                        },
+                        "h": {
+                          "type": "number"
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              "stale_warning": {
+                "type": "string"
+              }
+            }
+          }
+        ]
+      },
+      "bulk": {
+        "type": "web/page-snapshot"
+      }
+    },
+    "navigate": {
+      "description": "Go to `url`. Returns the new element table.",
+      "args": {
+        "type": "object",
+        "required": [
+          "url"
+        ],
+        "properties": {
+          "url": {
+            "type": "string"
+          }
+        }
+      },
+      "reply": {
+        "anyOf": [
+          {
+            "type": "object",
+            "required": [
+              "handle",
+              "size",
+              "preview"
+            ],
+            "properties": {
+              "handle": {
+                "type": "string"
+              },
+              "size": {
+                "type": "integer"
+              },
+              "preview": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "snapshot_id",
+              "url",
+              "title",
+              "element_count",
+              "elements"
+            ],
+            "properties": {
+              "snapshot_id": {
+                "type": "integer"
+              },
+              "url": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              },
+              "element_count": {
+                "type": "integer"
+              },
+              "elements": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "ref",
+                    "role",
+                    "name",
+                    "editable"
+                  ],
+                  "properties": {
+                    "ref": {
+                      "type": "string"
+                    },
+                    "role": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "editable": {
+                      "type": "boolean"
+                    },
+                    "tag": {
+                      "type": "string"
+                    },
+                    "visible": {
+                      "type": "boolean"
+                    },
+                    "bbox": {
+                      "type": "object",
+                      "required": [
+                        "x",
+                        "y",
+                        "w",
+                        "h"
+                      ],
+                      "properties": {
+                        "x": {
+                          "type": "number"
+                        },
+                        "y": {
+                          "type": "number"
+                        },
+                        "w": {
+                          "type": "number"
+                        },
+                        "h": {
+                          "type": "number"
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              "stale_warning": {
+                "type": "string"
+              }
+            }
+          }
+        ]
+      },
+      "bulk": {
+        "type": "web/page-snapshot"
+      }
+    },
+    "snapshot": {
+      "description": "Re-read the current page's element table with fresh refs. `with_bbox` adds each element's position.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "with_bbox": {
+            "type": "boolean"
+          }
+        }
+      },
+      "reply": {
+        "anyOf": [
+          {
+            "type": "object",
+            "required": [
+              "handle",
+              "size",
+              "preview"
+            ],
+            "properties": {
+              "handle": {
+                "type": "string"
+              },
+              "size": {
+                "type": "integer"
+              },
+              "preview": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "snapshot_id",
+              "url",
+              "title",
+              "element_count",
+              "elements"
+            ],
+            "properties": {
+              "snapshot_id": {
+                "type": "integer"
+              },
+              "url": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              },
+              "element_count": {
+                "type": "integer"
+              },
+              "elements": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "ref",
+                    "role",
+                    "name",
+                    "editable"
+                  ],
+                  "properties": {
+                    "ref": {
+                      "type": "string"
+                    },
+                    "role": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "editable": {
+                      "type": "boolean"
+                    },
+                    "tag": {
+                      "type": "string"
+                    },
+                    "visible": {
+                      "type": "boolean"
+                    },
+                    "bbox": {
+                      "type": "object",
+                      "required": [
+                        "x",
+                        "y",
+                        "w",
+                        "h"
+                      ],
+                      "properties": {
+                        "x": {
+                          "type": "number"
+                        },
+                        "y": {
+                          "type": "number"
+                        },
+                        "w": {
+                          "type": "number"
+                        },
+                        "h": {
+                          "type": "number"
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              "stale_warning": {
+                "type": "string"
+              }
+            }
+          }
+        ]
+      },
+      "bulk": {
+        "type": "web/page-snapshot"
+      }
+    },
+    "click": {
+      "description": "Click the element `ref` points at. Pass `expect_name` to be told if the element under that ref is no longer the one you saw.",
+      "args": {
+        "type": "object",
+        "required": [
+          "ref"
+        ],
+        "properties": {
+          "ref": {
+            "type": "string"
+          },
+          "expect_name": {
+            "type": "string"
+          }
+        }
+      },
+      "reply": {
+        "anyOf": [
+          {
+            "type": "object",
+            "required": [
+              "handle",
+              "size",
+              "preview"
+            ],
+            "properties": {
+              "handle": {
+                "type": "string"
+              },
+              "size": {
+                "type": "integer"
+              },
+              "preview": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "snapshot_id",
+              "url",
+              "title",
+              "element_count",
+              "elements"
+            ],
+            "properties": {
+              "snapshot_id": {
+                "type": "integer"
+              },
+              "url": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              },
+              "element_count": {
+                "type": "integer"
+              },
+              "elements": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "ref",
+                    "role",
+                    "name",
+                    "editable"
+                  ],
+                  "properties": {
+                    "ref": {
+                      "type": "string"
+                    },
+                    "role": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "editable": {
+                      "type": "boolean"
+                    },
+                    "tag": {
+                      "type": "string"
+                    },
+                    "visible": {
+                      "type": "boolean"
+                    },
+                    "bbox": {
+                      "type": "object",
+                      "required": [
+                        "x",
+                        "y",
+                        "w",
+                        "h"
+                      ],
+                      "properties": {
+                        "x": {
+                          "type": "number"
+                        },
+                        "y": {
+                          "type": "number"
+                        },
+                        "w": {
+                          "type": "number"
+                        },
+                        "h": {
+                          "type": "number"
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              "stale_warning": {
+                "type": "string"
+              }
+            }
+          }
+        ]
+      },
+      "bulk": {
+        "type": "web/page-snapshot"
+      }
+    },
+    "type": {
+      "description": "Type `text` into the element `ref` points at; `submit` presses Enter afterwards. `expect_name` as for click.",
+      "args": {
+        "type": "object",
+        "required": [
+          "ref",
+          "text"
+        ],
+        "properties": {
+          "ref": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "expect_name": {
+            "type": "string"
+          },
+          "submit": {
+            "type": "boolean"
+          }
+        }
+      },
+      "reply": {
+        "anyOf": [
+          {
+            "type": "object",
+            "required": [
+              "handle",
+              "size",
+              "preview"
+            ],
+            "properties": {
+              "handle": {
+                "type": "string"
+              },
+              "size": {
+                "type": "integer"
+              },
+              "preview": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "snapshot_id",
+              "url",
+              "title",
+              "element_count",
+              "elements"
+            ],
+            "properties": {
+              "snapshot_id": {
+                "type": "integer"
+              },
+              "url": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              },
+              "element_count": {
+                "type": "integer"
+              },
+              "elements": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "ref",
+                    "role",
+                    "name",
+                    "editable"
+                  ],
+                  "properties": {
+                    "ref": {
+                      "type": "string"
+                    },
+                    "role": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "editable": {
+                      "type": "boolean"
+                    },
+                    "tag": {
+                      "type": "string"
+                    },
+                    "visible": {
+                      "type": "boolean"
+                    },
+                    "bbox": {
+                      "type": "object",
+                      "required": [
+                        "x",
+                        "y",
+                        "w",
+                        "h"
+                      ],
+                      "properties": {
+                        "x": {
+                          "type": "number"
+                        },
+                        "y": {
+                          "type": "number"
+                        },
+                        "w": {
+                          "type": "number"
+                        },
+                        "h": {
+                          "type": "number"
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              "stale_warning": {
+                "type": "string"
+              }
+            }
+          }
+        ]
+      },
+      "bulk": {
+        "type": "web/page-snapshot"
+      }
+    },
+    "wait_for": {
+      "description": "Wait for a selector to appear, for the network to go idle, or for a number of milliseconds.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "selector": {
+            "type": "string"
+          },
+          "ms": {
+            "type": "number"
+          },
+          "network_idle": {
+            "type": "boolean"
+          }
+        }
+      },
+      "reply": {
+        "type": "object",
+        "required": [
+          "ok",
+          "waited"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "waited": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "screenshot": {
+      "description": "Take a screenshot. Returns a handle to the stored image and its path — never the image itself.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "reply": {
+        "type": "object",
+        "required": [
+          "handle",
+          "size",
+          "type",
+          "path"
+        ],
+        "properties": {
+          "handle": {
+            "type": "string"
+          },
+          "size": {
+            "type": "integer"
+          },
+          "type": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "login_passthrough": {
+      "description": "Hand the window to the person, to log in or pass a check. Passwords and passkeys never reach the agent; call `resume` when they are done.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string"
+          }
+        }
+      },
+      "reply": {
+        "type": "object",
+        "required": [
+          "mode",
+          "hint"
+        ],
+        "properties": {
+          "mode": {
+            "type": "string"
+          },
+          "hint": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "resume": {
+      "description": "Take the browser back after a passthrough.",
+      "args": {
+        "type": "object",
+        "properties": {}
+      },
+      "reply": {
+        "type": "object",
+        "required": [
+          "mode",
+          "url"
+        ],
+        "properties": {
+          "mode": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          },
+          "logged_in_hint": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "close": {
+      "description": "Close the browser.",
+      "args": {
+        "type": "object",
+        "properties": {}
+      },
+      "reply": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  }
+}

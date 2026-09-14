@@ -6,13 +6,15 @@
 //! handle: the two-layer naming rule. A screenshot is an artifact, never
 //! bytes in a conversation.
 //!
-//! The tool descriptions live in `tools.json` beside this file rather than
-//! in Rust, because the first implementation (`plugins/browser`) is
-//! JavaScript and reads the same file: one document, two readers, and a
-//! conformance test that what the plugin advertises is what this says.
+//! The interface is `driver.json` beside this file, like every driver's;
+//! here it also carries reply schemas, because the first implementation
+//! (`plugins/browser`) is JavaScript and has no types to be held to
+//! instead. One document, two readers, and a conformance test that what the
+//! plugin advertises is what this says.
 
+use portos_abi::driver::Driver;
 use portos_abi::ids::Verb;
-use portos_abi::wire::{Payload, ToolMeta};
+use portos_abi::wire::ToolMeta;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
@@ -35,8 +37,6 @@ verb!(RESUME, "browser::resume");
 verb!(CLOSE, "browser::close");
 
 /// The tool descriptions, as the JS implementation reads them.
-pub const TOOLS_JSON: &str = include_str!("../tools.json");
-
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct OpenArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -154,38 +154,26 @@ pub enum PageReply {
     Page(Snapshot),
 }
 
-#[derive(Deserialize)]
-struct ToolEntry {
-    description: String,
-    schema: serde_json::Value,
-}
+/// The interface itself; the crate's constants and types are a typed view.
+/// The JavaScript implementation reads the same file.
+pub const DRIVER_JSON: &str = include_str!("../driver.json");
+pub static DRIVER: LazyLock<Driver> = LazyLock::new(|| {
+    Driver::parse(DRIVER_JSON).expect("drivers/browser/driver.json is well-formed")
+});
 
-/// What each verb says about itself, parsed from `tools.json`.
+/// What each verb says about itself, as an implementation advertises it.
 pub fn tools() -> BTreeMap<Verb, ToolMeta> {
-    let raw: BTreeMap<String, ToolEntry> =
-        serde_json::from_str(TOOLS_JSON).expect("tools.json is well-formed");
-    raw.into_iter()
-        .map(|(verb, t)| {
-            (
-                Verb::parse(&verb).expect("tools.json names verbs"),
-                ToolMeta {
-                    description: t.description,
-                    schema: Payload::of(&t.schema).ok(),
-                },
-            )
-        })
-        .collect()
+    DRIVER.tools()
 }
 
 #[cfg(test)]
-mod tests {
+mod driver_document {
     use super::*;
 
-    /// The document both implementations read says exactly the verbs this
-    /// interface names, all of this driver.
+    /// The document is this interface: exactly the verbs named here, all of
+    /// this driver, described.
     #[test]
-    fn tools_json_is_this_interface() {
-        let tools = tools();
+    fn names_exactly_these_verbs() {
         let named: Vec<&Verb> = vec![
             &OPEN,
             &NAVIGATE,
@@ -198,10 +186,10 @@ mod tests {
             &RESUME,
             &CLOSE,
         ];
-        assert_eq!(tools.len(), named.len());
+        assert_eq!(DRIVER.driver, "browser");
+        assert_eq!(tools().len(), named.len());
         for v in named {
-            assert!(tools.contains_key(v), "{v} is described");
-            assert_eq!(v.driver(), "browser");
+            assert!(DRIVER.spec(v).is_some(), "{v} is in driver.json");
         }
     }
 }
