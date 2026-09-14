@@ -294,10 +294,13 @@ fn ps(client: &KernelClient) {
     let mut by_driver: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut idle: Vec<String> = Vec::new();
     for p in &listed.plugins {
-        let from = match (&p.artifact, &p.bin) {
-            (Some(id), _) => format!("artifact {id}"),
-            (None, Some(path)) => format!("bin {path}"),
-            (None, None) => String::new(),
+        // What it is, by content; then what the spec named it by.
+        let ran = p.ran.as_deref().map(short_id).unwrap_or_default();
+        let from = match (&p.plugin, &p.artifact, &p.bin) {
+            (Some(id), _, _) => format!("plugin {id}"),
+            (None, Some(id), _) => format!("artifact {id}"),
+            (None, None, Some(path)) => format!("bin {path}"),
+            (None, None, None) => String::new(),
         };
         let waiting = if p.unmet.is_empty() {
             String::new()
@@ -310,14 +313,14 @@ fn ps(client: &KernelClient) {
             drivers.entry(v.driver()).or_default().push(v.short());
         }
         if drivers.is_empty() {
-            idle.push(format!("  {}  {from}{waiting}", p.name));
+            idle.push(format!("  {}  {ran}  {from}{waiting}", p.name));
         }
         for (driver, shorts) in drivers {
             by_driver
                 .entry(driver.to_string())
                 .or_default()
                 .push(format!(
-                    "  {}  {from}  {}{waiting}",
+                    "  {}  {ran}  {from}  {}{waiting}",
                     p.name,
                     shorts.join(" ")
                 ));
@@ -334,6 +337,14 @@ fn ps(client: &KernelClient) {
         for l in idle {
             println!("{l}");
         }
+    }
+}
+
+/// A content id short enough to read across a line; the audit has it whole.
+fn short_id(id: &str) -> String {
+    match id.split_once(':') {
+        Some((algo, hex)) => format!("{algo}:{}", &hex[..hex.len().min(12)]),
+        None => id.to_string(),
     }
 }
 

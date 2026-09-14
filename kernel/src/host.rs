@@ -54,7 +54,7 @@ use launch::{rand_token, spawn_spec_on};
 use portos_abi::boundary::{Cgroup, CgroupRoot};
 use portos_abi::frame;
 use portos_abi::ids::{PluginName, SubId, Topic, Verb};
-use portos_abi::wire::{Call, LocalEvent, Payload, Reply, ServeMsg, ToolMeta};
+use portos_abi::wire::{Call, Hello, LocalEvent, Payload, Reply, ServeMsg, ToolMeta};
 use portos_router::{Miss, Router as _};
 use ready::{list_plugins, settle};
 use serde_json::json;
@@ -84,9 +84,15 @@ struct Declared {
 
 struct PluginHandle {
     declared: Mutex<Declared>,
-    /// What it was started from, as the spec named it; one of the two.
+    /// What it was started from, as the spec named it; one of the three.
+    plugin: Option<String>,
     artifact: Option<String>,
     bin: Option<String>,
+    /// The content id of the executable that ran.
+    ran: Option<String>,
+    /// What it declared when it started, token blanked. `declared` is the
+    /// live table and moves as verbs are claimed; this is the record.
+    hello: Hello,
     /// Present when this plugin was started in [`Form::Cgroup`]. Teardown
     /// ends with emptying it, and removing it is the proof that it worked —
     /// `rmdir` only succeeds on an empty cgroup.
@@ -217,6 +223,17 @@ impl Host {
     /// and what each is waiting for.
     pub fn plugins(&self) -> Vec<PluginInfo> {
         list_plugins(&self.kernel, &self.inner)
+    }
+
+    /// What a running plugin declared when it started: the material a
+    /// manifest is made of.
+    pub fn hello(&self, plugin: &PluginName) -> Option<Hello> {
+        self.inner
+            .plugins
+            .lock()
+            .unwrap()
+            .get(plugin)
+            .map(|h| h.hello.clone())
     }
 
     /// Every running instance that answers this verb — routed, or still

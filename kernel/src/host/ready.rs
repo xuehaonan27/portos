@@ -134,8 +134,10 @@ pub(super) fn list_plugins(kernel: &Arc<Kernel>, inner: &Arc<HostInner>) -> Vec<
             let verbs = inner.routes.lock().unwrap().verbs_of(&name);
             let unmet = unmet(kernel, inner, &handle, &name);
             PluginInfo {
+                plugin: handle.plugin.clone(),
                 artifact: handle.artifact.clone(),
                 bin: handle.bin.clone(),
+                ran: handle.ran.clone(),
                 name,
                 verbs,
                 unmet,

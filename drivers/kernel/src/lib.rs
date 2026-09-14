@@ -10,7 +10,7 @@
 //! a plugin means.
 
 use portos_abi::ids::{PluginName, Topic, Verb};
-use portos_abi::wire::{Payload, ToolMeta};
+use portos_abi::wire::{Hello, Payload, ToolMeta};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
@@ -40,6 +40,11 @@ pub static UP: LazyLock<Topic> =
 /// one description, not two code paths that drift.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct LaunchSpec {
+    /// A plugin, as one id: a [`Manifest`] in the CAS. What runs — artifact
+    /// or bin, bundle, args — comes from it, so a spec naming a plugin must
+    /// not name those as well.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<String>,
     /// An executable in the CAS.
     ///
     /// A plugin named this way is a **thing** rather than a location: the
@@ -120,6 +125,14 @@ impl LaunchSpec {
         }
     }
 
+    /// A plugin by its manifest's id.
+    pub fn from_manifest(id: impl Into<String>) -> LaunchSpec {
+        LaunchSpec {
+            plugin: Some(id.into()),
+            ..Default::default()
+        }
+    }
+
     /// A bundled plugin: its files from `bundle`, run by `bin` — which is
     /// either a name to find on PATH (`node`) or, if it contains a
     /// separator, a file inside the bundle.
@@ -179,6 +192,88 @@ pub struct StopReply {
     pub stopped: bool,
 }
 
+/// The CAS content type of a plugin manifest.
+pub const MANIFEST_TYPE: &str = "portos/plugin";
+
+/// A plugin as data: what runs, and what it declared when it ran.
+///
+/// Generated, never written by hand: `portos plugin` starts a launch spec
+/// once, takes its hello, and stores the two together under one content id.
+/// A spec then names the plugin by that id (`LaunchSpec.plugin`) and takes
+/// what runs from here. Deployment — the instance name, config, env, grants,
+/// form — is not in here, because it is not the plugin's.
+///
+/// The hello stays the truth: what a plugin declares when it runs is what
+/// it answers, and a manifest that disagrees is reported at spawn, not
+/// obeyed. Over an artifact the two cannot disagree unless the declaration
+/// depends on env or config; over a `bin` they can, which is the caveat
+/// `bin` already carries.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Manifest {
+    pub abi: String,
+    /// What it calls itself when the launcher does not name it.
+    pub name: PluginName,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verbs: Vec<Verb>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tools: BTreeMap<Verb, ToolMeta>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub needs: Vec<Verb>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subscribes: Vec<Topic>,
+}
+
+impl Manifest {
+    /// What a launch declared, joined with how it was launched.
+    pub fn of(spec: &LaunchSpec, hello: &Hello) -> Manifest {
+        Manifest {
+            abi: hello.abi.clone(),
+            name: hello.name.clone(),
+            artifact: spec.artifact.clone(),
+            bin: spec.bin.clone(),
+            bundle: spec.bundle.clone(),
+            args: spec.args.clone(),
+            verbs: hello.verbs.clone(),
+            tools: hello.tools.clone().unwrap_or_default(),
+            needs: hello.needs.clone(),
+            subscribes: hello.subscribes.clone(),
+        }
+    }
+
+    /// Where a hello departs from this manifest, as one line; `None` when
+    /// it does not.
+    pub fn drift(&self, hello: &Hello) -> Option<String> {
+        fn sorted<T: ToString>(v: &[T]) -> Vec<String> {
+            let mut s: Vec<String> = v.iter().map(ToString::to_string).collect();
+            s.sort();
+            s
+        }
+        let mut out = Vec::new();
+        for (what, mine, theirs) in [
+            ("verbs", sorted(&self.verbs), sorted(&hello.verbs)),
+            ("needs", sorted(&self.needs), sorted(&hello.needs)),
+            (
+                "subscribes",
+                sorted(&self.subscribes),
+                sorted(&hello.subscribes),
+            ),
+        ] {
+            if mine != theirs {
+                out.push(format!("{what}: manifest {mine:?}, hello {theirs:?}"));
+            }
+        }
+        (!out.is_empty()).then(|| out.join("; "))
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PluginsArgs {}
 
@@ -190,15 +285,24 @@ pub struct PluginsReply {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PluginInfo {
     pub name: PluginName,
-    /// What it was started from: exactly one of these, as in `LaunchSpec`.
-    /// This is the implementation, reported so an operator can tell two
-    /// instances of one driver apart by more than their names. It is never
-    /// a routing key: a caller that chose an implementation would be finding
-    /// a plugin by name, which is what replaceability forbids.
+    /// What it was started from, as the spec named it: a manifest, an
+    /// artifact, or a path. This is the implementation, reported so an
+    /// operator can tell two instances of one driver apart by more than
+    /// their names. It is never a routing key: a caller that chose an
+    /// implementation would be finding a plugin by name, which is what
+    /// replaceability forbids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bin: Option<String>,
+    /// The content id of the executable that actually ran, whatever the spec
+    /// named. For an artifact it is the artifact's own id; for a path it is
+    /// the content behind the path at the moment of the spawn, which is the
+    /// fact a path cannot give on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ran: Option<String>,
     pub verbs: Vec<Verb>,
     /// What it is still waiting for. Empty means it is answering.
     ///

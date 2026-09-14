@@ -111,9 +111,14 @@ fn kernel_verbs_are_capability_gated_like_any_other() {
         .collect();
     assert_eq!(names, vec!["portos-echoa"]);
     // And what it was started from — the implementation, reported for the
-    // operator, never routed on.
+    // operator, never routed on — plus what actually ran, by content, which
+    // a path cannot say on its own.
     assert_eq!(listed["plugins"][0]["bin"], ECHO_BIN);
     assert!(listed["plugins"][0].get("artifact").is_none());
+    assert_eq!(
+        listed["plugins"][0]["ran"],
+        portos_abi::artifact::id_for_bytes(&std::fs::read(ECHO_BIN).unwrap())
+    );
 
     host.shutdown_all();
     let _ = std::fs::remove_dir_all(&root);

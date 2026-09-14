@@ -130,6 +130,11 @@ criterion; build order is `.dev/plans/workstation-v1.md`, rationale is
   mechanism.
 - A driver has no version: a compatible change adds verbs, an incompatible
   one is a new driver under a new name.
+- A plugin is data: `portos plugin` captures a launch's hello into a
+  manifest in the CAS, and a spec names the plugin by that one id; a
+  manifest is generated from a run, never written by hand.
+- What ran is recorded by content (`ran`) whatever the spec named it by;
+  `bin` is the development path and costs the record nothing.
 - Nothing is reserved and nothing is intercepted before routing; `kernel::*`
   are ordinary rows in the one route table.
 - Grants in `portos.json` are the tool surface and the whole approval
@@ -160,7 +165,7 @@ cargo test --workspace    # rebuilt by `cargo test`, and tests find plugin
 cargo fmt --all           # binaries beside their own
 ```
 
-100 tests; all pass, zero warnings. Grep the output for `skipping:` before
+102 tests; all pass, zero warnings. Grep the output for `skipping:` before
 believing a green run: `cli/tests/run.rs` skips without `node` and
 `npm install` in `plugins/browser`, `plugins/echo/tests/form.rs` without
 writable cgroup v2. Run the narrowest relevant test first, then the whole
@@ -182,7 +187,7 @@ asserts: `.dev/gen/tests.md`.
 - `kernel/` (`portos-kernel`): `caps`, `cas`, `host`, `routes`, `audit`.
 - `sdk/rust/` (`portos-sdk`): `Plugin`, `KernelClient`, `config`, `scope`,
   `bulk`. `sdk/js/client.js` is its JS twin.
-- `cli/` (`portos-cli`): `init|put|bundle|meta|get|audit-verify|sessions|run`.
+- `cli/` (`portos-cli`): `init|put|bundle|plugin|meta|get|audit-verify|sessions|run`.
 - `drivers/`: interfaces only. `kernel`, `egress`, `model`, `fs`, `shell`,
   `browser` (with `tools.json`), `link`, `router`.
 - `plugins/`: `broker`, `echo` (the kernel's end-to-end tests live in its

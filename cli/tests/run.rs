@@ -471,16 +471,17 @@ fn portos_run_with_another_model_driver() {
         stdout.contains("say this back"),
         "the turn went through the other driver and came back:\n{stdout}"
     );
-    // The overview: the driver, the instance under it, what it was started
-    // from, and what it answers — and the front end itself, answering
-    // nothing.
+    // The overview: the driver, the instance under it, what it is by
+    // content, what it was started from, and what it answers — and the
+    // front end itself, answering nothing.
     assert!(
-        stdout.contains("[tty] model\n  portos-model-echo  bin ")
+        stdout.contains("[tty] model\n  portos-model-echo  blake3:")
+            && stdout.contains("  bin ")
             && stdout.contains("  cancel end send sessions start"),
-        "/ps lists the driver's instance with its source and verbs:\n{stdout}"
+        "/ps lists the driver's instance with its content, source and verbs:\n{stdout}"
     );
     assert!(
-        stdout.contains("[tty] (no verbs)\n  portos-tty  bin "),
+        stdout.contains("[tty] (no verbs)\n  portos-tty  blake3:"),
         "/ps lists a plugin with no verbs too:\n{stdout}"
     );
 
@@ -488,6 +489,87 @@ fn portos_run_with_another_model_driver() {
 }
 
 /// The whole runtime through the real CLI binary and a scripted provider.
+/// A plugin as data, through the CLI: the driver's executable goes into the
+/// CAS, `portos plugin` runs it once and stores what it declared as a
+/// manifest, and `portos.json` lists the plugin by that one id — nothing
+/// about what runs is in the file. The overview then shows what it is by
+/// content.
+#[test]
+fn portos_run_with_a_plugin_named_by_one_id() {
+    let cli = Path::new(CLI_BIN);
+    let driver = cli.with_file_name("portos-model-echo");
+    if !driver.exists() || !cli.with_file_name("portos-tty").exists() {
+        eprintln!("skipping: sibling binaries not built");
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("portos-run-manifest-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let cli_json = |args: &[&str]| -> Value {
+        let out = std::process::Command::new(cli).args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "portos {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+
+    let put = cli_json(&["put", root.to_str().unwrap(), driver.to_str().unwrap()]);
+    let executable = put["id"].as_str().unwrap().to_string();
+    let spec = root.join("model-echo.json");
+    write_json(&spec, &json!({"artifact": executable}));
+    let stored = cli_json(&["plugin", root.to_str().unwrap(), spec.to_str().unwrap()]);
+    assert_eq!(stored["type"], "portos/plugin");
+    let manifest = stored["id"].as_str().unwrap().to_string();
+
+    write_json(
+        &root.join("portos.json"),
+        &json!({"plugins": [{"plugin": manifest}, tty_plugin()]}),
+    );
+    let mut child = std::process::Command::new(cli)
+        .args(["run", root.to_str().unwrap()])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(120));
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .output();
+    });
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"/ps\nsay this back\n/exit\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "run exited badly.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("say this back"),
+        "the turn went through a driver the file names by one id:\n{stdout}"
+    );
+    // By content (the front end shows `blake3:` and twelve hex digits), and
+    // by the manifest the file named.
+    let short = &executable[..executable.find(':').unwrap() + 13];
+    assert!(
+        stdout.contains(&format!("  portos-model-echo  {short}  plugin {manifest}")),
+        "/ps shows what it is by content and what named it:\n{stdout}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn portos_run_end_to_end() {
     let Some((plugin, fixture)) = browser_ready() else {

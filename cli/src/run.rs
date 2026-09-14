@@ -54,6 +54,11 @@ struct RunConfig {
 
 #[derive(Debug, Deserialize)]
 struct PluginSpec {
+    /// A plugin as one id — `portos plugin <root> <spec.json>` gives you
+    /// it. What runs comes from the manifest, so none of the next three,
+    /// nor `args`, go with this.
+    #[serde(default)]
+    plugin: Option<String>,
     /// An executable stored in the CAS — `portos put <root> <file>` gives
     /// you the id. A plugin named this way is a thing rather than a
     /// location.
@@ -247,6 +252,8 @@ impl Desired {
     /// later.
     fn fingerprint(&self) -> String {
         let mut h = blake3::Hasher::new();
+        h.update(self.spec.plugin.as_deref().unwrap_or("").as_bytes());
+        h.update(b"\0a");
         h.update(self.spec.artifact.as_deref().unwrap_or("").as_bytes());
         h.update(b"\0b");
         h.update(self.spec.bin.as_deref().unwrap_or("").as_bytes());
@@ -327,6 +334,7 @@ fn desired(cfg: &RunConfig, root: &Path, exe: &Path) -> Vec<Desired> {
         .iter()
         .map(|p| Desired {
             spec: LaunchSpec {
+                plugin: p.plugin.clone(),
                 artifact: p.artifact.clone(),
                 bin: p.bin.as_deref().map(|b| resolve_bin(exe, b)),
                 bundle: p.bundle.clone(),
@@ -354,7 +362,7 @@ fn desired(cfg: &RunConfig, root: &Path, exe: &Path) -> Vec<Desired> {
 /// A `bin` with no directory in it is looked for beside this binary first,
 /// which is where the standard plugins are installed, and otherwise left to
 /// PATH the way `node` is.
-fn resolve_bin(exe: &Path, bin: &str) -> String {
+pub(crate) fn resolve_bin(exe: &Path, bin: &str) -> String {
     if bin.contains('/') {
         return bin.to_string();
     }

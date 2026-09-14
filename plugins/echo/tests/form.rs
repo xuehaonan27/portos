@@ -23,6 +23,7 @@ use portos_abi::boundary::CgroupRoot;
 use portos_abi::ids::PluginName;
 use portos_kernel::Kernel;
 use portos_kernel::host::{Form, Host, LaunchSpec};
+use portos_kernel_api::{MANIFEST_TYPE, Manifest};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -138,6 +139,16 @@ fn a_plugin_can_be_named_by_what_it_is_instead_of_where_it_is() {
         .parse()
         .unwrap();
     assert!(made["ref"].is_string(), "and it answers: {made}");
+    let info = host
+        .plugins()
+        .into_iter()
+        .find(|p| p.name == plugin)
+        .expect("it is listed");
+    assert_eq!(
+        info.ran.as_deref(),
+        Some(meta.id.as_str()),
+        "what ran is the id the spec named, checkable afterwards"
+    );
 
     // Materialised once, byte for byte. Content addressing is what makes
     // that cache correct without an invalidation rule.
@@ -182,6 +193,126 @@ fn a_plugin_can_be_named_by_what_it_is_instead_of_where_it_is() {
     );
 
     host.shutdown(&second);
+    host.shutdown_all();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A plugin as data: one id that says what runs and what it declared.
+///
+/// The manifest is generated from a run, never written by hand — what a
+/// plugin declares when it runs is the truth, and the manifest is that
+/// truth captured. A spec then names the plugin by the manifest's id and
+/// nothing else about what runs; naming both is refused. What the plugin
+/// declares when it starts again is compared to the manifest, and a
+/// difference is reported rather than obeyed, because env can change a
+/// declaration legitimately.
+#[test]
+fn a_plugin_is_data_named_by_one_id() {
+    let (kernel, host, root) = setup("manifest");
+    let mut file = std::fs::File::open(ECHO_BIN).unwrap();
+    let executable = kernel
+        .cas
+        .put_stream(
+            &mut file,
+            "application/x-executable",
+            portos_abi::Label::default(),
+            "test",
+        )
+        .unwrap();
+
+    // What `portos plugin` does: run it once, take its hello, store both.
+    let launch = LaunchSpec::from_artifact(executable.id.clone());
+    let first = host.spawn_spec(&launch).unwrap();
+    let hello = host.hello(&first).expect("what it declared is kept");
+    let manifest = Manifest::of(&launch, &hello);
+    assert_eq!(manifest.artifact.as_deref(), Some(executable.id.as_str()));
+    assert!(
+        manifest
+            .verbs
+            .iter()
+            .any(|v| v.as_str() == "echo::make_ref"),
+        "the manifest carries what the run declared: {:?}",
+        manifest.verbs
+    );
+    host.shutdown(&first);
+    let stored = kernel
+        .cas
+        .put_bytes(
+            &serde_json::to_vec(&manifest).unwrap(),
+            MANIFEST_TYPE,
+            portos_abi::Label::default(),
+            "test",
+        )
+        .unwrap();
+
+    // One id names the plugin; what runs comes from the manifest.
+    let plugin = host
+        .spawn_spec(&LaunchSpec::from_manifest(stored.id.clone()))
+        .expect("a plugin is startable from its manifest");
+    let info = host
+        .plugins()
+        .into_iter()
+        .find(|p| p.name == plugin)
+        .unwrap();
+    assert_eq!(info.plugin.as_deref(), Some(stored.id.as_str()));
+    assert_eq!(
+        info.artifact.as_deref(),
+        Some(executable.id.as_str()),
+        "what runs was read from the manifest"
+    );
+    assert_eq!(
+        info.ran.as_deref(),
+        Some(executable.id.as_str()),
+        "and what ran is that content"
+    );
+    assert!(
+        host.call(
+            &plugin,
+            &portos_abi::ids::Verb::parse("echo::make_ref").unwrap(),
+            portos_abi::wire::Payload::of(&serde_json::json!([])).unwrap(),
+        )
+        .is_ok(),
+        "and it answers"
+    );
+
+    // Two answers to "what runs" is the mistake a manifest removes.
+    let both = host.spawn_spec(&LaunchSpec {
+        bin: Some(ECHO_BIN.to_string()),
+        ..LaunchSpec::from_manifest(stored.id.clone())
+    });
+    assert!(
+        both.unwrap_err().to_string().contains("manifest"),
+        "naming a plugin and also what runs is refused"
+    );
+    // Something that is not a manifest is not a plugin.
+    let not_one = host.spawn_spec(&LaunchSpec::from_manifest(executable.id.clone()));
+    assert!(
+        not_one.unwrap_err().to_string().contains(MANIFEST_TYPE),
+        "an executable's id is not a plugin's"
+    );
+
+    // The same manifest, run under an env that changes what it declares:
+    // it runs, and the difference is on record.
+    let drifted = host
+        .spawn_spec(&LaunchSpec {
+            env: [("PORTOS_ECHO_DRIVER".to_string(), "other".to_string())]
+                .into_iter()
+                .collect(),
+            ..LaunchSpec::from_manifest(stored.id.clone())
+        })
+        .expect("a declaration that moved is reported, not refused");
+    assert_eq!(drifted.as_str(), "portos-other");
+    let entries = portos_kernel::audit::AuditLog::verify(&root.join("audit.log")).unwrap();
+    let drift = entries
+        .iter()
+        .find(|e| e["body"]["event"] == "plugin.drift")
+        .expect("the drift is on the audit chain");
+    assert_eq!(drift["body"]["plugin"], "portos-other");
+    assert!(
+        drift["body"]["drift"].as_str().unwrap().contains("verbs"),
+        "and says what moved: {drift}"
+    );
+
     host.shutdown_all();
     let _ = std::fs::remove_dir_all(&root);
 }

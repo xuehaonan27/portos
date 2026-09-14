@@ -17,3 +17,4 @@ serde_json = { workspace = true }
 nix = { workspace = true }
 tar = { workspace = true }
 portos-kernel = { path = "../../kernel" }
+portos-kernel-api = { path = "../../drivers/kernel" }

@@ -522,6 +522,7 @@ dependencies = [
  "nix",
  "portos-abi",
  "portos-kernel",
+ "portos-kernel-api",
  "portos-sdk",
  "serde",
  "serde_json",

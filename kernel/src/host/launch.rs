@@ -7,13 +7,16 @@ use super::events::spawn_event_pump;
 use super::ready::settle;
 use super::{Declared, EVENT_QUEUE, Form, HostInner, LaunchSpec, PluginHandle, Sub, SubTarget};
 use crate::{Kernel, KernelError};
+use portos_abi::artifact::id_for_bytes;
 use portos_abi::ids::{PluginName, SubId, Verb};
 use portos_abi::wire::{ChannelRole, Hello, HelloFrame, Payload, Reply, ServeMsg};
 use portos_abi::{ABI_VERSION, frame};
+use portos_kernel_api::{MANIFEST_TYPE, Manifest};
 use serde_json::json;
+use std::io::Read;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex};
@@ -26,9 +29,62 @@ enum Source<'a> {
     Artifact(&'a str),
     Path(&'a str),
 }
+/// What runs, once the spec has been read through its manifest if it names
+/// one. A spec naming a plugin takes all four from the manifest; naming any
+/// of them as well is refused, because two answers to "what runs" is the
+/// mistake a manifest exists to remove.
+struct WhatRuns {
+    artifact: Option<String>,
+    bin: Option<String>,
+    bundle: Option<String>,
+    args: Vec<String>,
+    manifest: Option<Manifest>,
+}
+
+fn what_runs(kernel: &Kernel, spec: &LaunchSpec) -> Result<WhatRuns, KernelError> {
+    let Some(id) = &spec.plugin else {
+        return Ok(WhatRuns {
+            artifact: spec.artifact.clone(),
+            bin: spec.bin.clone(),
+            bundle: spec.bundle.clone(),
+            args: spec.args.clone(),
+            manifest: None,
+        });
+    };
+    if spec.artifact.is_some()
+        || spec.bin.is_some()
+        || spec.bundle.is_some()
+        || !spec.args.is_empty()
+    {
+        return Err(KernelError::Denied(
+            "launch spec names a plugin and also what runs; with `plugin`, artifact, bin, bundle \
+             and args come from the manifest"
+                .into(),
+        ));
+    }
+    let meta = kernel.cas.meta(id)?;
+    if meta.r#type != MANIFEST_TYPE {
+        return Err(KernelError::Denied(format!(
+            "{id} is {} rather than a {MANIFEST_TYPE}",
+            meta.r#type
+        )));
+    }
+    let mut bytes = Vec::new();
+    kernel.cas.open_read(id)?.read_to_end(&mut bytes)?;
+    let m: Manifest = serde_json::from_slice(&bytes)
+        .map_err(|e| KernelError::Corrupt(format!("manifest {id}: {e}")))?;
+    Ok(WhatRuns {
+        artifact: m.artifact.clone(),
+        bin: m.bin.clone(),
+        bundle: m.bundle.clone(),
+        args: m.args.clone(),
+        manifest: Some(m),
+    })
+}
+
 /// Exactly one of `artifact` and `bin`, checked here, once.
-fn source(spec: &LaunchSpec) -> Result<Source<'_>, KernelError> {
-    match (&spec.artifact, &spec.bin) {
+fn source(runs: &WhatRuns) -> Result<Source<'_>, KernelError> {
+    match (&runs.artifact, &runs.bin) {
         (Some(id), None) => Ok(Source::Artifact(id)),
         (None, Some(path)) => Ok(Source::Path(path)),
         (Some(_), Some(_)) => Err(KernelError::Denied(
@@ -180,11 +236,12 @@ fn spawn_process(
         Form::Bare => None,
     };
 
-    let bundle_dir = match &spec.bundle {
+    let runs = what_runs(kernel, spec)?;
+    let bundle_dir = match &runs.bundle {
         Some(id) => Some(unpack(kernel, id)?),
         None => None,
     };
-    let bin = match source(spec)? {
+    let bin = match source(&runs)? {
         Source::Artifact(id) => materialise(kernel, id)?,
         // A program name with no separator is for PATH to find — `node` is
         // not something a bundle carries. One with a separator names a file,
@@ -197,11 +254,15 @@ fn spawn_process(
         },
     };
 
+    // Hashed before it runs, so that what ran is a fact about content
+    // whatever the spec named it by. For an artifact this is its own id.
+    let ran = hash_executable(&bin);
+
     let mut cmd = std::process::Command::new(&bin);
     if let Some(dir) = &bundle_dir {
         cmd.current_dir(dir);
     }
-    cmd.args(&spec.args)
+    cmd.args(&runs.args)
         .env("PORTOS_PLUGIN_SOCK", &sock_path)
         .env("PORTOS_PLUGIN_TOKEN", &token)
         // Each plugin leads its own process group, so teardown can reach
@@ -290,6 +351,17 @@ fn spawn_process(
     let tools_meta = hello.tools.clone().unwrap_or_default();
     let mut expected = hello.declared_channels();
 
+    // The manifest was a claim about this; the hello is the fact. A
+    // difference is reported, not obeyed: env and config can legitimately
+    // change what a plugin declares, and over a path the content can too.
+    if let Some(drift) = runs.manifest.as_ref().and_then(|m| m.drift(&hello)) {
+        eprintln!("[kernel] {name}: differs from its manifest — {drift}");
+        let _ = kernel.audit.lock().unwrap().append(json!({
+            "event": "plugin.drift", "plugin": name.as_str(),
+            "manifest": spec.plugin, "drift": drift,
+        }));
+    }
+
     if !expected.contains(&ChannelRole::Client) {
         let _ = child.kill();
         return Err(KernelError::Corrupt(
@@ -373,8 +445,14 @@ fn spawn_process(
                 tools: tools_meta.clone(),
                 needs: hello.needs.clone(),
             }),
-            artifact: spec.artifact.clone(),
-            bin: spec.bin.clone(),
+            plugin: spec.plugin.clone(),
+            artifact: runs.artifact.clone(),
+            bin: runs.bin.clone(),
+            ran: ran.clone(),
+            hello: Hello {
+                token: String::new(),
+                ..hello.clone()
+            },
             cgroup,
             child: Mutex::new(child),
             serve: Mutex::new(serve_stream),
@@ -392,18 +470,32 @@ fn spawn_process(
     let _ = kernel.audit.lock().unwrap().append(json!({
         "event": "plugin.spawned",
         "plugin": name.as_str(),
-        // What ran, by the name it is knowable under. For an artifact that
-        // is a claim anyone can check later; for a path it is only a claim
-        // about a file that may since have changed, which is the difference
-        // the two fields exist to record.
-        "artifact": spec.artifact,
-        "bin": spec.bin,
-        "bundle": spec.bundle,
+        // What ran, by the name it was asked for under, and by content:
+        // `ran` is checkable later whichever of the three named it.
+        "plugin": spec.plugin,
+        "artifact": runs.artifact,
+        "bin": runs.bin,
+        "bundle": runs.bundle,
+        "ran": ran,
         "form": spec.form,
         "verbs": verbs.iter().map(Verb::as_str).collect::<Vec<_>>(),
     }));
     Ok(name)
 }
+/// The content id of the file about to be executed. `None` only when it
+/// cannot be read, in which case the exec is about to fail too.
+fn hash_executable(bin: &Path) -> Option<String> {
+    let path = if bin.components().count() > 1 {
+        bin.to_path_buf()
+    } else {
+        // A bare name is what `Command` looks up on PATH; look the same way.
+        std::env::split_paths(&std::env::var_os("PATH")?)
+            .map(|dir| dir.join(bin))
+            .find(|p| p.is_file())?
+    };
+    std::fs::read(path).ok().map(|bytes| id_for_bytes(&bytes))
+}
+
 fn accept_with_deadline(
     listener: &UnixListener,
     child: &mut std::process::Child,
